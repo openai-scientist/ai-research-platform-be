@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: platform
+          POSTGRES_USER: platform
+          POSTGRES_PASSWORD: platform
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U platform -d platform"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql+asyncpg://platform:platform@127.0.0.1:5432/platform
+      PLATFORM_POSTGRES_TEST_URL: postgresql+asyncpg://platform:platform@127.0.0.1:5432/platform
+      APP_ENV: test
+      FIREBASE_PROJECT_ID: ai-research-platform-4ceb9
+      SESSION_SIGNING_SECRET: ci-only-session-signing-secret-change-me
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --all-groups
+      - run: uv run ruff format --check src alembic tests
+      - run: uv run ruff check src alembic tests
+      - run: uv run alembic upgrade head
+      - run: uv run pytest -q
+      - run: docker build --file docker/Dockerfile --tag ai-research-platform-be:ci .
