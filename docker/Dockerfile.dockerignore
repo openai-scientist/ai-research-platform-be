@@ -1,0 +1,13 @@
+.git
+.[e]nv
+.[e]nv.*
+[.]v[e]nv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+plans
+tests
+dist
+build
+docker/prod.env.local
