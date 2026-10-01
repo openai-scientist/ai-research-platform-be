@@ -4,3 +4,19 @@ Thumbs.db
 
 # Local logs
 *.log
+/plans/
+/docs/
+.[e]nv
+.[e]nv.*
+!.[e]nv.example
+[.]venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+.mypy_cache/
+docker/prod.env.local
