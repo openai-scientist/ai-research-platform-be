@@ -1,0 +1,6 @@
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Local logs
+*.log
