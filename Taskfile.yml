@@ -1,0 +1,49 @@
+version: '3'
+
+vars:
+  DEV_COMPOSE: docker/docker-compose.dev.yml
+  DEV_ENV_FILE: .env.local
+
+tasks:
+  default:
+    desc: List project shortcuts
+    cmds:
+      - task --list
+
+  up:
+    desc: Start or rebuild the local API and PostgreSQL
+    preconditions:
+      - sh: test -f {{.DEV_ENV_FILE}}
+        msg: Copy the sample settings file to the local settings file before starting.
+    cmds:
+      - docker compose --env-file {{.DEV_ENV_FILE}} -f {{.DEV_COMPOSE}} up -d --build
+
+  down:
+    desc: Stop local services and preserve the database volume
+    aliases: [stop]
+    cmds:
+      - docker compose -f {{.DEV_COMPOSE}} down
+
+  restart:
+    desc: Restart local containers without rebuilding
+    cmds:
+      - docker compose -f {{.DEV_COMPOSE}} restart
+
+  status:
+    desc: Show local container status
+    aliases: [ps]
+    cmds:
+      - docker compose -f {{.DEV_COMPOSE}} ps
+
+  logs:
+    desc: Follow local container logs
+    cmds:
+      - docker compose -f {{.DEV_COMPOSE}} logs --tail=100 --follow
+
+  migrate:
+    desc: Apply pending database migrations
+    preconditions:
+      - sh: test -f {{.DEV_ENV_FILE}}
+        msg: Copy the sample settings file to the local settings file before migrating.
+    cmds:
+      - docker compose --env-file {{.DEV_ENV_FILE}} -f {{.DEV_COMPOSE}} run --rm api alembic upgrade head
