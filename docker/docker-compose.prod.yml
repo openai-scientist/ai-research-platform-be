@@ -36,11 +36,23 @@ services:
       AUTH_SESSION_RATE_LIMIT: ${AUTH_SESSION_RATE_LIMIT:-10}
       AUTH_SESSION_RATE_WINDOW_SECONDS: ${AUTH_SESSION_RATE_WINDOW_SECONDS:-60}
       REQUEST_MAX_BODY_BYTES: ${REQUEST_MAX_BODY_BYTES:-1048576}
+      STORAGE_LOCAL_ROOT: /app/var/storage
+      DATASET_MAX_UPLOAD_BYTES: ${DATASET_MAX_UPLOAD_BYTES:-52428800}
+      ARTIFACT_MAX_UPLOAD_BYTES: ${ARTIFACT_MAX_UPLOAD_BYTES:-52428800}
+      POPPER_BASE_URL: ${POPPER_BASE_URL:-}
+      POPPER_SERVICE_KEY: ${POPPER_SERVICE_KEY:-}
+      POPPER_CALLBACK_KEY: ${POPPER_CALLBACK_KEY:-}
+      POPPER_TIMEOUT_SECONDS: ${POPPER_TIMEOUT_SECONDS:-30}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?Set PUBLIC_BASE_URL in the production environment file}
+      RUN_DEFAULT_BUDGET_USD: ${RUN_DEFAULT_BUDGET_USD:-5}
+      RUN_MAX_BUDGET_USD: ${RUN_MAX_BUDGET_USD:-20}
     depends_on:
       db:
         condition: service_healthy
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
+    volumes:
+      - platform_prod_storage:/app/var/storage
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/ready', timeout=2)"]
       interval: 10s
@@ -49,3 +61,4 @@ services:
 
 volumes:
   platform_prod_db_data:
+  platform_prod_storage:

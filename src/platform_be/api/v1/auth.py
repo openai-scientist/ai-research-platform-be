@@ -22,10 +22,11 @@ from platform_be.auth.tokens import FirebaseTokenRejected, FirebaseTokenVerifier
 from platform_be.core.config import Settings
 from platform_be.core.errors import APIError
 from platform_be.core.responses import ApiResponse, ErrorResponse, ok
-from platform_be.core.roles import PlatformRole
+from platform_be.core.roles import PlatformRole, ProjectRole
 from platform_be.core.security import new_session_secret, token_digest
 from platform_be.db.session import get_db
 from platform_be.models.identity import AuthSession, User, UserPlatformRole, UserStatus
+from platform_be.models.project import Project, ProjectMembership
 from platform_be.services.audit import record_audit
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
@@ -74,9 +75,19 @@ class LoginResult(BaseModel):
     )
 
 
+class MembershipSummary(BaseModel):
+    project_id: str
+    project_name: str
+    role: ProjectRole
+    archived: bool
+
+
 class CurrentUser(BaseModel):
     user: UserProfile
     session: SessionDetails
+    memberships: list[MembershipSummary] = Field(
+        description="The projects you are a member of and your role in each, newest first."
+    )
 
 
 class CsrfToken(BaseModel):
@@ -306,17 +317,35 @@ async def login(
     "/me",
     response_model=ApiResponse[CurrentUser],
     summary="Get the signed-in user and current session",
-    description="Use after a page reload to restore the signed-in user, role, and session expiry.",
+    description=(
+        "Use after a page reload to restore the signed-in user, role, session expiry, "
+        "and the projects to show in the menu."
+    ),
     responses=SESSION_REQUIRED,
 )
 async def me(
     principal: Principal = Depends(get_principal),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[CurrentUser]:
+    rows = await db.execute(
+        select(Project, ProjectMembership.role_code)
+        .join(ProjectMembership, ProjectMembership.project_id == Project.id)
+        .where(ProjectMembership.user_id == principal.user.id, ProjectMembership.status == "active")
+        .order_by(Project.created_at.desc(), Project.id)
+    )
     return ok(
         CurrentUser(
             user=await _user_profile(db, principal.user),
             session=_session_details(principal.session),
+            memberships=[
+                MembershipSummary(
+                    project_id=str(project.id),
+                    project_name=project.name,
+                    role=role,
+                    archived=project.archived_at is not None,
+                )
+                for project, role in rows
+            ],
         )
     )
 

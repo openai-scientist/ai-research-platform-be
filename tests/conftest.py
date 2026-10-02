@@ -11,8 +11,10 @@ from sqlalchemy.pool import StaticPool
 from platform_be.core.config import Settings
 from platform_be.db.base import Base
 from platform_be.main import create_app
+from tests.fakes import FakePopperClient
 
 ORIGIN = "http://localhost:3000"
+CALLBACK_KEY = "test-popper-callback-key"
 
 
 class FakeTokenVerifier:
@@ -58,6 +60,8 @@ class Harness:
         self.factory = factory
         self.verifier = verifier
         self.settings = settings
+        self.popper = FakePopperClient()
+        app.state.popper_client = self.popper
         self.transport = ASGITransport(app=app, raise_app_exceptions=False)
 
     def client(self) -> AsyncClient:
@@ -65,9 +69,12 @@ class Harness:
 
 
 @pytest_asyncio.fixture
-async def harness() -> AsyncIterator[Harness]:
+async def harness(tmp_path) -> AsyncIterator[Harness]:
     settings = Settings(
         app_env="test",
+        storage_local_root=str(tmp_path / "storage"),
+        popper_callback_key=CALLBACK_KEY,
+        popper_timeout_seconds=1,
         database_url="sqlite+aiosqlite:///:memory:",
         cors_allowed_origins=ORIGIN,
         session_signing_secret="test-session-signing-secret-is-long-enough",

@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import time
 from collections import OrderedDict, deque
 
@@ -7,6 +8,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from platform_be.core.config import Settings
 from platform_be.core.responses import error_content
+from platform_be.core.security import service_key_matches
 
 
 class RequestProtectionMiddleware:
@@ -16,6 +18,13 @@ class RequestProtectionMiddleware:
         self.app = app
         self.settings = settings
         self._session_attempts: OrderedDict[str, deque[float]] = OrderedDict()
+        prefix = re.escape(settings.api_prefix.rstrip("/"))
+        # File uploads get their own, larger limit; every other route keeps the small one.
+        self._dataset_upload_path = re.compile(
+            rf"{prefix}/projects/[^/]+/datasets(/[^/]+/versions)?/?"
+        )
+        self._artifact_upload_path = re.compile(rf"{prefix}/internal/popper/runs/[^/]+/artifacts/?")
+        self._popper_callback_prefix = f"{settings.api_prefix.rstrip('/')}/internal/popper/"
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -23,7 +32,19 @@ class RequestProtectionMiddleware:
             return
 
         request_id = (scope.get("state") or {}).get("request_id")
+        max_body_bytes = self._max_body_bytes(scope)
         headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        if scope.get("path", "").startswith(self._popper_callback_prefix):
+            # Checked here so a caller without the key cannot make the API spool an upload.
+            expected = self.settings.popper_callback_key
+            candidate = headers.get(b"x-service-key", b"").decode("latin-1")
+            if not service_key_matches(
+                expected.get_secret_value() if expected else None, candidate
+            ):
+                await self._reject(
+                    send, 401, "SERVICE_KEY_INVALID", "A valid service key is required", request_id
+                )
+                return
         content_length = headers.get(b"content-length")
         if content_length is not None:
             try:
@@ -38,7 +59,7 @@ class RequestProtectionMiddleware:
                     send, 400, "INVALID_CONTENT_LENGTH", "Invalid Content-Length", request_id
                 )
                 return
-            if declared_length > self.settings.request_max_body_bytes:
+            if declared_length > max_body_bytes:
                 await self._reject(
                     send,
                     413,
@@ -63,40 +84,54 @@ class RequestProtectionMiddleware:
                 )
                 return
 
-        body_chunks: list[bytes] = []
-        body_size = 0
-        while True:
+        # Count bytes as they pass instead of buffering, so a large upload never sits in memory.
+        received = 0
+        exceeded = False
+        response_started = False
+
+        async def counting_receive() -> Message:
+            nonlocal received, exceeded
+            if exceeded:
+                return {"type": "http.disconnect"}
             message = await receive()
-            if message["type"] == "http.disconnect":
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > max_body_bytes:
+                    exceeded = True
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def guarded_send(message: Message) -> None:
+            nonlocal response_started
+            if exceeded and not response_started:
+                # The handler saw a truncated body; its own answer would be misleading.
                 return
-            if message["type"] != "http.request":
-                continue
-            chunk = message.get("body", b"")
-            body_size += len(chunk)
-            if body_size > self.settings.request_max_body_bytes:
-                await self._reject(
-                    send,
-                    413,
-                    "REQUEST_BODY_TOO_LARGE",
-                    "Request body exceeds the allowed size",
-                    request_id,
-                )
-                return
-            body_chunks.append(chunk)
-            if not message.get("more_body", False):
-                break
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
 
-        body = b"".join(body_chunks)
-        replayed = False
+        try:
+            await self.app(scope, counting_receive, guarded_send)
+        except Exception:
+            if not exceeded or response_started:
+                raise
+        if exceeded and not response_started:
+            await self._reject(
+                send,
+                413,
+                "REQUEST_BODY_TOO_LARGE",
+                "Request body exceeds the allowed size",
+                request_id,
+            )
 
-        async def replay_receive() -> Message:
-            nonlocal replayed
-            if not replayed:
-                replayed = True
-                return {"type": "http.request", "body": body, "more_body": False}
-            return await receive()
-
-        await self.app(scope, replay_receive, send)
+    def _max_body_bytes(self, scope: Scope) -> int:
+        if scope.get("method") == "POST":
+            path = scope.get("path", "")
+            if self._dataset_upload_path.fullmatch(path):
+                return self.settings.dataset_max_upload_bytes
+            if self._artifact_upload_path.fullmatch(path):
+                return self.settings.artifact_max_upload_bytes
+        return self.settings.request_max_body_bytes
 
     def _consume_session_attempt(self, scope: Scope) -> int | None:
         now = time.monotonic()

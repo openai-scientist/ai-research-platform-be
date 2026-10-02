@@ -14,12 +14,12 @@ from platform_be.db.base import Base
 from platform_be.main import create_app
 from platform_be.models.identity import User, UserStatus
 from platform_be.models.project import ProjectMembership
-from tests.conftest import FakeTokenVerifier, Harness, login, mutation_headers
+from tests.conftest import CALLBACK_KEY, FakeTokenVerifier, Harness, login, mutation_headers
 from tests.test_projects_api import PROJECTS, add_member, create_project
 
 
 @pytest_asyncio.fixture
-async def postgres_harness() -> AsyncIterator[Harness]:
+async def postgres_harness(tmp_path) -> AsyncIterator[Harness]:
     database_url = os.environ.get("PLATFORM_POSTGRES_TEST_URL")
     if not database_url:
         pytest.skip("PLATFORM_POSTGRES_TEST_URL is not configured")
@@ -39,6 +39,8 @@ async def postgres_harness() -> AsyncIterator[Harness]:
             await connection.run_sync(Base.metadata.create_all)
         settings = Settings(
             app_env="test",
+            storage_local_root=str(tmp_path / "storage"),
+            popper_callback_key=CALLBACK_KEY,
             database_url=database_url,
             cors_allowed_origins="http://localhost:3000",
             session_signing_secret="postgres-test-session-signing-secret",
@@ -222,3 +224,65 @@ async def test_member_add_racing_a_suspension_never_adds_a_suspended_user(
     assert added.status_code in {201, 409}
     if added.status_code == 409:
         assert added.json()["error"]["code"] == "USER_SUSPENDED"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_run_starts_leave_one_run_in_progress(postgres_harness: Harness) -> None:
+    from tests.test_runs_api import ready_project, start_run
+
+    async with (
+        postgres_harness.client() as manager_client,
+        postgres_harness.client() as researcher_client,
+    ):
+        manager = await login(
+            postgres_harness, manager_client, uid="run-manager", email="run-manager@example.com"
+        )
+        researcher = await login(
+            postgres_harness,
+            researcher_client,
+            uid="run-researcher",
+            email="run-researcher@example.com",
+        )
+        project, version = await ready_project(manager_client, manager)
+        await add_member(
+            manager_client, manager, project["id"], "run-researcher@example.com", "researcher"
+        )
+
+        responses = await asyncio.gather(
+            start_run(manager_client, manager, project["id"], version["id"]),
+            start_run(researcher_client, researcher, project["id"], version["id"]),
+        )
+        assert sorted(response.status_code for response in responses) == [201, 409]
+        refused = next(response for response in responses if response.status_code == 409)
+        assert refused.json()["error"]["code"] == "RUN_ACTIVE"
+        assert len(postgres_harness.popper.started) == 1
+        runs = (await manager_client.get(f"{PROJECTS}/{project['id']}/runs")).json()["data"]
+        assert [run["status"] for run in runs] == ["running"]
+
+
+@pytest.mark.asyncio
+async def test_repeated_callbacks_arriving_together_apply_once(postgres_harness: Harness) -> None:
+    from tests.test_runs_api import REVIEW, ready_project, report, start_run
+
+    async with postgres_harness.client() as client, postgres_harness.client() as popper:
+        manager = await login(
+            postgres_harness, client, uid="callback-manager", email="callback-manager@example.com"
+        )
+        project, version = await ready_project(client, manager)
+        run = (await start_run(client, manager, project["id"], version["id"])).json()["data"]
+
+        responses = await asyncio.gather(
+            *(report(popper, run["id"], status="awaiting_review", review=REVIEW) for _ in range(4))
+        )
+        assert [response.status_code for response in responses] == [200] * 4
+        reviews = await client.get(f"{PROJECTS}/{project['id']}/runs/{run['id']}/frame-reviews")
+        assert [item["sequence"] for item in reviews.json()["data"]] == [1]
+        audit = await client.get(
+            "/api/v1/audit", params={"project_id": project["id"], "action": "run.status_changed"}
+        )
+        assert [item["details"]["after"] for item in audit.json()["data"]] == [
+            "awaiting_review",
+            "running",
+        ]
+        notifications = await client.get("/api/v1/notifications")
+        assert [item["kind"] for item in notifications.json()["data"]] == ["run_awaiting_review"]

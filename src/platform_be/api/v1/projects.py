@@ -19,6 +19,7 @@ from platform_be.core.roles import ProjectRole
 from platform_be.db.session import get_db
 from platform_be.models.identity import User, UserStatus
 from platform_be.models.project import Project, ProjectMembership
+from platform_be.models.research import ACTIVE_RUN_STATUSES, ResearchRun
 from platform_be.services.access import (
     active_manager_count,
     ensure_writable_project,
@@ -28,6 +29,8 @@ from platform_be.services.access import (
     require_project_access,
 )
 from platform_be.services.audit import record_audit
+from platform_be.services.notifications import notify_user
+from platform_be.services.project_status import derive_project_status
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -387,6 +390,74 @@ async def restore_project(
     return ok(_project_item(project, membership), "Project restored")
 
 
+@router.post(
+    "/{project_id}/complete",
+    response_model=ApiResponse[ProjectItem],
+    summary="Mark the project's research as completed",
+    description="Project Manager only. Refused while a run is in progress.",
+    responses=PROJECT_ERRORS,
+)
+async def complete_project(
+    project_id: UUID,
+    request: Request,
+    principal: Principal = Depends(require_active_csrf),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[ProjectItem]:
+    project, membership = await _manage_project(db, principal, project_id)
+    ensure_writable_project(project)
+    if project.status != "completed":
+        active = await db.scalar(
+            select(ResearchRun.id).where(
+                ResearchRun.project_id == project_id,
+                ResearchRun.status.in_(ACTIVE_RUN_STATUSES),
+            )
+        )
+        if active is not None:
+            raise APIError(409, "RUN_ACTIVE", "Wait for the run in progress to finish first")
+        project.status = "completed"
+        record_audit(
+            db,
+            actor_user_id=principal.user.id,
+            action="project.completed",
+            resource_type="project",
+            resource_id=project.id,
+            project_id=project.id,
+            request_id=getattr(request.state, "request_id", None),
+        )
+        await db.flush()
+    return ok(_project_item(project, membership), "Project completed")
+
+
+@router.post(
+    "/{project_id}/reopen",
+    response_model=ApiResponse[ProjectItem],
+    summary="Reopen a completed project",
+    description="Project Manager only. The status goes back to what the project's data shows.",
+    responses=PROJECT_ERRORS,
+)
+async def reopen_project(
+    project_id: UUID,
+    request: Request,
+    principal: Principal = Depends(require_active_csrf),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[ProjectItem]:
+    project, membership = await _manage_project(db, principal, project_id)
+    ensure_writable_project(project)
+    if project.status == "completed":
+        project.status = await derive_project_status(db, project)
+        record_audit(
+            db,
+            actor_user_id=principal.user.id,
+            action="project.reopened",
+            resource_type="project",
+            resource_id=project.id,
+            project_id=project.id,
+            request_id=getattr(request.state, "request_id", None),
+        )
+        await db.flush()
+    return ok(_project_item(project, membership), "Project reopened")
+
+
 @router.get(
     "/{project_id}/members",
     response_model=ApiResponse[list[ProjectMemberItem]],
@@ -482,6 +553,14 @@ async def add_project_member(
         request_id=getattr(request.state, "request_id", None),
         details={"user_id": str(user.id), "role": body.role},
     )
+    if user.id != principal.user.id:
+        notify_user(
+            db,
+            user.id,
+            "added_to_project",
+            project_id=project_id,
+            actor_user_id=principal.user.id,
+        )
     return ok(_member_item(membership, user), "Project member added")
 
 
