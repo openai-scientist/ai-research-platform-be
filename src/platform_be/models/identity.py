@@ -19,9 +19,10 @@ class User(Base):
     __table_args__ = (CheckConstraint("status IN ('active', 'suspended')", name="ck_users_status"),)
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
-    firebase_uid: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     email: Mapped[str] = mapped_column(String(320), nullable=False)
     email_normalized: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
+    # Empty for accounts created before the Platform kept passwords; they cannot sign in.
+    password_hash: Mapped[str | None] = mapped_column(String(255))
     display_name: Mapped[str | None] = mapped_column(String(200))
     status: Mapped[str] = mapped_column(String(32), nullable=False, default=UserStatus.ACTIVE)
     created_at: Mapped[datetime] = mapped_column(

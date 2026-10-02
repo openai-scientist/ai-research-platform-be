@@ -4,11 +4,10 @@ import pytest
 from sqlalchemy import select
 
 from platform_be.auth.sessions import normalize_email
-from platform_be.auth.tokens import FirebaseTokenRejected, FirebaseUnavailable
 from platform_be.cli.bootstrap_admin import bootstrap_admin
 from platform_be.core.errors import APIError
 from platform_be.models.identity import AuthSession, User, UserPlatformRole
-from tests.conftest import ORIGIN, Harness, login
+from tests.conftest import ORIGIN, PASSWORD, Harness, login
 
 
 @pytest.mark.asyncio
@@ -28,14 +27,18 @@ async def test_health_probes_and_openapi(harness: Harness) -> None:
     schema = harness.app.openapi()
     auth_paths = {path for path in schema["paths"] if path.startswith("/api/v1/auth/")}
     assert auth_paths == {
+        "/api/v1/auth/register",
         "/api/v1/auth/login",
+        "/api/v1/auth/change-password",
         "/api/v1/auth/logout",
         "/api/v1/auth/logout-all",
         "/api/v1/auth/me",
         "/api/v1/auth/csrf-token",
     }
     login_responses = schema["paths"]["/api/v1/auth/login"]["post"]["responses"]
-    assert {"200", "401", "403", "409", "413", "422", "429", "503"}.issubset(login_responses)
+    assert {"200", "401", "403", "413", "422", "429"}.issubset(login_responses)
+    register_responses = schema["paths"]["/api/v1/auth/register"]["post"]["responses"]
+    assert {"201", "403", "409", "413", "422", "429"}.issubset(register_responses)
     assert {"200", "401", "403"}.issubset(
         schema["paths"]["/api/v1/auth/logout"]["post"]["responses"]
     )
@@ -46,111 +49,51 @@ async def test_health_probes_and_openapi(harness: Harness) -> None:
         "/", maxsplit=1
     )[1]
     request_properties = schema["components"]["schemas"][request_schema_name]["properties"]
-    assert set(request_properties) == {"firebase_id_token"}
+    assert set(request_properties) == {"email", "password"}
     assert "HTTPValidationError" not in schema["components"]["schemas"]
     assert "/api/v1/projects/{project_id}/members/{membership_id}" in schema["paths"]
     assert "/api/v1/research" not in schema["paths"]
 
 
 @pytest.mark.asyncio
-async def test_session_exchange_requires_recent_verified_token_and_allowed_origin(
-    harness: Harness,
-) -> None:
+async def test_sign_up_and_sign_in_require_an_allowed_origin(harness: Harness) -> None:
+    credentials = {"email": "origin@example.com", "password": PASSWORD}
     async with harness.client() as client:
-        unverified = harness.verifier.add_user(
-            uid="unverified", email="unverified@example.com", verified=False
-        )
-        response = await client.post(
-            "/api/v1/auth/login",
-            json={"firebase_id_token": unverified},
-            headers={"Origin": ORIGIN},
-        )
-        assert response.status_code == 403
-        assert response.json()["error"]["code"] == "EMAIL_NOT_VERIFIED"
-
-        stale = harness.verifier.add_user(
-            uid="stale",
-            email="stale@example.com",
-            auth_time=int((datetime.now(UTC) - timedelta(hours=1)).timestamp()),
-        )
-        response = await client.post(
-            "/api/v1/auth/login",
-            json={"firebase_id_token": stale},
-            headers={"Origin": ORIGIN},
-        )
-        assert response.status_code == 401
-        assert response.json()["error"]["code"] == "RECENT_AUTH_REQUIRED"
-
-        valid = harness.verifier.add_user(uid="origin", email="origin@example.com")
-        response = await client.post(
-            "/api/v1/auth/login",
-            json={"firebase_id_token": valid},
-            headers={"Origin": "https://untrusted.example"},
-        )
-        assert response.status_code == 403
-        assert response.json()["error"]["code"] == "ORIGIN_NOT_ALLOWED"
-
-    async with harness.factory() as db:
-        users = (await db.scalars(select(User))).all()
-    assert users == []
-
-
-@pytest.mark.asyncio
-async def test_firebase_provider_failures_keep_public_error_contract(harness: Harness) -> None:
-    class RejectedVerifier:
-        def verify(self, _id_token: str) -> dict[str, object]:
-            raise FirebaseTokenRejected
-
-    class UnavailableVerifier:
-        def verify(self, _id_token: str) -> dict[str, object]:
-            raise FirebaseUnavailable
-
-    async with harness.client() as client:
-        for verifier, status, error_code in (
-            (RejectedVerifier(), 401, "FIREBASE_TOKEN_INVALID"),
-            (UnavailableVerifier(), 503, "IDENTITY_PROVIDER_UNAVAILABLE"),
-        ):
-            harness.app.state.token_verifier = verifier
+        for path in ("/api/v1/auth/register", "/api/v1/auth/login"):
             response = await client.post(
-                "/api/v1/auth/login",
-                json={"firebase_id_token": "a-valid-length-but-invalid-token-value"},
-                headers={"Origin": ORIGIN},
+                path, json=credentials, headers={"Origin": "https://untrusted.example"}
             )
-            assert response.status_code == status
-            assert response.json()["error"]["code"] == error_code
+            assert response.status_code == 403
+            assert response.json()["error"]["code"] == "ORIGIN_NOT_ALLOWED"
 
     async with harness.factory() as db:
         assert await db.scalar(select(User.id)) is None
 
 
 @pytest.mark.asyncio
-async def test_auth_exchange_rate_limit_and_request_body_limit(harness: Harness) -> None:
+async def test_sign_in_rate_limit_and_request_body_limit(harness: Harness) -> None:
     harness.settings.auth_session_rate_limit = 2
     async with harness.client() as client:
-        token = harness.verifier.add_user(uid="rate-limit", email="rate-limit@example.com")
         headers = {"Origin": ORIGIN}
-        for _ in range(2):
-            response = await client.post(
-                "/api/v1/auth/login",
-                json={"firebase_id_token": token},
-                headers=headers,
-            )
-            assert response.status_code == 200, response.text
+        credentials = {"email": "rate-limit@example.com", "password": PASSWORD}
+        registered = await client.post("/api/v1/auth/register", json=credentials, headers=headers)
+        assert registered.status_code == 201, registered.text
+        signed_in = await client.post("/api/v1/auth/login", json=credentials, headers=headers)
+        assert signed_in.status_code == 200, signed_in.text
 
-        limited = await client.post(
-            "/api/v1/auth/login",
-            json={"firebase_id_token": token},
-            headers=headers,
-        )
-        assert limited.status_code == 429
-        assert limited.json()["error"]["code"] == "RATE_LIMITED"
-        assert int(limited.headers["retry-after"]) >= 1
-        assert limited.headers.get("x-request-id")
+        # Signing up and signing in share one allowance.
+        for path in ("/api/v1/auth/login", "/api/v1/auth/register"):
+            limited = await client.post(path, json=credentials, headers=headers)
+            assert limited.status_code == 429
+            assert limited.json()["error"]["code"] == "RATE_LIMITED"
+            assert int(limited.headers["retry-after"]) >= 1
+            assert limited.headers.get("x-request-id")
 
+        harness.settings.auth_session_rate_limit = 100
         harness.settings.request_max_body_bytes = 1024
         oversized = await client.post(
             "/api/v1/auth/login",
-            json={"firebase_id_token": "x" * 1100},
+            json={"email": "rate-limit@example.com", "password": "x" * 1100},
             headers=headers,
         )
         assert oversized.status_code == 413
@@ -192,7 +135,7 @@ async def test_session_token_is_stored_as_digest_and_admin_bootstrap_is_one_time
         profile = await client.get("/api/v1/auth/me")
         assert profile.status_code == 200
         current = profile.json()["data"]
-        assert current["user"]["email"] == "Admin@Example.com"
+        assert current["user"]["email"] == "Admin@example.com"
         assert current["user"]["status"] == "active"
         assert current["user"]["platform_role"] == "platform_admin"
         assert current["session"]["absolute_expires_at"]
@@ -257,37 +200,138 @@ async def test_logout_requires_csrf_and_revokes_cookie_session(harness: Harness)
 
 
 @pytest.mark.asyncio
-async def test_first_login_registers_user_and_later_logins_sign_in(harness: Harness) -> None:
+async def test_register_creates_an_account_and_login_checks_the_password(
+    harness: Harness,
+) -> None:
+    headers = {"Origin": ORIGIN}
     async with harness.client() as client:
-        token = harness.verifier.add_user(
-            uid="google-user", email="new@example.com", sign_in_provider="google.com"
+        registered = await client.post(
+            "/api/v1/auth/register",
+            json={"email": "New@Example.com", "password": PASSWORD, "display_name": " New User "},
+            headers=headers,
         )
-        first = await client.post(
-            "/api/v1/auth/login", json={"firebase_id_token": token}, headers={"Origin": ORIGIN}
+        again = await client.post(
+            "/api/v1/auth/register",
+            json={"email": "new@example.com", "password": "another password"},
+            headers=headers,
         )
-        second = await client.post(
-            "/api/v1/auth/login", json={"firebase_id_token": token}, headers={"Origin": ORIGIN}
+        too_short = await client.post(
+            "/api/v1/auth/register",
+            json={"email": "short@example.com", "password": "1234567"},
+            headers=headers,
         )
-        # Firebase keeps one account per email: a second UID for the same email is refused.
-        other_uid = harness.verifier.add_user(
-            uid="password-user", email="New@Example.com", sign_in_provider="password"
-        )
-        conflict = await client.post(
+    async with harness.client() as client:
+        wrong_password = await client.post(
             "/api/v1/auth/login",
-            json={"firebase_id_token": other_uid},
-            headers={"Origin": ORIGIN},
+            json={"email": "new@example.com", "password": "not the password"},
+            headers=headers,
+        )
+        unknown_email = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "nobody@example.com", "password": PASSWORD},
+            headers=headers,
+        )
+        assert client.cookies.get(harness.settings.session_cookie_name) is None
+        signed_in = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "NEW@example.com", "password": PASSWORD},
+            headers=headers,
+        )
+        assert client.cookies.get(harness.settings.session_cookie_name)
+        assert (await client.get("/api/v1/auth/me")).status_code == 200
+
+    assert registered.status_code == 201, registered.text
+    assert registered.json()["message"] == "Account registered"
+    user = registered.json()["data"]["user"]
+    assert user["email"] == "New@example.com"
+    assert user["display_name"] == "New User"
+    assert user["status"] == "active"
+    assert user["platform_role"] is None
+    assert registered.json()["data"]["csrf_token"]
+    assert again.status_code == 409
+    assert again.json()["error"]["code"] == "EMAIL_ALREADY_REGISTERED"
+    assert too_short.status_code == 422
+    for refused in (wrong_password, unknown_email):
+        assert refused.status_code == 401
+        assert refused.json()["error"]["code"] == "INVALID_CREDENTIALS"
+    assert signed_in.status_code == 200, signed_in.text
+    assert signed_in.json()["message"] == "Signed in"
+    assert signed_in.json()["data"]["user"]["id"] == user["id"]
+
+    async with harness.factory() as db:
+        stored = await db.scalar(select(User))
+    assert stored.password_hash.startswith("scrypt$")
+    assert PASSWORD not in stored.password_hash
+
+
+@pytest.mark.asyncio
+async def test_suspended_or_passwordless_accounts_cannot_sign_in(harness: Harness) -> None:
+    headers = {"Origin": ORIGIN}
+    async with harness.client() as client:
+        await login(harness, client, uid="suspended", email="suspended@example.com")
+        await login(harness, client, uid="legacy", email="legacy@example.com")
+        async with harness.factory() as db, db.begin():
+            for user in (await db.scalars(select(User))).all():
+                if user.email == "suspended@example.com":
+                    user.status = "suspended"
+                else:
+                    user.password_hash = None
+        suspended = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "suspended@example.com", "password": PASSWORD},
+            headers=headers,
+        )
+        legacy = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "legacy@example.com", "password": PASSWORD},
+            headers=headers,
         )
 
-    assert first.status_code == 200, first.text
-    assert first.json()["message"] == "Account registered"
-    assert first.json()["data"]["is_new_user"] is True
-    assert first.json()["data"]["user"]["status"] == "active"
-    assert first.json()["data"]["user"]["platform_role"] is None
-    assert second.json()["message"] == "Signed in"
-    assert second.json()["data"]["is_new_user"] is False
-    assert second.json()["data"]["user"]["id"] == first.json()["data"]["user"]["id"]
-    assert conflict.status_code == 409
-    assert conflict.json()["error"]["code"] == "EMAIL_ALREADY_LINKED"
+    assert suspended.status_code == 403
+    assert suspended.json()["error"]["code"] == "USER_SUSPENDED"
+    assert legacy.status_code == 401
+    assert legacy.json()["error"]["code"] == "INVALID_CREDENTIALS"
+
+
+@pytest.mark.asyncio
+async def test_changing_the_password_signs_out_the_other_sessions(harness: Harness) -> None:
+    email = "change@example.com"
+    new_password = "a brand new password"
+    async with harness.client() as laptop, harness.client() as phone:
+        session = await login(harness, laptop, uid="change", email=email)
+        await login(harness, phone, uid="change", email=email)
+        headers = {"Origin": ORIGIN, "X-CSRF-Token": session["csrf_token"]}
+
+        wrong = await laptop.post(
+            "/api/v1/auth/change-password",
+            json={"current_password": "not the password", "new_password": new_password},
+            headers=headers,
+        )
+        assert wrong.status_code == 403
+        assert wrong.json()["error"]["code"] == "CURRENT_PASSWORD_INCORRECT"
+        assert (await phone.get("/api/v1/auth/me")).status_code == 200
+
+        changed = await laptop.post(
+            "/api/v1/auth/change-password",
+            json={"current_password": PASSWORD, "new_password": new_password},
+            headers=headers,
+        )
+        assert changed.status_code == 200, changed.text
+        assert (await laptop.get("/api/v1/auth/me")).status_code == 200
+        assert (await phone.get("/api/v1/auth/me")).status_code == 401
+
+        old = await phone.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": PASSWORD},
+            headers={"Origin": ORIGIN},
+        )
+        new = await phone.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": new_password},
+            headers={"Origin": ORIGIN},
+        )
+    assert old.status_code == 401
+    assert new.status_code == 200
 
 
 @pytest.mark.asyncio
@@ -296,9 +340,8 @@ async def test_errors_share_one_envelope(harness: Harness) -> None:
         unknown = await client.get("/api/v1/does-not-exist")
         wrong_method = await client.put("/api/v1/auth/login")
         invalid = await client.post(
-            "/api/v1/auth/login", json={"firebase_id_token": "short"}, headers={"Origin": ORIGIN}
+            "/api/v1/auth/login", json={"email": "not-an-email"}, headers={"Origin": ORIGIN}
         )
-        harness.app.state.token_verifier = None
         harness.app.state.settings = None
         crashed = await client.get("/api/v1/auth/me", headers={"Origin": ORIGIN})
 
@@ -314,7 +357,7 @@ async def test_errors_share_one_envelope(harness: Harness) -> None:
         assert body["success"] is False
         assert body["error"]["code"] == code
         assert body["meta"]["request_id"] == response.headers["x-request-id"]
-    assert invalid.json()["error"]["details"][0]["field"] == "body.firebase_id_token"
+    assert invalid.json()["error"]["details"][0]["field"] == "body.email"
     assert crashed.headers["access-control-allow-origin"] == ORIGIN
 
 

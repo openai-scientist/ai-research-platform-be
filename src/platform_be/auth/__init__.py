@@ -1,1 +1,1 @@
-"""Firebase identity exchange and Platform session handling."""
+"""Platform accounts and session handling."""

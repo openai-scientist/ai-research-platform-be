@@ -1,10 +1,10 @@
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from functools import lru_cache
 
 from fastapi import APIRouter, Depends, Request, Response
-from pydantic import BaseModel, Field
-from sqlalchemy import select, text, update
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -18,12 +18,16 @@ from platform_be.auth.sessions import (
     require_origin,
     set_session_cookie,
 )
-from platform_be.auth.tokens import FirebaseTokenRejected, FirebaseTokenVerifier
 from platform_be.core.config import Settings
 from platform_be.core.errors import APIError
 from platform_be.core.responses import ApiResponse, ErrorResponse, ok
 from platform_be.core.roles import PlatformRole, ProjectRole
-from platform_be.core.security import new_session_secret, token_digest
+from platform_be.core.security import (
+    hash_password,
+    new_session_secret,
+    token_digest,
+    verify_password,
+)
 from platform_be.db.session import get_db
 from platform_be.models.identity import AuthSession, User, UserPlatformRole, UserStatus
 from platform_be.models.project import Project, ProjectMembership
@@ -37,17 +41,48 @@ SESSION_REQUIRED = {
         "description": "The Platform session is missing, expired, revoked, or suspended",
     },
 }
+SIGN_IN_ERRORS = {
+    403: {"model": ErrorResponse, "description": "Origin is not allowed or the user is suspended"},
+    413: {
+        "model": ErrorResponse,
+        "description": "The request body exceeds the configured maximum size",
+    },
+    429: {
+        "model": ErrorResponse,
+        "description": "The per-instance sign-in rate limit was exceeded",
+        "headers": {
+            "Retry-After": {
+                "description": "Seconds to wait before retrying",
+                "schema": {"type": "integer"},
+            }
+        },
+    },
+}
+CSRF_ERRORS = {
+    **SESSION_REQUIRED,
+    403: {
+        "model": ErrorResponse,
+        "description": "Origin is not allowed or the CSRF token is invalid",
+    },
+}
+
+Password = Field(min_length=8, max_length=128, description="8 to 128 characters.")
+
+
+class RegisterRequest(BaseModel):
+    email: EmailStr = Field(description="The sign-in name. One account per email.")
+    password: str = Password
+    display_name: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class LoginRequest(BaseModel):
-    firebase_id_token: str = Field(
-        min_length=20,
-        max_length=8192,
-        description=(
-            "ID token of the signed-in Firebase user (Google or email/password), "
-            "obtained from the Firebase SDK with getIdToken()."
-        ),
-    )
+    email: EmailStr
+    password: str = Field(min_length=1, max_length=128)
+
+
+class PasswordChange(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Password
 
 
 class UserProfile(BaseModel):
@@ -66,13 +101,10 @@ class SessionDetails(BaseModel):
     absolute_expires_at: datetime
 
 
-class LoginResult(BaseModel):
+class SessionResult(BaseModel):
     user: UserProfile
     session: SessionDetails
     csrf_token: str
-    is_new_user: bool = Field(
-        description="True when this login registered the Platform account (first sign-up)."
-    )
 
 
 class MembershipSummary(BaseModel):
@@ -94,114 +126,10 @@ class CsrfToken(BaseModel):
     csrf_token: str
 
 
-@dataclass(slots=True)
-class FirebaseIdentity:
-    uid: str
-    email: str
-    display_name: str | None
-    sign_in_provider: str | None
-
-
-def _token_verifier(request: Request) -> Any:
-    verifier = request.app.state.token_verifier
-    if verifier is None:
-        verifier = FirebaseTokenVerifier(request.app.state.settings)
-        request.app.state.token_verifier = verifier
-    return verifier
-
-
-async def _verified_identity(request: Request, id_token: str) -> FirebaseIdentity:
-    """Verify the Firebase ID token and enforce the Platform's sign-in requirements."""
-    verifier = _token_verifier(request)
-    try:
-        claims = await run_in_threadpool(verifier.verify, id_token)
-    except (FirebaseTokenRejected, ValueError) as exc:
-        raise APIError(401, "FIREBASE_TOKEN_INVALID", "Firebase identity token is invalid") from exc
-    except Exception as exc:
-        raise APIError(
-            503,
-            "IDENTITY_PROVIDER_UNAVAILABLE",
-            "Firebase identity verification is temporarily unavailable",
-        ) from exc
-
-    email = claims.get("email")
-    firebase_uid = claims.get("uid") or claims.get("sub")
-    if (
-        not isinstance(email, str)
-        or not email
-        or not isinstance(firebase_uid, str)
-        or not firebase_uid
-    ):
-        raise APIError(
-            401, "FIREBASE_IDENTITY_INCOMPLETE", "Firebase token has no email or user ID"
-        )
-    if claims.get("email_verified") is not True:
-        raise APIError(403, "EMAIL_NOT_VERIFIED", "Verify your email before accessing the platform")
-    auth_time = claims.get("auth_time")
-    settings: Settings = request.app.state.settings
-    now_seconds = int(datetime.now(UTC).timestamp())
-    if (
-        not isinstance(auth_time, (int, float))
-        or now_seconds - int(auth_time) > settings.recent_auth_seconds
-        or int(auth_time) > now_seconds + 60
-    ):
-        raise APIError(401, "RECENT_AUTH_REQUIRED", "Sign in again to establish a Platform session")
-
-    display_name = claims.get("name")
-    firebase_claim = claims.get("firebase")
-    provider = firebase_claim.get("sign_in_provider") if isinstance(firebase_claim, dict) else None
-    return FirebaseIdentity(
-        uid=firebase_uid,
-        email=email,
-        display_name=display_name if isinstance(display_name, str) else None,
-        sign_in_provider=provider if isinstance(provider, str) else None,
-    )
-
-
-async def _register_or_update_user(
-    db: AsyncSession, identity: FirebaseIdentity, request_id: str | None
-) -> tuple[User, bool]:
-    """Find the Platform user for a Firebase UID, creating it on first login."""
-    normalized = normalize_email(identity.email)
-    if db.bind and db.bind.dialect.name == "postgresql":
-        identity_keys = sorted((f"firebase-uid:{identity.uid}", f"verified-email:{normalized}"))
-        for identity_key in identity_keys:
-            await db.execute(
-                text("SELECT pg_advisory_xact_lock(hashtextextended(:identity_key, 0))"),
-                {"identity_key": identity_key},
-            )
-    user = await db.scalar(select(User).where(User.firebase_uid == identity.uid).with_for_update())
-    email_owner = await db.scalar(select(User.id).where(User.email_normalized == normalized))
-    if email_owner is not None and (user is None or email_owner != user.id):
-        raise APIError(409, "EMAIL_ALREADY_LINKED", "This email belongs to another identity")
-    if user is not None:
-        user.email = identity.email
-        user.email_normalized = normalized
-        user.display_name = identity.display_name or user.display_name
-        return user, False
-
-    user = User(
-        firebase_uid=identity.uid,
-        email=identity.email,
-        email_normalized=normalized,
-        display_name=identity.display_name,
-        status=UserStatus.ACTIVE,
-    )
-    db.add(user)
-    await db.flush()
-    record_audit(
-        db,
-        actor_user_id=user.id,
-        action="user.registered",
-        resource_type="user",
-        resource_id=user.id,
-        request_id=request_id,
-        details={
-            "status": UserStatus.ACTIVE,
-            "sign_in_provider": identity.sign_in_provider,
-        },
-    )
-    return user, True
+@lru_cache
+def _unused_password_hash(log2_n: int) -> str:
+    """A hash no password matches, so signing in costs the same whether the email exists."""
+    return hash_password(new_session_secret(), log2_n)
 
 
 async def _user_profile(db: AsyncSession, user: User) -> UserProfile:
@@ -225,68 +153,9 @@ def _session_details(session: AuthSession) -> SessionDetails:
     )
 
 
-@router.post(
-    "/login",
-    response_model=ApiResponse[LoginResult],
-    summary="Sign in (or sign up) with a Firebase ID token",
-    description=(
-        "Single entry point for Google and email/password accounts. The frontend signs the "
-        "user up or in with the Firebase SDK, then exchanges a recent, email-verified "
-        "Firebase ID token for a Platform HttpOnly session cookie. The first login of a "
-        "Firebase account registers the Platform user (`is_new_user: true`), who can use "
-        "the Platform right away. Email verification, password reset, and provider linking stay "
-        "in the Firebase SDK."
-    ),
-    responses={
-        401: {
-            "model": ErrorResponse,
-            "description": (
-                "Firebase token is invalid, identity is incomplete, or sign-in is not recent"
-            ),
-        },
-        403: {
-            "model": ErrorResponse,
-            "description": "Origin is not allowed, email is not verified, or the user is suspended",
-        },
-        409: {
-            "model": ErrorResponse,
-            "description": "The verified email is already linked to another Firebase identity",
-        },
-        413: {
-            "model": ErrorResponse,
-            "description": "The request body exceeds the configured maximum size",
-        },
-        429: {
-            "model": ErrorResponse,
-            "description": "The per-instance login rate limit was exceeded",
-            "headers": {
-                "Retry-After": {
-                    "description": "Seconds to wait before retrying",
-                    "schema": {"type": "integer"},
-                }
-            },
-        },
-        503: {
-            "model": ErrorResponse,
-            "description": "Firebase identity verification is temporarily unavailable",
-        },
-    },
-)
-async def login(
-    body: LoginRequest,
-    request: Request,
-    response: Response,
-    _: None = Depends(require_origin),
-    db: AsyncSession = Depends(get_db),
-) -> ApiResponse[LoginResult]:
-    settings: Settings = request.app.state.settings
-    identity = await _verified_identity(request, body.firebase_id_token)
-    user, is_new_user = await _register_or_update_user(
-        db, identity, getattr(request.state, "request_id", None)
-    )
-    if user.status == UserStatus.SUSPENDED:
-        raise APIError(403, "USER_SUSPENDED", "This account is suspended")
-
+async def _start_session(
+    db: AsyncSession, response: Response, settings: Settings, user: User
+) -> SessionResult:
     raw_secret = new_session_secret()
     now = datetime.now(UTC)
     session = AuthSession(
@@ -300,17 +169,149 @@ async def login(
     db.add(session)
     await db.flush()
     set_session_cookie(response, settings, raw_secret)
-    return ok(
-        LoginResult(
-            user=await _user_profile(db, user),
-            session=_session_details(session),
-            csrf_token=csrf_for_principal(
-                Principal(user=user, session=session, raw_secret=raw_secret), settings
-            ),
-            is_new_user=is_new_user,
+    return SessionResult(
+        user=await _user_profile(db, user),
+        session=_session_details(session),
+        csrf_token=csrf_for_principal(
+            Principal(user=user, session=session, raw_secret=raw_secret), settings
         ),
-        "Account registered" if is_new_user else "Signed in",
     )
+
+
+@router.post(
+    "/register",
+    status_code=201,
+    response_model=ApiResponse[SessionResult],
+    summary="Create an account and sign in",
+    description=(
+        "Registers a user with an email and a password and starts a session, exactly as "
+        "`login` does. The account is usable right away; the email is not verified."
+    ),
+    responses={
+        **SIGN_IN_ERRORS,
+        409: {"model": ErrorResponse, "description": "An account with this email already exists"},
+    },
+)
+async def register(
+    body: RegisterRequest,
+    request: Request,
+    response: Response,
+    _: None = Depends(require_origin),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[SessionResult]:
+    settings: Settings = request.app.state.settings
+    normalized = normalize_email(body.email)
+    taken = APIError(409, "EMAIL_ALREADY_REGISTERED", "An account with this email already exists")
+    if await db.scalar(select(User.id).where(User.email_normalized == normalized)) is not None:
+        raise taken
+    user = User(
+        email=body.email,
+        email_normalized=normalized,
+        display_name=body.display_name.strip() if body.display_name else None,
+        password_hash=await run_in_threadpool(
+            hash_password, body.password, settings.password_scrypt_log2_n
+        ),
+        status=UserStatus.ACTIVE,
+    )
+    db.add(user)
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # Someone registered the same email between the check and the insert.
+        raise taken from exc
+    record_audit(
+        db,
+        actor_user_id=user.id,
+        action="user.registered",
+        resource_type="user",
+        resource_id=user.id,
+        request_id=getattr(request.state, "request_id", None),
+        details={"status": UserStatus.ACTIVE},
+    )
+    return ok(await _start_session(db, response, settings, user), "Account registered")
+
+
+@router.post(
+    "/login",
+    response_model=ApiResponse[SessionResult],
+    summary="Sign in with email and password",
+    description=(
+        "Starts a session: sets the HttpOnly session cookie and returns the user and the "
+        "CSRF token to send on mutating requests."
+    ),
+    responses={
+        **SIGN_IN_ERRORS,
+        401: {"model": ErrorResponse, "description": "The email or the password is wrong"},
+    },
+)
+async def login(
+    body: LoginRequest,
+    request: Request,
+    response: Response,
+    _: None = Depends(require_origin),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[SessionResult]:
+    settings: Settings = request.app.state.settings
+    user = await db.scalar(select(User).where(User.email_normalized == normalize_email(body.email)))
+    stored = (
+        user.password_hash
+        if user is not None and user.password_hash
+        else _unused_password_hash(settings.password_scrypt_log2_n)
+    )
+    if not await run_in_threadpool(verify_password, body.password, stored) or user is None:
+        raise APIError(401, "INVALID_CREDENTIALS", "The email or the password is wrong")
+    if user.status == UserStatus.SUSPENDED:
+        raise APIError(403, "USER_SUSPENDED", "This account is suspended")
+    return ok(await _start_session(db, response, settings, user), "Signed in")
+
+
+@router.post(
+    "/change-password",
+    response_model=ApiResponse[None],
+    summary="Change your password",
+    description=(
+        "Needs the current password. Every other session of the user is signed out; the "
+        "one making the change stays signed in."
+    ),
+    responses={
+        **CSRF_ERRORS,
+        403: {
+            "model": ErrorResponse,
+            "description": "The current password is wrong, or the CSRF token is invalid",
+        },
+    },
+)
+async def change_password(
+    body: PasswordChange,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_csrf),
+) -> ApiResponse[None]:
+    settings: Settings = request.app.state.settings
+    user = principal.user
+    if not await run_in_threadpool(verify_password, body.current_password, user.password_hash):
+        raise APIError(403, "CURRENT_PASSWORD_INCORRECT", "The current password is wrong")
+    user.password_hash = await run_in_threadpool(
+        hash_password, body.new_password, settings.password_scrypt_log2_n
+    )
+    await db.execute(
+        update(AuthSession)
+        .where(
+            AuthSession.user_id == user.id,
+            AuthSession.id != principal.session.id,
+            AuthSession.revoked_at.is_(None),
+        )
+        .values(revoked_at=datetime.now(UTC))
+    )
+    record_audit(
+        db,
+        actor_user_id=user.id,
+        action="user.password_changed",
+        resource_type="user",
+        resource_id=user.id,
+        request_id=getattr(request.state, "request_id", None),
+    )
+    return ok(None, "Password changed")
 
 
 @router.get(
@@ -370,15 +371,9 @@ async def get_csrf_token(
     summary="Sign out of the current session",
     description=(
         "Revokes the current Platform session and clears its cookie. Requires the "
-        "X-CSRF-Token header. The frontend should also call Firebase signOut()."
+        "X-CSRF-Token header."
     ),
-    responses={
-        **SESSION_REQUIRED,
-        403: {
-            "model": ErrorResponse,
-            "description": "Origin is not allowed or the CSRF token is invalid",
-        },
-    },
+    responses=CSRF_ERRORS,
 )
 async def logout(
     request: Request,
@@ -401,13 +396,7 @@ async def logout(
         "and devices. Use after a password change or a lost device. Requires the "
         "X-CSRF-Token header."
     ),
-    responses={
-        **SESSION_REQUIRED,
-        403: {
-            "model": ErrorResponse,
-            "description": "Origin is not allowed or the CSRF token is invalid",
-        },
-    },
+    responses=CSRF_ERRORS,
 )
 async def logout_all(
     request: Request,
