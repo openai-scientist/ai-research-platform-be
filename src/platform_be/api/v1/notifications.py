@@ -1,0 +1,168 @@
+from datetime import UTC, datetime
+from typing import Literal
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel, Field
+from sqlalchemy import exists, func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
+
+from platform_be.auth.sessions import Principal, require_active_csrf, require_active_principal
+from platform_be.core.errors import APIError
+from platform_be.core.responses import ApiResponse, ErrorResponse, ok, paginated
+from platform_be.db.session import get_db
+from platform_be.models.collaboration import Notification
+from platform_be.models.identity import User
+from platform_be.models.project import Project, ProjectMembership
+
+router = APIRouter(prefix="/notifications", tags=["notifications"])
+
+NotificationKind = Literal[
+    "run_awaiting_review", "run_finished", "added_to_project", "run_commented"
+]
+NOT_FOUND = {404: {"model": ErrorResponse, "description": "The notification is not yours"}}
+
+
+class NotificationItem(BaseModel):
+    """Carries no sentence: the client words it from `kind` and the names given here."""
+
+    id: str
+    kind: NotificationKind
+    project_id: str
+    project_name: str
+    run_id: str | None
+    actor_user_id: str | None
+    actor_display_name: str | None
+    created_at: datetime
+    read_at: datetime | None
+
+
+class UnreadCount(BaseModel):
+    unread_count: int
+
+
+class MarkedRead(BaseModel):
+    marked: int = Field(description="How many notifications were unread before this call.")
+
+
+def _mine(user_id: UUID) -> list:
+    """The user's notifications for projects they are still a member of."""
+    return [
+        Notification.recipient_user_id == user_id,
+        exists().where(
+            ProjectMembership.project_id == Notification.project_id,
+            ProjectMembership.user_id == user_id,
+            ProjectMembership.status == "active",
+        ),
+    ]
+
+
+def _item(notification: Notification, project_name: str, actor_name: str | None):
+    return NotificationItem(
+        id=str(notification.id),
+        kind=notification.kind,
+        project_id=str(notification.project_id),
+        project_name=project_name,
+        run_id=str(notification.run_id) if notification.run_id else None,
+        actor_user_id=str(notification.actor_user_id) if notification.actor_user_id else None,
+        actor_display_name=actor_name,
+        created_at=notification.created_at,
+        read_at=notification.read_at,
+    )
+
+
+def _with_names(*filters):
+    actor = aliased(User)
+    return (
+        select(Notification, Project.name, actor.display_name)
+        .join(Project, Project.id == Notification.project_id)
+        .outerjoin(actor, actor.id == Notification.actor_user_id)
+        .where(*filters)
+    )
+
+
+@router.get(
+    "",
+    response_model=ApiResponse[list[NotificationItem]],
+    summary="List my notifications, newest first",
+)
+async def list_notifications(
+    unread_only: bool = False,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(require_active_principal),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[list[NotificationItem]]:
+    filters = _mine(principal.user.id)
+    if unread_only:
+        filters.append(Notification.read_at.is_(None))
+    total = int(
+        await db.scalar(select(func.count()).select_from(Notification).where(*filters)) or 0
+    )
+    rows = (
+        await db.execute(
+            _with_names(*filters)
+            .order_by(Notification.created_at.desc(), Notification.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+    return paginated([_item(*row) for row in rows], total=total, limit=limit, offset=offset)
+
+
+@router.get(
+    "/unread-count",
+    response_model=ApiResponse[UnreadCount],
+    summary="Count my unread notifications",
+)
+async def unread_count(
+    principal: Principal = Depends(require_active_principal),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[UnreadCount]:
+    count = await db.scalar(
+        select(func.count())
+        .select_from(Notification)
+        .where(*_mine(principal.user.id), Notification.read_at.is_(None))
+    )
+    return ok(UnreadCount(unread_count=int(count or 0)))
+
+
+@router.post(
+    "/read-all",
+    response_model=ApiResponse[MarkedRead],
+    summary="Mark all my notifications as read",
+)
+async def mark_all_read(
+    principal: Principal = Depends(require_active_csrf),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[MarkedRead]:
+    result = await db.execute(
+        update(Notification)
+        .where(Notification.recipient_user_id == principal.user.id, Notification.read_at.is_(None))
+        .values(read_at=datetime.now(UTC))
+    )
+    return ok(MarkedRead(marked=result.rowcount), "Notifications marked as read")
+
+
+@router.post(
+    "/{notification_id}/read",
+    response_model=ApiResponse[NotificationItem],
+    summary="Mark one notification as read",
+    responses=NOT_FOUND,
+)
+async def mark_read(
+    notification_id: UUID,
+    principal: Principal = Depends(require_active_csrf),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[NotificationItem]:
+    row = (
+        await db.execute(_with_names(*_mine(principal.user.id), Notification.id == notification_id))
+    ).first()
+    if row is None:
+        raise APIError(404, "NOT_FOUND", "Notification was not found")
+    notification = row[0]
+    if notification.read_at is None:
+        notification.read_at = datetime.now(UTC)
+        await db.flush()
+    return ok(_item(*row), "Notification marked as read")
