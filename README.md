@@ -1,73 +1,67 @@
 # AI Research Platform Backend
 
-Platform API for identity, users, organizations, projects, workspace access, and audit. The Platform BE is independent from Popper: the frontend uses Platform for accounts and workspaces, then connects to Popper for AI and research workflows.
+Platform API for identity, users, projects, project access, and audit. The Platform BE is independent from Popper: the frontend uses Platform for accounts and projects, then connects to Popper for AI and research workflows.
 
 ## Current scope
 
 - Firebase Authentication identity exchange and opaque Platform sessions.
-- Fixed roles at platform, organization, and project scope.
-- User administration, organization and project membership, archive/restore, and audit events.
+- Fixed roles at platform and project scope.
+- User administration, projects and project membership, archive/restore, and audit events.
 - Dataset catalog/versioning, research lifecycle, paper writing, and Popper integration remain follow-up work.
 
 The research flow remains a separate system contract: question → problem understanding → dataset → analysis → hypothesis → analysis → diagram → paper. This repository does not create placeholder routes or records for that workflow.
 
 ## Roles
 
-Each user has at most one active role in each organization and project. Roles are fixed in the API schema; there is no permission editor or custom role system. Access is decided by role alone — there is no permission table. The role codes are defined once in `src/platform_be/core/roles.py` and published as enums in OpenAPI.
+The Platform has the four roles the PRD names. A role alone decides access: there is no permission table, role editor, or custom role. A user holds at most one role in each project.
 
-The PRD names four roles (Admin, Project Manager, Researcher, Reviewer). `platform_admin` is the PRD's Admin and the three project roles keep the PRD names; the two organization roles are added here because the ERD has organizations as tenants but the PRD names no role to manage them.
-
-| Role | Scope | Platform BE capability |
+| Role | Scope | Capabilities |
 |---|---|---|
-| `platform_admin` | Platform | Manage users (suspend, grant Platform Admin) and administer any organization, project, and audit scope. |
-| `organization_admin` | Organization | Held by whoever creates the organization. Manage the organization, its members, and all child project metadata/members. |
-| `organization_member` | Organization | View the organization and create projects; creator becomes the first Project Manager. Existing projects require explicit project membership. |
-| `project_manager` | Project | Read/update project metadata, manage project members, and archive/restore the project. |
-| `researcher` | Project | Read project metadata. Research operations are not implemented here. |
-| `reviewer` | Project | Read project metadata. Research review artifacts are not implemented here. |
+| `platform_admin` | Platform | The PRD's Admin. Manage users (suspend, grant Platform Admin), see and manage every project, read the global audit log. |
+| `project_manager` | Project | Held by whoever creates the project. Edit project details, archive/restore, manage members, read the project audit log. |
+| `researcher` | Project | Work in the project. Read project details and members. |
+| `reviewer` | Project | Review the project's outputs. Read project details and members. |
 
-Organization and project archive make the corresponding scope read-only. Archiving an organization blocks writes to all its projects without changing their individual archived status. Restore does not unarchive child projects.
+Researcher and Reviewer have the same rights in this API; they differ in the research workflow (PRD §10), which Popper and later modules enforce.
 
-### Workspace flow
+### Project flow
+
+The project is the top-level scope, as in the BRD and PRD: there is no organization or workspace above it.
+
+```text
+Sign in -> POST /projects (creator owns it and is its Project Manager)
+        -> POST /projects/{id}/members (email of a registered user + role)
+        -> research
+```
 
 1. A user signs up and is active immediately; no admin approval is needed.
-2. Any user creates an organization (`POST /api/v1/organizations`) and becomes its Organization Admin.
-3. The Organization Admin adds members by email; the person must already have an account.
-4. Any member creates projects and becomes the Project Manager of each one they create.
-5. The Project Manager adds organization members to the project as Researcher or Reviewer.
+2. Any signed-in user creates a project and becomes its owner and Project Manager.
+3. The Project Manager adds members by email as Project Manager, Researcher, or Reviewer. The person must already have an account; there is no invitation email.
+4. `GET /projects` lists the projects the user belongs to. Being a Reviewer in one project does not stop a user from creating their own.
 
 A Platform Admin is only needed for system tasks: suspending users, granting Platform Admin, global audit.
 
 ### Who can do what
 
-There is no hard delete: "delete" for an organization or project is **archive** (read-only, restorable). Removing a member revokes the membership.
+There is no hard delete: "delete" for a project is **archive** (read-only, restorable). Removing a member revokes the membership.
 
-Organization:
-
-| Action | Platform Admin | Organization Admin | Organization Member | Not a member |
+| Action | Platform Admin | Project Manager | Researcher / Reviewer | Not a member |
 |---|:-:|:-:|:-:|:-:|
-| Create (`POST /organizations`) | ✓ | — | — | ✓ any user; creator becomes Organization Admin |
-| Read details | ✓ | ✓ | ✓ | 404 |
-| List | all | own | own | own |
-| Update name/description | ✓ | ✓ | 403 | 404 |
+| Create (`POST /projects`) | ✓ | — | — | ✓ any user; creator becomes Project Manager |
+| List (`GET /projects`) | all | own | own | own |
+| Read details and members | ✓ | ✓ | ✓ | 404 |
+| Update details | ✓ | ✓ | 403 | 404 |
 | Archive / restore | ✓ | ✓ | 403 | 404 |
-| List members | ✓ | ✓ | ✓ | 404 |
-| Add / change role / remove members | ✓ | ✓ | 403 | 404 |
-| View organization audit | ✓ | ✓ | 404 | 404 |
+| Add / change role / remove member | ✓ | ✓ | 403 | 404 |
+| Read project audit | ✓ | ✓ | 404 | 404 |
 
-Project (the user must first belong to the organization):
+Rules that protect a project:
 
-| Action | Platform Admin / Organization Admin | Project Manager | Researcher | Reviewer | Organization Member outside the project |
-|---|:-:|:-:|:-:|:-:|:-:|
-| Create (`POST .../projects`) | ✓ may name another member as manager | — | — | — | ✓ creator becomes Project Manager |
-| Read details | ✓ | ✓ | ✓ | ✓ | 404 |
-| List | all in the organization | own | own | own | own |
-| Update | ✓ | ✓ | 403 | 403 | 404 |
-| Archive / restore | ✓ | ✓ | 403 | 403 | 404 |
-| List members | ✓ | ✓ | ✓ | ✓ | 404 |
-| Add / change role / remove members | ✓ | ✓ | 403 | 403 | 404 |
+- A project always keeps one active Project Manager: the last one cannot be demoted or removed (`LAST_PROJECT_MANAGER`).
+- Suspending a user is refused while they are the only Project Manager of a project other people work in. A project they work in alone never blocks the suspension.
+- An archived project is read-only (`PROJECT_ARCHIVED`); its research status is kept and comes back on restore.
 
-Project roles apply inside one project: a Researcher in one project is still free to create their own project in the same organization. A Platform Admin who is not an organization member must name the first Project Manager when creating a project there.
+Project `status` follows the PRD: `draft`, `data_ready`, `researching`, `needs_review`, `completed`, and `archived`. New projects start as `draft`; the dataset and research modules will move the status forward.
 
 ## Requirements
 
@@ -169,9 +163,14 @@ Local settings are copied from the template to the ignored local settings file. 
 | `GET` | `/api/v1/users` | List users (Platform Admin) |
 | `PATCH` | `/api/v1/users/{id}/status` | Activate or suspend a user (Platform Admin) |
 | `PUT` | `/api/v1/users/{id}/platform-role` | Grant or remove Platform Admin |
-| `GET` | `/api/v1/audit` | Audit events (Platform Admin global; Organization Admin by organization) |
+| `GET` | `/api/v1/audit` | Audit events (Platform Admin global; Project Manager with `project_id`) |
+| `GET` `POST` | `/api/v1/projects` | List my projects; create a project |
+| `GET` `PATCH` | `/api/v1/projects/{id}` | Read or update project details |
+| `POST` | `/api/v1/projects/{id}/archive`, `/restore` | Archive or restore a project |
+| `GET` `POST` | `/api/v1/projects/{id}/members` | List members; add a registered user by email |
+| `PUT` `DELETE` | `/api/v1/projects/{id}/members/{membership_id}` | Change a member's role; remove a member |
 
-Organization CRUD, membership management, and archive/restore live under `/api/v1/organizations`; the same for projects under `/api/v1/organizations/{organization_id}/projects`. Detailed schemas, fixed role codes, and error cases are published by FastAPI OpenAPI at `/docs`.
+Detailed schemas, fixed role codes, and error cases are published by FastAPI OpenAPI at `/docs`.
 
 ### Response format
 

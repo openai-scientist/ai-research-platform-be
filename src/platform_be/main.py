@@ -51,7 +51,7 @@ def create_app(
     app = FastAPI(
         title=settings.app_name,
         version="0.1.0",
-        description="Identity and workspace APIs for the AI Research Platform.",
+        description="Identity, project, and access APIs for the AI Research Platform.",
         debug=settings.debug,
         lifespan=lifespan,
     )

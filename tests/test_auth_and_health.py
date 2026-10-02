@@ -48,7 +48,7 @@ async def test_health_probes_and_openapi(harness: Harness) -> None:
     request_properties = schema["components"]["schemas"][request_schema_name]["properties"]
     assert set(request_properties) == {"firebase_id_token"}
     assert "HTTPValidationError" not in schema["components"]["schemas"]
-    assert "/api/v1/organizations/{organization_id}/projects/{project_id}" in schema["paths"]
+    assert "/api/v1/projects/{project_id}/members/{membership_id}" in schema["paths"]
     assert "/api/v1/research" not in schema["paths"]
 
 

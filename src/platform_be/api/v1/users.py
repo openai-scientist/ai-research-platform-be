@@ -18,10 +18,9 @@ from platform_be.core.roles import PlatformRole
 from platform_be.db.session import get_db
 from platform_be.models.identity import AuthSession, User, UserPlatformRole, UserStatus
 from platform_be.services.access import (
-    ensure_user_suspension_preserves_workspace_admins,
+    ensure_user_suspension_keeps_project_managers,
     lock_user,
-    lock_user_organization_scopes,
-    lock_user_workspace_rows,
+    lock_user_project_scopes,
 )
 from platform_be.services.audit import record_audit
 
@@ -112,7 +111,7 @@ async def update_user_status(
     target_id = require_user_id(user_id)
     await _lock_platform_admin_set(db)
     if body.status == UserStatus.SUSPENDED:
-        await lock_user_organization_scopes(db, target_id)
+        await lock_user_project_scopes(db, target_id)
     target = await lock_user(db, target_id)
     if target.status == body.status:
         return ok(await _user_item(db, target))
@@ -122,8 +121,7 @@ async def update_user_status(
                 409, "LAST_PLATFORM_ADMIN", "The last active Platform Admin cannot be suspended"
             )
     if body.status == UserStatus.SUSPENDED and target.status == UserStatus.ACTIVE:
-        await lock_user_workspace_rows(db, target.id)
-        await ensure_user_suspension_preserves_workspace_admins(db, target)
+        await ensure_user_suspension_keeps_project_managers(db, target)
     before = target.status
     target.status = body.status
     now = datetime.now(UTC)

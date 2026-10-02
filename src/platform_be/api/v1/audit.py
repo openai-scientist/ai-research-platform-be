@@ -9,11 +9,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from platform_be.auth.sessions import Principal, require_active_principal
 from platform_be.core.errors import APIError
 from platform_be.core.responses import ApiResponse, paginated
-from platform_be.core.roles import OrganizationRole
+from platform_be.core.roles import ProjectRole
 from platform_be.db.session import get_db
 from platform_be.models.audit import AuditEvent
 from platform_be.models.identity import UserPlatformRole
-from platform_be.models.workspace import OrganizationMembership
+from platform_be.models.project import ProjectMembership
 
 router = APIRouter(prefix="/audit", tags=["audit"])
 
@@ -24,7 +24,6 @@ class AuditItem(BaseModel):
     action: str
     resource_type: str
     resource_id: str
-    organization_id: str | None
     project_id: str | None
     request_id: str | None
     details: dict
@@ -33,7 +32,6 @@ class AuditItem(BaseModel):
 
 @router.get("", response_model=ApiResponse[list[AuditItem]])
 async def list_audit_events(
-    organization_id: UUID | None = None,
     project_id: UUID | None = None,
     action: str | None = Query(default=None, min_length=1, max_length=120),
     from_time: datetime | None = Query(
@@ -60,22 +58,20 @@ async def list_audit_events(
 
     is_platform_admin = await db.get(UserPlatformRole, principal.user.id) is not None
     query = select(AuditEvent)
-    if organization_id is None:
-        if not is_platform_admin or project_id is not None:
+    if project_id is None:
+        if not is_platform_admin:
             raise APIError(404, "NOT_FOUND", "Audit scope was not found")
     else:
-        is_org_admin = await db.scalar(
-            select(OrganizationMembership.id).where(
-                OrganizationMembership.organization_id == organization_id,
-                OrganizationMembership.user_id == principal.user.id,
-                OrganizationMembership.status == "active",
-                OrganizationMembership.role_code == OrganizationRole.ADMIN,
+        is_project_manager = await db.scalar(
+            select(ProjectMembership.id).where(
+                ProjectMembership.project_id == project_id,
+                ProjectMembership.user_id == principal.user.id,
+                ProjectMembership.status == "active",
+                ProjectMembership.role_code == ProjectRole.MANAGER,
             )
         )
-        if not is_platform_admin and not is_org_admin:
+        if not is_platform_admin and not is_project_manager:
             raise APIError(404, "NOT_FOUND", "Audit scope was not found")
-        query = query.where(AuditEvent.organization_id == organization_id)
-    if project_id is not None:
         query = query.where(AuditEvent.project_id == project_id)
     if action is not None:
         query = query.where(AuditEvent.action == action.strip())
@@ -99,7 +95,6 @@ async def list_audit_events(
                 action=row.action,
                 resource_type=row.resource_type,
                 resource_id=row.resource_id,
-                organization_id=str(row.organization_id) if row.organization_id else None,
                 project_id=str(row.project_id) if row.project_id else None,
                 request_id=row.request_id,
                 details=row.details,

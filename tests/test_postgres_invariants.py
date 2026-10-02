@@ -1,7 +1,7 @@
 import asyncio
 import os
 from collections.abc import AsyncIterator
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
@@ -13,8 +13,9 @@ from platform_be.core.config import Settings
 from platform_be.db.base import Base
 from platform_be.main import create_app
 from platform_be.models.identity import User, UserStatus
-from platform_be.models.workspace import OrganizationMembership, ProjectMembership
+from platform_be.models.project import ProjectMembership
 from tests.conftest import FakeTokenVerifier, Harness, login, mutation_headers
+from tests.test_projects_api import PROJECTS, add_member, create_project
 
 
 @pytest_asyncio.fixture
@@ -53,387 +54,171 @@ async def postgres_harness() -> AsyncIterator[Harness]:
         await admin_engine.dispose()
 
 
+async def _shared_project_with_two_managers(harness: Harness, first_client, second_client):
+    """A project with two Project Managers and one Researcher."""
+    first = await login(harness, first_client, uid="manager-one", email="manager-one@example.com")
+    second = await login(harness, second_client, uid="manager-two", email="manager-two@example.com")
+    async with harness.client() as researcher_client:
+        await login(harness, researcher_client, uid="researcher", email="researcher@example.com")
+    project = await create_project(first_client, first)
+    second_member = await add_member(
+        first_client, first, project["id"], "manager-two@example.com", "project_manager"
+    )
+    await add_member(first_client, first, project["id"], "researcher@example.com", "researcher")
+    members = (await first_client.get(f"{PROJECTS}/{project['id']}/members")).json()["data"]
+    first_member = next(item for item in members if item["user_id"] == first["user"]["id"])
+    return project, (first, first_member), (second, second_member)
+
+
+async def _active_managers(harness: Harness, project_id: str) -> int:
+    async with harness.factory() as db:
+        rows = (
+            await db.execute(
+                select(ProjectMembership, User)
+                .join(User, User.id == ProjectMembership.user_id)
+                .where(
+                    ProjectMembership.project_id == UUID(project_id),
+                    ProjectMembership.status == "active",
+                    ProjectMembership.role_code == "project_manager",
+                    User.status == UserStatus.ACTIVE,
+                )
+            )
+        ).all()
+        return len(rows)
+
+
 @pytest.mark.asyncio
-async def test_concurrent_org_admin_suspensions_preserve_one_active_admin(
+async def test_concurrent_manager_suspensions_keep_one_active_manager(
     postgres_harness: Harness,
 ) -> None:
     harness = postgres_harness
     async with (
-        harness.client() as platform_admin_client,
-        harness.client() as first_admin_client,
-        harness.client() as second_admin_client,
+        harness.client() as admin_client,
+        harness.client() as first_client,
+        harness.client() as second_client,
     ):
-        platform_admin = await login(
-            harness,
-            platform_admin_client,
-            uid="concurrent-org-pa",
-            email="concurrent-org-pa@example.com",
-        )
-        first_admin = await login(
-            harness,
-            first_admin_client,
-            uid="concurrent-org-admin-one",
-            email="concurrent-org-admin-one@example.com",
-        )
-        second_admin = await login(
-            harness,
-            second_admin_client,
-            uid="concurrent-org-admin-two",
-            email="concurrent-org-admin-two@example.com",
-        )
+        admin = await login(harness, admin_client, uid="admin", email="admin@example.com")
         await bootstrap_admin(
-            "concurrent-org-pa@example.com",
-            settings=harness.settings,
-            session_factory=harness.factory,
+            "admin@example.com", settings=harness.settings, session_factory=harness.factory
         )
-        org_response = await platform_admin_client.post(
-            "/api/v1/organizations",
-            json={
-                "name": "Concurrent Organization",
-                "slug": "concurrent-organization",
-                "initial_admin_email": "concurrent-org-admin-one@example.com",
-            },
-            headers=mutation_headers(platform_admin["csrf_token"]),
+        project, (first, _), (second, _) = await _shared_project_with_two_managers(
+            harness, first_client, second_client
         )
-        assert org_response.status_code == 201, org_response.text
-        organization_id = org_response.json()["data"]["id"]
-        add_second_admin = await first_admin_client.post(
-            f"/api/v1/organizations/{organization_id}/members",
-            json={"email": "concurrent-org-admin-two@example.com", "role": "organization_admin"},
-            headers=mutation_headers(first_admin["csrf_token"]),
+        responses = await asyncio.gather(
+            *(
+                admin_client.patch(
+                    f"/api/v1/users/{session['user']['id']}/status",
+                    json={"status": "suspended"},
+                    headers=mutation_headers(admin["csrf_token"]),
+                )
+                for session in (first, second)
+            )
         )
-        assert add_second_admin.status_code == 201, add_second_admin.text
 
-        suspend_responses = await asyncio.gather(
-            platform_admin_client.patch(
-                f"/api/v1/users/{first_admin['user']['id']}/status",
-                json={"status": "suspended"},
-                headers=mutation_headers(platform_admin["csrf_token"]),
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    conflict = next(response for response in responses if response.status_code == 409)
+    assert conflict.json()["error"]["code"] == "LAST_PROJECT_MANAGER"
+    assert await _active_managers(harness, project["id"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_manager_demotions_leave_one_manager(postgres_harness: Harness) -> None:
+    harness = postgres_harness
+    async with harness.client() as first_client, harness.client() as second_client:
+        (
+            project,
+            (first, first_member),
+            (second, second_member),
+        ) = await _shared_project_with_two_managers(harness, first_client, second_client)
+        # Each manager demotes the other at the same time.
+        responses = await asyncio.gather(
+            first_client.put(
+                f"{PROJECTS}/{project['id']}/members/{second_member['id']}",
+                json={"role": "researcher"},
+                headers=mutation_headers(first["csrf_token"]),
             ),
-            platform_admin_client.patch(
-                f"/api/v1/users/{second_admin['user']['id']}/status",
-                json={"status": "suspended"},
-                headers=mutation_headers(platform_admin["csrf_token"]),
+            second_client.put(
+                f"{PROJECTS}/{project['id']}/members/{first_member['id']}",
+                json={"role": "researcher"},
+                headers=mutation_headers(second["csrf_token"]),
             ),
         )
 
-    assert sorted(response.status_code for response in suspend_responses) == [200, 409]
-    conflict = next(response for response in suspend_responses if response.status_code == 409)
-    assert conflict.json()["error"]["code"] == "LAST_ORGANIZATION_ADMIN"
+    # The loser is either refused as a non-manager or stopped by the last-manager rule.
+    assert sorted(response.status_code for response in responses)[0] == 200
+    assert sorted(response.status_code for response in responses)[1] in {403, 409}
+    assert await _active_managers(harness, project["id"]) == 1
 
+
+@pytest.mark.asyncio
+async def test_concurrent_adds_of_one_user_create_one_membership(
+    postgres_harness: Harness,
+) -> None:
+    harness = postgres_harness
+    async with harness.client() as manager_client, harness.client() as colleague_client:
+        manager = await login(harness, manager_client, uid="manager", email="manager@example.com")
+        colleague = await login(
+            harness, colleague_client, uid="colleague", email="colleague@example.com"
+        )
+        project = await create_project(manager_client, manager)
+        responses = await asyncio.gather(
+            *(
+                manager_client.post(
+                    f"{PROJECTS}/{project['id']}/members",
+                    json={"email": "colleague@example.com", "role": role},
+                    headers=mutation_headers(manager["csrf_token"]),
+                )
+                for role in ("researcher", "reviewer")
+            )
+        )
+
+    assert sorted(response.status_code for response in responses) == [201, 409]
     async with harness.factory() as db:
         memberships = (
             await db.scalars(
-                select(OrganizationMembership).where(
-                    OrganizationMembership.role_code == "organization_admin"
-                )
-            )
-        ).all()
-        active_admins = 0
-        for membership in memberships:
-            user = await db.get(User, membership.user_id)
-            active_admins += int(
-                membership.status == "active"
-                and user is not None
-                and user.status == UserStatus.ACTIVE
-            )
-        assert active_admins == 1
-
-
-@pytest.mark.asyncio
-async def test_concurrent_project_manager_demotions_leave_one_manager(
-    postgres_harness: Harness,
-) -> None:
-    harness = postgres_harness
-    async with (
-        harness.client() as platform_admin_client,
-        harness.client() as org_admin_client,
-        harness.client() as first_manager_client,
-        harness.client() as second_manager_client,
-    ):
-        platform_admin = await login(
-            harness,
-            platform_admin_client,
-            uid="concurrent-project-pa",
-            email="concurrent-project-pa@example.com",
-        )
-        org_admin = await login(
-            harness,
-            org_admin_client,
-            uid="concurrent-project-oa",
-            email="concurrent-project-oa@example.com",
-        )
-        first_manager = await login(
-            harness,
-            first_manager_client,
-            uid="concurrent-project-manager-one",
-            email="concurrent-project-manager-one@example.com",
-        )
-        second_manager = await login(
-            harness,
-            second_manager_client,
-            uid="concurrent-project-manager-two",
-            email="concurrent-project-manager-two@example.com",
-        )
-        await bootstrap_admin(
-            "concurrent-project-pa@example.com",
-            settings=harness.settings,
-            session_factory=harness.factory,
-        )
-        org_response = await platform_admin_client.post(
-            "/api/v1/organizations",
-            json={
-                "name": "Concurrent Project Organization",
-                "slug": "concurrent-project-organization",
-                "initial_admin_email": "concurrent-project-oa@example.com",
-            },
-            headers=mutation_headers(platform_admin["csrf_token"]),
-        )
-        assert org_response.status_code == 201, org_response.text
-        organization_id = org_response.json()["data"]["id"]
-        for email in (
-            "concurrent-project-manager-one@example.com",
-            "concurrent-project-manager-two@example.com",
-        ):
-            response = await org_admin_client.post(
-                f"/api/v1/organizations/{organization_id}/members",
-                json={"email": email, "role": "organization_member"},
-                headers=mutation_headers(org_admin["csrf_token"]),
-            )
-            assert response.status_code == 201, response.text
-        project_response = await org_admin_client.post(
-            f"/api/v1/organizations/{organization_id}/projects",
-            json={
-                "name": "Concurrent Project",
-                "slug": "concurrent-project",
-                "initial_manager_email": "concurrent-project-manager-one@example.com",
-            },
-            headers=mutation_headers(org_admin["csrf_token"]),
-        )
-        assert project_response.status_code == 201, project_response.text
-        project_id = project_response.json()["data"]["id"]
-        add_second_manager = await first_manager_client.post(
-            f"/api/v1/organizations/{organization_id}/projects/{project_id}/members",
-            json={"email": "concurrent-project-manager-two@example.com", "role": "project_manager"},
-            headers=mutation_headers(first_manager["csrf_token"]),
-        )
-        assert add_second_manager.status_code == 201, add_second_manager.text
-        members = await first_manager_client.get(
-            f"/api/v1/organizations/{organization_id}/projects/{project_id}/members"
-        )
-        assert members.status_code == 200, members.text
-        first_membership = next(
-            item
-            for item in members.json()["data"]
-            if item["email"] == "concurrent-project-manager-one@example.com"
-        )
-
-        demote_responses = await asyncio.gather(
-            first_manager_client.put(
-                f"/api/v1/organizations/{organization_id}/projects/{project_id}/members/{add_second_manager.json()['data']['id']}",
-                json={"role": "researcher"},
-                headers=mutation_headers(first_manager["csrf_token"]),
-            ),
-            second_manager_client.put(
-                f"/api/v1/organizations/{organization_id}/projects/{project_id}/members/{first_membership['id']}",
-                json={"role": "researcher"},
-                headers=mutation_headers(second_manager["csrf_token"]),
-            ),
-        )
-
-    assert sorted(response.status_code for response in demote_responses) == [200, 403]
-
-    async with harness.factory() as db:
-        active_managers = (
-            await db.scalars(
                 select(ProjectMembership).where(
-                    ProjectMembership.project_id == project_id,
+                    ProjectMembership.user_id == UUID(colleague["user"]["id"]),
                     ProjectMembership.status == "active",
-                    ProjectMembership.role_code == "project_manager",
                 )
             )
         ).all()
-        assert len(active_managers) == 1
-        user = await db.get(User, active_managers[0].user_id)
-        assert user is not None and user.status == UserStatus.ACTIVE
+        assert len(memberships) == 1
 
 
 @pytest.mark.asyncio
-async def test_concurrent_org_admin_demotions_leave_one_admin(postgres_harness: Harness) -> None:
-    harness = postgres_harness
-    async with (
-        harness.client() as platform_admin_client,
-        harness.client() as first_admin_client,
-        harness.client() as second_admin_client,
-    ):
-        platform_admin = await login(
-            harness,
-            platform_admin_client,
-            uid="concurrent-org-role-pa",
-            email="concurrent-org-role-pa@example.com",
-        )
-        first_admin = await login(
-            harness,
-            first_admin_client,
-            uid="concurrent-org-role-one",
-            email="concurrent-org-role-one@example.com",
-        )
-        second_admin = await login(
-            harness,
-            second_admin_client,
-            uid="concurrent-org-role-two",
-            email="concurrent-org-role-two@example.com",
-        )
-        await bootstrap_admin(
-            "concurrent-org-role-pa@example.com",
-            settings=harness.settings,
-            session_factory=harness.factory,
-        )
-        organization_response = await platform_admin_client.post(
-            "/api/v1/organizations",
-            json={
-                "name": "Concurrent Organization Role",
-                "slug": "concurrent-organization-role",
-                "initial_admin_email": "concurrent-org-role-one@example.com",
-            },
-            headers=mutation_headers(platform_admin["csrf_token"]),
-        )
-        assert organization_response.status_code == 201, organization_response.text
-        organization_id = organization_response.json()["data"]["id"]
-        add_second_admin = await first_admin_client.post(
-            f"/api/v1/organizations/{organization_id}/members",
-            json={"email": "concurrent-org-role-two@example.com", "role": "organization_admin"},
-            headers=mutation_headers(first_admin["csrf_token"]),
-        )
-        assert add_second_admin.status_code == 201, add_second_admin.text
-        members_response = await first_admin_client.get(
-            f"/api/v1/organizations/{organization_id}/members"
-        )
-        assert members_response.status_code == 200, members_response.text
-        members = {item["email"]: item["id"] for item in members_response.json()["data"]}
-
-        demote_responses = await asyncio.gather(
-            first_admin_client.put(
-                f"/api/v1/organizations/{organization_id}/members/{members['concurrent-org-role-two@example.com']}",
-                json={"role": "organization_member"},
-                headers=mutation_headers(first_admin["csrf_token"]),
-            ),
-            second_admin_client.put(
-                f"/api/v1/organizations/{organization_id}/members/{members['concurrent-org-role-one@example.com']}",
-                json={"role": "organization_member"},
-                headers=mutation_headers(second_admin["csrf_token"]),
-            ),
-        )
-
-    assert sorted(response.status_code for response in demote_responses) == [200, 403]
-
-    async with harness.factory() as db:
-        active_admins = (
-            await db.scalars(
-                select(OrganizationMembership).where(
-                    OrganizationMembership.organization_id == organization_id,
-                    OrganizationMembership.status == "active",
-                    OrganizationMembership.role_code == "organization_admin",
-                )
-            )
-        ).all()
-        assert len(active_admins) == 1
-
-
-@pytest.mark.asyncio
-async def test_project_member_add_races_org_membership_revoke_without_orphan(
+async def test_member_add_racing_a_suspension_never_adds_a_suspended_user(
     postgres_harness: Harness,
 ) -> None:
     harness = postgres_harness
     async with (
-        harness.client() as platform_admin_client,
-        harness.client() as org_admin_client,
-        harness.client() as target_client,
+        harness.client() as admin_client,
+        harness.client() as manager_client,
+        harness.client() as colleague_client,
     ):
-        platform_admin = await login(
-            harness,
-            platform_admin_client,
-            uid="membership-race-pa",
-            email="membership-race-pa@example.com",
-        )
-        org_admin = await login(
-            harness,
-            org_admin_client,
-            uid="membership-race-oa",
-            email="membership-race-oa@example.com",
-        )
-        await login(
-            harness,
-            target_client,
-            uid="membership-race-target",
-            email="membership-race-target@example.com",
+        admin = await login(harness, admin_client, uid="admin", email="admin@example.com")
+        manager = await login(harness, manager_client, uid="manager", email="manager@example.com")
+        colleague = await login(
+            harness, colleague_client, uid="colleague", email="colleague@example.com"
         )
         await bootstrap_admin(
-            "membership-race-pa@example.com",
-            settings=harness.settings,
-            session_factory=harness.factory,
+            "admin@example.com", settings=harness.settings, session_factory=harness.factory
         )
-        organization_response = await platform_admin_client.post(
-            "/api/v1/organizations",
-            json={
-                "name": "Membership Race Organization",
-                "slug": "membership-race-organization",
-                "initial_admin_email": "membership-race-oa@example.com",
-            },
-            headers=mutation_headers(platform_admin["csrf_token"]),
-        )
-        assert organization_response.status_code == 201, organization_response.text
-        organization_id = organization_response.json()["data"]["id"]
-        add_target = await org_admin_client.post(
-            f"/api/v1/organizations/{organization_id}/members",
-            json={"email": "membership-race-target@example.com", "role": "organization_member"},
-            headers=mutation_headers(org_admin["csrf_token"]),
-        )
-        assert add_target.status_code == 201, add_target.text
-        project_response = await org_admin_client.post(
-            f"/api/v1/organizations/{organization_id}/projects",
-            json={
-                "name": "Membership Race Project",
-                "slug": "membership-race-project",
-                "initial_manager_email": "membership-race-oa@example.com",
-            },
-            headers=mutation_headers(org_admin["csrf_token"]),
-        )
-        assert project_response.status_code == 201, project_response.text
-        project_id = project_response.json()["data"]["id"]
-
-        add_project_membership, revoke_organization_membership = await asyncio.gather(
-            org_admin_client.post(
-                f"/api/v1/organizations/{organization_id}/projects/{project_id}/members",
-                json={"email": "membership-race-target@example.com", "role": "researcher"},
-                headers=mutation_headers(org_admin["csrf_token"]),
+        project = await create_project(manager_client, manager)
+        added, suspended = await asyncio.gather(
+            manager_client.post(
+                f"{PROJECTS}/{project['id']}/members",
+                json={"email": "colleague@example.com", "role": "researcher"},
+                headers=mutation_headers(manager["csrf_token"]),
             ),
-            org_admin_client.delete(
-                f"/api/v1/organizations/{organization_id}/members/{add_target.json()['data']['id']}",
-                headers=mutation_headers(org_admin["csrf_token"]),
+            admin_client.patch(
+                f"/api/v1/users/{colleague['user']['id']}/status",
+                json={"status": "suspended"},
+                headers=mutation_headers(admin["csrf_token"]),
             ),
         )
 
-    assert add_project_membership.status_code in {201, 409}
-    assert revoke_organization_membership.status_code == 200
-    async with harness.factory() as db:
-        target_id = await db.scalar(
-            select(User.id).where(User.email_normalized == "membership-race-target@example.com")
-        )
-        active_org_membership = await db.scalar(
-            select(OrganizationMembership).where(
-                OrganizationMembership.organization_id == organization_id,
-                OrganizationMembership.user_id == target_id,
-                OrganizationMembership.status == "active",
-            )
-        )
-        active_project_membership = await db.scalar(
-            select(ProjectMembership).where(
-                ProjectMembership.organization_id == organization_id,
-                ProjectMembership.project_id == project_id,
-                ProjectMembership.user_id == target_id,
-                ProjectMembership.status == "active",
-            )
-        )
-        assert active_org_membership is None
-        assert active_project_membership is None
+    # Either order is valid; an add that comes second must be refused.
+    assert suspended.status_code == 200, suspended.text
+    assert added.status_code in {201, 409}
+    if added.status_code == 409:
+        assert added.json()["error"]["code"] == "USER_SUSPENDED"
