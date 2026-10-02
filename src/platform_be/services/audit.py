@@ -14,7 +14,6 @@ def record_audit(
     resource_type: str,
     resource_id: UUID | str,
     request_id: str | None = None,
-    organization_id: UUID | None = None,
     project_id: UUID | None = None,
     details: dict[str, Any] | None = None,
 ) -> None:
@@ -25,7 +24,6 @@ def record_audit(
             resource_type=resource_type,
             resource_id=str(resource_id),
             request_id=request_id,
-            organization_id=organization_id,
             project_id=project_id,
             details=details or {},
         )
