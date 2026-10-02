@@ -17,6 +17,13 @@ def csrf_token(session_secret: str, signing_secret: str) -> str:
     ).hexdigest()
 
 
+def service_key_matches(expected: str | None, candidate: str | None) -> bool:
+    """Compare a shared service key in constant time. No configured key matches nothing."""
+    if not expected or not candidate:
+        return False
+    return hmac.compare_digest(expected.encode("utf-8"), candidate.encode("utf-8"))
+
+
 def csrf_matches(session_secret: str, signing_secret: str, candidate: str | None) -> bool:
     if not candidate:
         return False

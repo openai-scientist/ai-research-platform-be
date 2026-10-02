@@ -128,11 +128,13 @@ async def require_project_access(
     project_id: UUID,
     *,
     manage: bool = False,
+    contribute: bool = False,
     lock: bool = False,
 ) -> tuple[Project, ProjectMembership | None]:
     """Return the project for a member or Platform Admin; anyone else gets 404.
 
     With ``manage``, a member must be the Project Manager (403 otherwise).
+    With ``contribute``, a member must be the Project Manager or a Researcher.
     The membership is None when access comes from the Platform Admin role alone.
     """
     project = await get_project(db, project_id, lock=lock)
@@ -143,6 +145,8 @@ async def require_project_access(
         raise APIError(404, "NOT_FOUND", "Project was not found")
     if manage and membership.role_code != ProjectRole.MANAGER:
         raise APIError(403, "ROLE_REQUIRED", "Project Manager role is required")
+    if contribute and membership.role_code == ProjectRole.REVIEWER:
+        raise APIError(403, "ROLE_REQUIRED", "Project Manager or Researcher role is required")
     return project, membership
 
 
