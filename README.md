@@ -1,95 +1,48 @@
 # AI Research Platform Backend
 
-Platform API for identity, users, projects, project access, and audit. The Platform BE is independent from Popper: the frontend uses Platform for accounts and projects, then connects to Popper for AI and research workflows.
+The Platform API of the AI Research Experimentation Platform. It handles sign-in, projects, who may do what, the inputs of a research run, the review step, the result files, comments, notifications, and the audit log.
 
-## Current scope
+The research itself is done by **Popper**, a separate service. The Platform sends Popper the inputs of a run, shows its progress, records who reviewed what, and keeps a copy of the results. It stores metadata and files only: it never reads or judges scientific content.
 
-- Firebase Authentication identity exchange and opaque Platform sessions.
-- Fixed roles at platform and project scope.
-- User administration, projects and project membership, archive/restore, and audit events.
-- Dataset catalog/versioning, research lifecycle, paper writing, and Popper integration remain follow-up work.
+## Contents
 
-The research flow remains a separate system contract: question → problem understanding → dataset → analysis → hypothesis → analysis → diagram → paper. This repository does not create placeholder routes or records for that workflow.
+- [Quick start](#quick-start)
+- [How the Platform works](#how-the-platform-works)
+- [Roles and permissions](#roles-and-permissions)
+- [Research features](#research-features)
+- [Authentication](#authentication)
+- [API reference](#api-reference)
+- [Configuration](#configuration)
+- [Operations](#operations)
 
-## Roles
+## Quick start
 
-The Platform has the four roles the PRD names. A role alone decides access: there is no permission table, role editor, or custom role. A user holds at most one role in each project.
-
-| Role | Scope | Capabilities |
-|---|---|---|
-| `platform_admin` | Platform | The PRD's Admin. Manage users (suspend, grant Platform Admin), see and manage every project, read the global audit log. |
-| `project_manager` | Project | Held by whoever creates the project. Edit project details, archive/restore, manage members, read the project audit log. |
-| `researcher` | Project | Work in the project. Read project details and members. |
-| `reviewer` | Project | Review the project's outputs. Read project details and members. |
-
-Researcher and Reviewer have the same rights in this API; they differ in the research workflow (PRD §10), which Popper and later modules enforce.
-
-### Project flow
-
-The project is the top-level scope, as in the BRD and PRD: there is no organization or workspace above it.
-
-```text
-Sign in -> POST /projects (creator owns it and is its Project Manager)
-        -> POST /projects/{id}/members (email of a registered user + role)
-        -> research
-```
-
-1. A user signs up and is active immediately; no admin approval is needed.
-2. Any signed-in user creates a project and becomes its owner and Project Manager.
-3. The Project Manager adds members by email as Project Manager, Researcher, or Reviewer. The person must already have an account; there is no invitation email.
-4. `GET /projects` lists the projects the user belongs to. Being a Reviewer in one project does not stop a user from creating their own.
-
-A Platform Admin is only needed for system tasks: suspending users, granting Platform Admin, global audit.
-
-### Who can do what
-
-There is no hard delete: "delete" for a project is **archive** (read-only, restorable). Removing a member revokes the membership.
-
-| Action | Platform Admin | Project Manager | Researcher / Reviewer | Not a member |
-|---|:-:|:-:|:-:|:-:|
-| Create (`POST /projects`) | ✓ | — | — | ✓ any user; creator becomes Project Manager |
-| List (`GET /projects`) | all | own | own | own |
-| Read details and members | ✓ | ✓ | ✓ | 404 |
-| Update details | ✓ | ✓ | 403 | 404 |
-| Archive / restore | ✓ | ✓ | 403 | 404 |
-| Add / change role / remove member | ✓ | ✓ | 403 | 404 |
-| Read project audit | ✓ | ✓ | 404 | 404 |
-
-Rules that protect a project:
-
-- A project always keeps one active Project Manager: the last one cannot be demoted or removed (`LAST_PROJECT_MANAGER`).
-- Suspending a user is refused while they are the only Project Manager of a project other people work in. A project they work in alone never blocks the suspension.
-- An archived project is read-only (`PROJECT_ARCHIVED`); its research status is kept and comes back on restore.
-
-Project `status` follows the PRD: `draft`, `data_ready`, `researching`, `needs_review`, `completed`, and `archived`. New projects start as `draft`; the dataset and research modules will move the status forward.
-
-## Requirements
-
-- Python 3.12+
-- `uv`
-- Docker with the Compose plugin for local PostgreSQL and the API
-- [Task (go-task)](https://taskfile.dev/docs/installation) for the project shortcuts
-
-## Local setup
-
-Copy the sample configuration to the untracked local settings file, then start the services:
+You need Python 3.12+, [`uv`](https://docs.astral.sh/uv/), Docker with the Compose plugin, and [Task](https://taskfile.dev/docs/installation).
 
 ```bash
-cp [.]env.example .env.local
-task up
+cp .env.example .env.local     # then fill in the Firebase values, see Authentication
+task up                        # PostgreSQL + API on 127.0.0.1
+task migrate                   # in a second terminal, on a fresh database
 ```
 
-Compose starts PostgreSQL and the API on host loopback (`127.0.0.1`); the API waits for the database health check. On a fresh database, apply the schema in a second terminal:
+| What | Where |
+|---|---|
+| API | `http://localhost:8000` |
+| Swagger UI | `http://localhost:8000/docs` |
+| OpenAPI schema | `http://localhost:8000/openapi.json` |
+| Liveness / readiness | `/api/v1/health/live`, `/api/v1/health/ready` (checks PostgreSQL) |
+
+Other shortcuts: `task down` (stops the stack, keeps the database volume), `task restart`, `task status`, `task logs`; `task --list` describes them all.
+
+After the first account has signed in through Firebase, make it the first Platform Admin:
 
 ```bash
-task migrate
+docker compose --env-file .env.local -f docker/docker-compose.dev.yml run --rm api platform-be bootstrap-admin --email admin@example.com
 ```
 
-The API is at `http://localhost:8000`; interactive Swagger/OpenAPI docs are at `http://localhost:8000/docs` and the schema is at `http://localhost:8000/openapi.json`.
+The command refuses to run when a Platform Admin already exists, and does not accept an unregistered or suspended account.
 
-Use `task down` to stop the local stack without deleting its database volume. `task restart`, `task status`, `task logs`, and `task migrate` are also available; run `task --list` for descriptions. FE calls Platform APIs for user, organization, project, membership, and audit operations. Liveness is `/api/v1/health/live`; readiness is `/api/v1/health/ready` and checks PostgreSQL.
-
-To run the test suite and static checks on the host:
+Tests and static checks, on the host:
 
 ```bash
 uv sync --all-groups
@@ -98,79 +51,293 @@ uv run ruff check src alembic tests
 uv run pytest
 ```
 
-When an account has been registered and verified through Firebase, grant the first platform role once:
+Tests run on SQLite in memory. The tests that need real PostgreSQL behaviour (locks, concurrent requests) are skipped unless `PLATFORM_POSTGRES_TEST_URL` points at a scratch database.
 
-```bash
-docker compose --env-file .env.local -f docker/docker-compose.dev.yml run --rm api platform-be bootstrap-admin --email admin@example.com
+## How the Platform works
+
+The project is the top-level scope: there is no organization or workspace above it.
+
+```text
+Sign in (a new account is active at once, no approval step)
+   ↓
+Create a project                     the creator is its Project Manager
+   ↓
+Add members by email                 registered users only; role: project_manager, researcher or reviewer
+   ↓
+Upload a dataset (CSV)               project: draft → data_ready
+   ↓
+Write the research context           every save is a new version
+   ↓
+Start a run                          project: researching    run: queued → running
+   ↓
+Popper asks for a frame review       project: needs_review   run: awaiting_review
+   ↓
+A Project Manager or Researcher decides: approve / edit / reject
+   ↓                                 project: researching    run: running   (may repeat)
+Popper delivers the result files and finishes
+   ↓                                 project: data_ready     run: completed | budget_exceeded | failed
+Members read the results, download files, comment
+   ↓
+Start another run, or the Project Manager marks the project completed
 ```
 
-This CLI command refuses to run if a Platform Admin already exists. It does not accept an unregistered or suspended account.
+### Project status
 
-## Authentication setup
+Derived from what the project contains; it is never set by hand, except `completed`.
 
-The current Firebase project is `ai-research-platform-4ceb9`; the shown project settings have no registered Firebase apps yet. In this project, configure Authentication providers: enable Google and set its public-facing project name and support email, enable **Email/Password**, and add the frontend's local and deployed hostnames under Authentication → Settings → Authorized domains. The Platform requires the `email_verified` claim, so the frontend must complete Firebase's email-verification flow and refresh the Firebase ID token before exchanging it.
+| Status | Meaning |
+|---|---|
+| `draft` | no dataset yet |
+| `data_ready` | has a dataset, no run in progress |
+| `researching` | a run is in progress |
+| `needs_review` | the run waits for a frame review |
+| `completed` | marked by a Project Manager while no run is in progress; can be reopened |
+| `archived` | shown instead of the above while the project is archived; the real status comes back on restore |
 
-For local Platform API authentication, open **Project settings → Service accounts → Firebase Admin SDK**, click **Generate new private key**, and download the JSON file. Copy its `project_id`, `client_email`, and `private_key` fields into the ignored local settings file. The project ID is already set in the local template; add the other two values in this form, keeping the literal `\n` sequences inside the single quotes:
+### Run status
 
-```dotenv
-FIREBASE_CLIENT_EMAIL=firebase-adminsdk-xxxxx@ai-research-platform-4ceb9.iam.gserviceaccount.com
-FIREBASE_PRIVATE_KEY='-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n'
-```
+| Status | Meaning |
+|---|---|
+| `queued` | saved, Popper has not confirmed it yet |
+| `running` | Popper is working |
+| `awaiting_review` | Popper waits for a frame review |
+| `completed`, `budget_exceeded`, `failed` | finished; never changes again |
 
-The API expands those `\n` sequences before initializing Firebase Admin SDK. Keep the downloaded JSON and private key out of Git, frontend code, screenshots, and chat. If the key is exposed, disable/delete it and generate a replacement. On Google Cloud deployments, the API can use Application Default Credentials instead, so a long-lived service-account key does not need to be packaged with the deployment.
+### Rules that always hold
 
-Separately, register a **Web App** from the Firebase project overview using the `</>` icon (or **Add app → Web**). Put that app's Firebase SDK configuration in the frontend's own local settings. The Web SDK `apiKey`, `authDomain`, `projectId`, and `appId` are for the frontend; they are different from the Admin SDK service-account key. Never expose the OAuth Web client secret or the service-account private key in frontend configuration.
+- A project works on **one run at a time** (`RUN_ACTIVE`).
+- **Nothing is overwritten.** A new dataset file is a new version, saving the research context adds a version, and result files cannot be replaced. A run always points at the exact versions it used.
+- **There is no hard delete.** A project is archived (read-only, restorable); removing a member revokes the membership; a deleted comment keeps its place with the text erased.
+- A project always keeps one active Project Manager: the last one cannot be demoted or removed (`LAST_PROJECT_MANAGER`).
+- Suspending a user is refused while they are the only Project Manager of a project other people work in.
+- An archived project is read-only (`PROJECT_ARCHIVED`).
+- Every change is written to the audit log.
 
-### Sign-up and sign-in flow
+## Roles and permissions
 
-Firebase owns credentials; Platform owns the session and roles. The login name is the email address — there is no separate username. Both providers end at the same Platform endpoint:
+There are four fixed roles. A role alone decides access: there is no permission table, role editor, or custom role. A user holds at most one role in each project, and may hold different roles in different projects.
+
+| Role | Scope | What it is for |
+|---|---|---|
+| `platform_admin` | Platform | System tasks: suspend users, grant Platform Admin, see and manage every project, read the global audit log and the cost report. |
+| `project_manager` | Project | Given to whoever creates the project. Edits project details, manages members, archives, completes, reads the project audit log, and everything a Researcher does. |
+| `researcher` | Project | Uploads datasets, writes the research context, starts runs, decides frame reviews, comments. |
+| `reviewer` | Project | Reads everything in the project and comments. Changes nothing else. |
+
+Someone who is not a member gets `404` for everything in a project, so its existence is not revealed. A member whose role is too low gets `403 ROLE_REQUIRED`.
+
+**Projects**
+
+| Action | Platform Admin | Project Manager | Researcher / Reviewer |
+|---|:-:|:-:|:-:|
+| Create a project | any signed-in user; the creator becomes Project Manager |||
+| List projects | all | own | own |
+| Read details and members | ✓ | ✓ | ✓ |
+| Update details | ✓ | ✓ | 403 |
+| Archive / restore | ✓ | ✓ | 403 |
+| Add / change role / remove a member | ✓ | ✓ | 403 |
+| Complete / reopen | ✓ | ✓ | 403 |
+| Read the project audit log | ✓ | ✓ | 404 |
+
+**Inside a project**
+
+| Action | Platform Admin | Project Manager | Researcher | Reviewer |
+|---|:-:|:-:|:-:|:-:|
+| Read datasets, research context, runs, reviews, result files, comments | ✓ | ✓ | ✓ | ✓ |
+| Download dataset and result files | ✓ | ✓ | ✓ | ✓ |
+| Upload a dataset or a new version; rename a dataset | ✓ | ✓ | ✓ | 403 |
+| Save the research context | ✓ | ✓ | ✓ | 403 |
+| Start or sync a run; decide a frame review | ✓ | ✓ | ✓ | 403 |
+| Abandon a run | ✓ | ✓ | 403 | 403 |
+| Comment; edit own comment | ✓ | ✓ | ✓ | ✓ |
+| Delete a comment | any | any | own | own |
+
+## Research features
+
+### Datasets
+
+CSV only. A file must be UTF-8, have a header row of unique, non-empty column names, at least one data row, and the same number of values on every row. The size limit is 50 MiB by default (`DATASET_MAX_UPLOAD_BYTES`); a header may have at most 2000 columns with names of at most 200 characters.
+
+The Platform records the row count, column names, size, and SHA-256. A file that fails a check is refused and nothing is stored.
+
+### Research context
+
+A Markdown body plus optional structured fields: `domain`, `objectives`, `variables`, `design`, `assumptions`, `constraints`, `concepts`, `notes`. Together they become the `research.md` file Popper reads, with the structured fields as its YAML front matter.
+
+Send `base_version` when saving. If someone else saved first, the answer is `409 RESEARCH_CONTEXT_CONFLICT` instead of silently replacing their work.
+
+### Runs
+
+`POST /projects/{id}/runs` fixes one dataset version and one research context version, checks that every variable the context names is a column of the dataset, and sends both to Popper with a spending cap (`RUN_DEFAULT_BUDGET_USD`, at most `RUN_MAX_BUDGET_USD`).
+
+When a run does not move:
+
+| Situation | What to do |
+|---|---|
+| Popper did not answer in time when the run was started | The response is `202` and the run stays `queued`. Call `sync`. |
+| A run looks stuck | `POST …/runs/{run}/sync` asks Popper for the current state. The Platform does not poll on its own. |
+| `sync` answers `409 RUN_DISPATCHING` | The run was created moments ago and may still be on its way to Popper. Try again after twice `POPPER_TIMEOUT_SECONDS`. |
+| Popper does not know the run | `sync` marks it `failed`, so the project is free again. |
+| Popper keeps answering with errors | A Project Manager calls `POST …/runs/{run}/abandon`. The run becomes `failed` and the project can start another. |
+
+Abandoning only changes the Platform's record. Popper is not told, so check on its side that the run is not still spending; a later report from Popper about an abandoned run is refused.
+
+### Frame review
+
+`GET …/runs/{run}/frame-review` returns Popper's request with its `items`. A Project Manager or Researcher answers with either:
+
+- `{"approve_all": true}`, or
+- a list of `signals`, one per item: `approve`, `edit` (with a `value`), `reject`, or `unknown`. Items left out are approved.
+
+The decision is stored with who made it and when, then sent to Popper. If Popper does not confirm (`502`), the review stays pending with the decision kept: send it again, or it is confirmed when Popper reports the run moving on.
+
+### Results
+
+Popper delivers files (paper PDF/TeX, figures, results). They are listed per run and always served as downloads, never rendered by the API.
+
+### Comments and notifications
+
+Any member comments on a run, optionally about one result file. Only the author edits a comment.
+
+Notifications are created for four events:
+
+| `kind` | Sent to |
+|---|---|
+| `added_to_project` | the user who was added |
+| `run_awaiting_review` | Project Managers and Researchers of the project |
+| `run_finished` | all members |
+| `run_commented` | the person who started the run |
+
+A notification carries no text; the frontend words it from `kind`. There is no email.
+
+### Running without Popper
+
+Leave `POPPER_BASE_URL` empty. Everything works except the three actions that talk to Popper (starting a run, syncing a run, deciding a frame review), which answer `503 POPPER_NOT_CONFIGURED`. The test suite uses an in-memory stand-in (`tests/fakes.py`).
+
+The API Popper must offer, and the two endpoints it calls back, are specified in `docs/popper-integration-contract.md` (kept locally; `docs/` is not tracked in Git). Popper v2 does not implement that contract yet.
+
+## Authentication
+
+Firebase owns credentials; the Platform owns the session and roles. The login name is the email address; there is no separate username.
+
+### Sign-up and sign-in
+
+Both providers end at the same Platform endpoint.
 
 | Step | Google | Email + password |
 |---|---|---|
-| 1. Sign up / sign in (frontend, Firebase SDK) | `signInWithPopup(GoogleAuthProvider)` — first use creates the Firebase account | Sign up: `createUserWithEmailAndPassword`, then `sendEmailVerification`. Sign in: `signInWithEmailAndPassword` |
-| 2. Email verified | Already verified by Google | User opens the verification link, then the frontend calls `getIdToken(true)` to refresh the token |
+| 1. Sign up / sign in (frontend, Firebase SDK) | `signInWithPopup(GoogleAuthProvider)`; first use creates the Firebase account | Sign up: `createUserWithEmailAndPassword`, then `sendEmailVerification`. Sign in: `signInWithEmailAndPassword` |
+| 2. Email verified | Already verified by Google | The user opens the verification link, then the frontend calls `getIdToken(true)` to refresh the token |
 | 3. Platform session | `POST /api/v1/auth/login` with `{ "firebase_id_token": "<getIdToken()>" }` | Same |
 
-`POST /api/v1/auth/login` verifies the token, registers the Platform user on first login (`is_new_user: true`, status `active` — usable right away), sets the HttpOnly session cookie, and returns the user, session expiry, and CSRF token. It rejects unverified emails (`EMAIL_NOT_VERIFIED`) and sign-ins older than five minutes (`RECENT_AUTH_REQUIRED` — sign in or reauthenticate again).
+`POST /api/v1/auth/login` verifies the token, registers the Platform user on first login (`is_new_user: true`, status `active`), sets the HttpOnly session cookie, and returns the user, session expiry, and CSRF token. It rejects unverified emails (`EMAIL_NOT_VERIFIED`) and sign-ins older than five minutes (`RECENT_AUTH_REQUIRED`).
 
-A session stays valid for 30 days from login (`SESSION_ABSOLUTE_DAYS`) as long as it is used at least once every 7 days (`SESSION_IDLE_MINUTES`, default 10080); after either limit the user signs in again. There is no refresh token: each request extends the idle window server-side.
+A session stays valid for 30 days from login (`SESSION_ABSOLUTE_DAYS`) as long as it is used at least once every 7 days (`SESSION_IDLE_MINUTES`, default 10080). There is no refresh token: each request extends the idle window on the server.
 
-Password reset (`sendPasswordResetEmail`), email verification, and provider linking stay in the Firebase SDK; Platform has no endpoints for them.
+Password reset, email verification, and provider linking stay in the Firebase SDK; the Platform has no endpoints for them. Firebase does not merge accounts: to use both Google and email/password on one account, sign in to the existing account first, then link the second provider through the SDK. The Platform never merges two Firebase UIDs.
 
-Frontend rules:
+### Rules for the frontend
 
 - Send every request with `credentials: "include"` and an `Origin` that exactly matches `CORS_ALLOWED_ORIGINS`.
 - Send the CSRF token in `X-CSRF-Token` on every mutation (`POST`, `PATCH`, `PUT`, `DELETE`). After a page reload, get it again from `GET /api/v1/auth/csrf-token`.
-- Restore the signed-in user after a reload with `GET /api/v1/auth/me` (user, platform role, session expiry).
+- Restore the signed-in user after a reload with `GET /api/v1/auth/me`. It returns the user, platform role, session expiry, and `memberships`: the user's projects with the role in each.
 - On sign-out call `POST /api/v1/auth/logout` and Firebase `signOut()`.
 - On `401` with `SESSION_EXPIRED` or `USER_SUSPENDED` the session cookie is already cleared; send the user back to sign-in.
 
-Swagger UI is available at `http://localhost:8000/docs`, with the OpenAPI schema at `http://localhost:8000/openapi.json`.
+### Firebase setup
 
-When a user wants both Google and email/password on one account, sign in to the existing Firebase account first, then link the second provider through Firebase SDK. Firebase does not automatically merge two accounts; if the credential already belongs to a different UID, resolve ownership and account data explicitly. Platform does not merge distinct Firebase UIDs.
+The Firebase project is `ai-research-platform-4ceb9`.
 
-Local settings are copied from the template to the ignored local settings file. This repository does not use the Firebase Auth Emulator; local authentication uses your Firebase project and requires the service-account values above (or valid Application Default Credentials).
+1. **Providers.** In Authentication, enable Google (set its public-facing project name and support email) and Email/Password. Add the frontend's local and deployed hostnames under Authentication → Settings → Authorized domains.
+2. **Backend credentials.** Open Project settings → Service accounts → Firebase Admin SDK, click **Generate new private key**, and copy `client_email` and `private_key` from the downloaded JSON into `.env.local`, keeping the literal `\n` sequences inside the single quotes:
 
-## API outline
+   ```dotenv
+   FIREBASE_CLIENT_EMAIL=firebase-adminsdk-xxxxx@ai-research-platform-4ceb9.iam.gserviceaccount.com
+   FIREBASE_PRIVATE_KEY='-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n'
+   ```
+
+3. **Frontend app.** Register a Web App from the project overview (**Add app → Web**) and put its SDK configuration (`apiKey`, `authDomain`, `projectId`, `appId`) in the frontend's own settings. These are different from the Admin SDK key above.
+
+Keep the downloaded JSON and the private key out of Git, frontend code, screenshots, and chat. If the key is exposed, delete it and generate a replacement. On Google Cloud, the API can use Application Default Credentials instead of a long-lived key.
+
+This repository does not use the Firebase Auth Emulator; local sign-in goes through the real Firebase project.
+
+## API reference
+
+All paths start with `/api/v1`. Full schemas and error cases are in Swagger UI at `/docs`.
+
+**Session**
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/v1/auth/login` | Sign in or sign up with a Firebase ID token; sets the session cookie |
-| `POST` | `/api/v1/auth/logout` | End the current session (CSRF required) |
-| `POST` | `/api/v1/auth/logout-all` | End every session of the signed-in user, on all devices (CSRF required) |
-| `GET` | `/api/v1/auth/me` | Signed-in user, platform role, and session expiry |
-| `GET` | `/api/v1/auth/csrf-token` | CSRF token for the current session |
-| `GET` | `/api/v1/users` | List users (Platform Admin) |
-| `PATCH` | `/api/v1/users/{id}/status` | Activate or suspend a user (Platform Admin) |
-| `PUT` | `/api/v1/users/{id}/platform-role` | Grant or remove Platform Admin |
-| `GET` | `/api/v1/audit` | Audit events (Platform Admin global; Project Manager with `project_id`) |
-| `GET` `POST` | `/api/v1/projects` | List my projects; create a project |
-| `GET` `PATCH` | `/api/v1/projects/{id}` | Read or update project details |
-| `POST` | `/api/v1/projects/{id}/archive`, `/restore` | Archive or restore a project |
-| `GET` `POST` | `/api/v1/projects/{id}/members` | List members; add a registered user by email |
-| `PUT` `DELETE` | `/api/v1/projects/{id}/members/{membership_id}` | Change a member's role; remove a member |
+| `POST` | `/auth/login` | Sign in or sign up with a Firebase ID token; sets the session cookie |
+| `POST` | `/auth/logout` | End the current session |
+| `POST` | `/auth/logout-all` | End every session of the signed-in user, on all devices |
+| `GET` | `/auth/me` | Signed-in user, platform role, session expiry, and project memberships |
+| `GET` | `/auth/csrf-token` | CSRF token for the current session |
 
-Detailed schemas, fixed role codes, and error cases are published by FastAPI OpenAPI at `/docs`.
+**Administration**
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/users` | List users (Platform Admin) |
+| `PATCH` | `/users/{id}/status` | Activate or suspend a user (Platform Admin) |
+| `PUT` | `/users/{id}/platform-role` | Grant or remove Platform Admin |
+| `GET` | `/audit` | Audit events: global for a Platform Admin, one project (`project_id`) for its Project Manager |
+| `GET` | `/admin/usage/projects` | Runs and cost per project (Platform Admin; `from`, `to`) |
+
+**Projects and members**
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` `POST` | `/projects` | List my projects; create a project |
+| `GET` `PATCH` | `/projects/{id}` | Read or update project details |
+| `POST` | `/projects/{id}/archive`, `/restore` | Archive or restore a project |
+| `POST` | `/projects/{id}/complete`, `/reopen` | Mark the project completed; reopen it |
+| `GET` `POST` | `/projects/{id}/members` | List members; add a registered user by email |
+| `PUT` `DELETE` | `/projects/{id}/members/{membership_id}` | Change a member's role; remove a member |
+
+**Research inputs**
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` `POST` | `/projects/{id}/datasets` | List datasets; upload a CSV as a new dataset (multipart: `name`, `description`, `file`) |
+| `GET` `PATCH` | `/projects/{id}/datasets/{dataset_id}` | Read; rename or describe |
+| `GET` `POST` | `/projects/{id}/datasets/{dataset_id}/versions` | List versions; upload a new version |
+| `GET` | `/projects/{id}/datasets/{dataset_id}/versions/{version_id}/download` | Download a version's file |
+| `GET` `PUT` | `/projects/{id}/research-context` | Newest research context; save a new version |
+| `GET` | `/projects/{id}/research-context/versions`, `/versions/{n}` | Version history; one version |
+
+**Runs, review, and results**
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` `POST` | `/projects/{id}/runs` | List runs; start a run |
+| `GET` | `/projects/{id}/runs/{run_id}` | One run |
+| `POST` | `/projects/{id}/runs/{run_id}/sync` | Ask Popper for the run's current state |
+| `POST` | `/projects/{id}/runs/{run_id}/abandon` | Mark a run that cannot finish as failed (Project Manager) |
+| `GET` `POST` | `/projects/{id}/runs/{run_id}/frame-review` | Newest review request; decide the pending one |
+| `GET` | `/projects/{id}/runs/{run_id}/frame-reviews` | All review requests of the run |
+| `GET` | `/projects/{id}/runs/{run_id}/artifacts` | Result files |
+| `GET` | `/projects/{id}/runs/{run_id}/artifacts/{artifact_id}/download` | Download a result file |
+
+**Comments and notifications**
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` `POST` | `/projects/{id}/runs/{run_id}/comments` | List comments (`artifact_id` filter); add one |
+| `PATCH` `DELETE` | `/projects/{id}/runs/{run_id}/comments/{comment_id}` | Edit own comment; delete |
+| `GET` | `/notifications`, `/notifications/unread-count` | My notifications (`unread_only`); unread count |
+| `POST` | `/notifications/{id}/read`, `/notifications/read-all` | Mark as read |
+
+**Called by Popper, not by the frontend**
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/internal/popper/runs/{run_id}/status` | Report a run's status, cost, and review request |
+| `POST` | `/internal/popper/runs/{run_id}/artifacts` | Deliver a result file |
+
+Both require the `X-Service-Key` header (`POPPER_CALLBACK_KEY`); a request without a valid key is refused with `401 SERVICE_KEY_INVALID` before its body is read.
 
 ### Response format
 
@@ -198,23 +365,41 @@ List endpoints return the array in `data` and fill `meta.pagination` with `{ "to
 
 Branch on `error.code`, not on `message`. `error.details` lists `{ "field", "message" }` entries for `VALIDATION_ERROR` (422) and is empty otherwise.
 
-## Deployment security
+## Configuration
 
-The API limits request bodies to 1 MiB by default and allows 10 `POST /api/v1/auth/login` attempts per ASGI client IP per 60 seconds per API process. Tune these limits with `REQUEST_MAX_BODY_BYTES`, `AUTH_SESSION_RATE_LIMIT`, and `AUTH_SESSION_RATE_WINDOW_SECONDS`. Production Compose expects an external TLS proxy but does not configure Uvicorn's trusted proxy addresses. Until that proxy network is known and explicitly trusted, requests may share the proxy IP and therefore share the in-process login quota. Before public deployment, configure Uvicorn to trust only the actual proxy addresses and add a shared rate limit at the ingress/API gateway. Do not use caller-supplied forwarding headers as client identity. The hosting platform is not selected yet.
+Settings come from environment variables; `.env.example` lists them all with safe local defaults. The ones specific to research:
 
-## Migrations
+| Variable | Purpose |
+|---|---|
+| `STORAGE_LOCAL_ROOT` | Directory that holds uploaded and produced files (`var/storage` on the host). |
+| `DATASET_MAX_UPLOAD_BYTES` | Largest dataset file (default 50 MiB). |
+| `ARTIFACT_MAX_UPLOAD_BYTES` | Largest result file Popper may deliver (default 50 MiB). |
+| `POPPER_BASE_URL` | Popper's address. Empty: runs cannot start. |
+| `POPPER_SERVICE_KEY` | Sent to Popper in `X-Service-Key`. Required with the base URL. |
+| `POPPER_CALLBACK_KEY` | Expected from Popper in `X-Service-Key`. Required with the base URL. |
+| `POPPER_TIMEOUT_SECONDS` | Longest a whole call to Popper may take, dataset upload included (default 30, at most 300). |
+| `PUBLIC_BASE_URL` | Address Popper uses to call this API back, without `/api/v1`. |
+| `RUN_DEFAULT_BUDGET_USD` | Spending cap of a run when the user gives none (5). |
+| `RUN_MAX_BUDGET_USD` | Highest cap a user may ask for (20). |
 
-Alembic owns the database schema. App startup never creates or migrates tables automatically. Apply migrations once during local setup or deployment:
+The two Popper keys are different secrets of at least 32 characters in production. The callback endpoints are reachable by anyone who can reach the API; the key is what protects them, so keep the API behind TLS.
 
-```bash
-task migrate
-```
+## Operations
 
-Do not point a developer command at a production database.
+### File storage
 
-## Docker production stack
+Dataset files, review requests and decisions, and result files are kept in a file store, outside the database. The only store today is a directory (a named volume under Compose). Until a cloud store is added:
 
-Production uses a separate Compose project, database volume, and configuration file. Copy the template inside `docker/`, set strong unique database/session secrets and the production Firebase service-account values, then validate and start the stack:
+- Run a single API replica, or give every replica the same volume.
+- Back up the storage volume together with the database: rows point at files by key.
+
+### Migrations
+
+Alembic owns the database schema. App startup never creates or migrates tables. Apply migrations once during local setup or deployment with `task migrate`. Do not point a developer command at a production database.
+
+### Production stack
+
+Production uses a separate Compose project, database volume, storage volume, and configuration file. Copy the template inside `docker/`, set strong unique database, session, and Popper secrets and the production Firebase values, then validate and start the stack:
 
 ```bash
 cp docker/prod.env.example docker/prod.env.local
@@ -223,4 +408,11 @@ docker compose --env-file docker/prod.env.local -f docker/docker-compose.prod.ym
 docker compose --env-file docker/prod.env.local -f docker/docker-compose.prod.yml run --rm api alembic upgrade head
 ```
 
-The production API binds to `127.0.0.1` and expects a TLS-terminating reverse proxy in front of it. PostgreSQL has no published host port. For Google Cloud deployments, use Application Default Credentials through the runtime identity rather than storing a service-account private key in the production environment file.
+The production API binds to `127.0.0.1` and expects a TLS-terminating reverse proxy in front of it. PostgreSQL has no published host port.
+
+### Limits and deployment security
+
+- Request bodies are limited to 1 MiB (`REQUEST_MAX_BODY_BYTES`); dataset uploads and result files have their own limits, above.
+- `POST /api/v1/auth/login` allows 10 attempts per client IP per 60 seconds per API process (`AUTH_SESSION_RATE_LIMIT`, `AUTH_SESSION_RATE_WINDOW_SECONDS`).
+- Production Compose does not configure Uvicorn's trusted proxy addresses, so behind a proxy all requests may share one IP and one login quota. Before public deployment, make Uvicorn trust only the real proxy addresses and add a shared rate limit at the ingress. Do not use caller-supplied forwarding headers as client identity.
+- The hosting platform is not selected yet.
