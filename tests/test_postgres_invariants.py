@@ -14,7 +14,7 @@ from platform_be.db.base import Base
 from platform_be.main import create_app
 from platform_be.models.identity import User, UserStatus
 from platform_be.models.project import ProjectMembership
-from tests.conftest import CALLBACK_KEY, FakeTokenVerifier, Harness, login, mutation_headers
+from tests.conftest import CALLBACK_KEY, Harness, login, mutation_headers
 from tests.test_projects_api import PROJECTS, add_member, create_project
 
 
@@ -44,11 +44,11 @@ async def postgres_harness(tmp_path) -> AsyncIterator[Harness]:
             database_url=database_url,
             cors_allowed_origins="http://localhost:3000",
             session_signing_secret="postgres-test-session-signing-secret",
+            password_scrypt_log2_n=4,
         )
         factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
-        verifier = FakeTokenVerifier()
-        app = create_app(settings, engine=engine, session_factory=factory, token_verifier=verifier)
-        yield Harness(app, factory, verifier, settings)
+        app = create_app(settings, engine=engine, session_factory=factory)
+        yield Harness(app, factory, settings)
     finally:
         await engine.dispose()
         async with admin_engine.begin() as connection:

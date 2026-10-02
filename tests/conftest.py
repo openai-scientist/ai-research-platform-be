@@ -1,5 +1,4 @@
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
 from typing import Any
 
 import pytest_asyncio
@@ -15,37 +14,7 @@ from tests.fakes import FakePopperClient
 
 ORIGIN = "http://localhost:3000"
 CALLBACK_KEY = "test-popper-callback-key"
-
-
-class FakeTokenVerifier:
-    def __init__(self) -> None:
-        self.tokens: dict[str, dict[str, object]] = {}
-
-    def add_user(
-        self,
-        *,
-        uid: str,
-        email: str,
-        verified: bool = True,
-        auth_time: int | None = None,
-        display_name: str | None = None,
-        sign_in_provider: str = "password",
-    ) -> str:
-        token = f"fake-id-token-for-platform-be-test-{uid}-long-enough"
-        self.tokens[token] = {
-            "uid": uid,
-            "email": email,
-            "email_verified": verified,
-            "auth_time": auth_time or int(datetime.now(UTC).timestamp()),
-            "name": display_name,
-            "firebase": {"sign_in_provider": sign_in_provider},
-        }
-        return token
-
-    def verify(self, id_token: str) -> dict[str, object]:
-        if id_token not in self.tokens:
-            raise ValueError("invalid test token")
-        return self.tokens[id_token]
+PASSWORD = "correct horse battery"
 
 
 class Harness:
@@ -53,12 +22,10 @@ class Harness:
         self,
         app: Any,
         factory: async_sessionmaker[AsyncSession],
-        verifier: FakeTokenVerifier,
         settings: Settings,
     ) -> None:
         self.app = app
         self.factory = factory
-        self.verifier = verifier
         self.settings = settings
         self.popper = FakePopperClient()
         app.state.popper_client = self.popper
@@ -78,6 +45,7 @@ async def harness(tmp_path) -> AsyncIterator[Harness]:
         database_url="sqlite+aiosqlite:///:memory:",
         cors_allowed_origins=ORIGIN,
         session_signing_secret="test-session-signing-secret-is-long-enough",
+        password_scrypt_log2_n=4,
     )
     engine = create_async_engine(
         settings.database_url,
@@ -94,24 +62,30 @@ async def harness(tmp_path) -> AsyncIterator[Harness]:
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
-    verifier = FakeTokenVerifier()
-    app = create_app(settings, engine=engine, session_factory=factory, token_verifier=verifier)
-    yield Harness(app, factory, verifier, settings)
+    app = create_app(settings, engine=engine, session_factory=factory)
+    yield Harness(app, factory, settings)
     await engine.dispose()
 
 
 async def login(
     harness: Harness, client: AsyncClient, *, uid: str, email: str
 ) -> dict[str, object]:
-    token = harness.verifier.add_user(
-        uid=uid, email=email, display_name=uid.replace("-", " ").title()
-    )
+    """Sign in as the user with this email, registering the account the first time."""
+    headers = {"Origin": ORIGIN}
     response = await client.post(
-        "/api/v1/auth/login",
-        json={"firebase_id_token": token},
-        headers={"Origin": ORIGIN},
+        "/api/v1/auth/register",
+        json={
+            "email": email,
+            "password": PASSWORD,
+            "display_name": uid.replace("-", " ").title(),
+        },
+        headers=headers,
     )
-    assert response.status_code == 200, response.text
+    if response.status_code == 409:
+        response = await client.post(
+            "/api/v1/auth/login", json={"email": email, "password": PASSWORD}, headers=headers
+        )
+    assert response.status_code in (200, 201), response.text
     return response.json()["data"]
 
 

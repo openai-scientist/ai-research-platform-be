@@ -41,9 +41,7 @@ async def bootstrap_admin(
                 .with_for_update()
             )
             if user is None:
-                raise APIError(
-                    404, "REGISTERED_USER_NOT_FOUND", "Register and verify this email first"
-                )
+                raise APIError(404, "REGISTERED_USER_NOT_FOUND", "Register this email first")
             if user.status == UserStatus.SUSPENDED:
                 raise APIError(
                     409, "USER_SUSPENDED", "A suspended user cannot become Platform Admin"

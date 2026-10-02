@@ -69,8 +69,10 @@ class RequestProtectionMiddleware:
                 )
                 return
 
-        if scope.get("method") == "POST" and scope.get("path") == (
-            f"{self.settings.api_prefix.rstrip('/')}/auth/login"
+        auth_prefix = f"{self.settings.api_prefix.rstrip('/')}/auth"
+        if scope.get("method") == "POST" and scope.get("path") in (
+            f"{auth_prefix}/login",
+            f"{auth_prefix}/register",
         ):
             retry_after = self._consume_session_attempt(scope)
             if retry_after is not None:
@@ -78,7 +80,7 @@ class RequestProtectionMiddleware:
                     send,
                     429,
                     "RATE_LIMITED",
-                    "Too many login attempts; try again later",
+                    "Too many sign-in attempts; try again later",
                     request_id,
                     headers={"retry-after": str(retry_after)},
                 )

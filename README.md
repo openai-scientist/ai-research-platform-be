@@ -20,7 +20,7 @@ The research itself is done by **Popper**, a separate service. The Platform send
 You need Python 3.12+, [`uv`](https://docs.astral.sh/uv/), Docker with the Compose plugin, and [Task](https://taskfile.dev/docs/installation).
 
 ```bash
-cp .env.example .env.local     # then fill in the Firebase values, see Authentication
+cp .env.example .env.local
 task up                        # PostgreSQL + API on 127.0.0.1
 task migrate                   # in a second terminal, on a fresh database
 ```
@@ -34,7 +34,7 @@ task migrate                   # in a second terminal, on a fresh database
 
 Other shortcuts: `task down` (stops the stack, keeps the database volume), `task restart`, `task status`, `task logs`; `task --list` describes them all.
 
-After the first account has signed in through Firebase, make it the first Platform Admin:
+After the first account has registered (`POST /api/v1/auth/register`), make it the first Platform Admin:
 
 ```bash
 docker compose --env-file .env.local -f docker/docker-compose.dev.yml run --rm api platform-be bootstrap-admin --email admin@example.com
@@ -58,7 +58,7 @@ Tests run on SQLite in memory. The tests that need real PostgreSQL behaviour (lo
 The project is the top-level scope: there is no organization or workspace above it.
 
 ```text
-Sign in (a new account is active at once, no approval step)
+Register with email + password (the account is active at once, no approval step)
    ↓
 Create a project                     the creator is its Project Manager
    ↓
@@ -218,49 +218,35 @@ The API Popper must offer, and the two endpoints it calls back, are specified in
 
 ## Authentication
 
-Firebase owns credentials; the Platform owns the session and roles. The login name is the email address; there is no separate username.
+The Platform owns accounts, passwords, sessions, and roles; there is no external identity provider. The login name is the email address; there is no separate username.
 
 ### Sign-up and sign-in
 
-Both providers end at the same Platform endpoint.
-
-| Step | Google | Email + password |
+| Action | Request | Result |
 |---|---|---|
-| 1. Sign up / sign in (frontend, Firebase SDK) | `signInWithPopup(GoogleAuthProvider)`; first use creates the Firebase account | Sign up: `createUserWithEmailAndPassword`, then `sendEmailVerification`. Sign in: `signInWithEmailAndPassword` |
-| 2. Email verified | Already verified by Google | The user opens the verification link, then the frontend calls `getIdToken(true)` to refresh the token |
-| 3. Platform session | `POST /api/v1/auth/login` with `{ "firebase_id_token": "<getIdToken()>" }` | Same |
+| Sign up | `POST /api/v1/auth/register` with `{ "email", "password", "display_name"? }` | `201`; the account is `active` and already signed in. `409 EMAIL_ALREADY_REGISTERED` when the email is taken. |
+| Sign in | `POST /api/v1/auth/login` with `{ "email", "password" }` | `200`. `401 INVALID_CREDENTIALS` for a wrong email or password (the answer does not say which), `403 USER_SUSPENDED` for a suspended account. |
+| Change password | `POST /api/v1/auth/change-password` with `{ "current_password", "new_password" }` | `200`; every other session of the user is signed out. `403 CURRENT_PASSWORD_INCORRECT`. |
 
-`POST /api/v1/auth/login` verifies the token, registers the Platform user on first login (`is_new_user: true`, status `active`), sets the HttpOnly session cookie, and returns the user, session expiry, and CSRF token. It rejects unverified emails (`EMAIL_NOT_VERIFIED`) and sign-ins older than five minutes (`RECENT_AUTH_REQUIRED`).
+Sign-up and sign-in both set the HttpOnly session cookie and return the user, session expiry, and CSRF token. Together they are limited to `AUTH_SESSION_RATE_LIMIT` requests per window for each client address (`429 RATE_LIMITED`).
+
+Passwords are 8 to 128 characters. Only an scrypt hash with its own salt is stored (`PASSWORD_SCRYPT_LOG2_N` sets the cost); emails are compared without regard to letter case.
 
 A session stays valid for 30 days from login (`SESSION_ABSOLUTE_DAYS`) as long as it is used at least once every 7 days (`SESSION_IDLE_MINUTES`, default 10080). There is no refresh token: each request extends the idle window on the server.
 
-Password reset, email verification, and provider linking stay in the Firebase SDK; the Platform has no endpoints for them. Firebase does not merge accounts: to use both Google and email/password on one account, sign in to the existing account first, then link the second provider through the SDK. The Platform never merges two Firebase UIDs.
+What the Platform does not do, because it sends no email:
+
+- **No email verification.** Anyone can register with any address, so do not treat the email as proof of identity.
+- **No "forgot password".** A user who forgets the password cannot recover the account through the API.
+- Accounts created before passwords were kept on the Platform have no password and cannot sign in.
 
 ### Rules for the frontend
 
 - Send every request with `credentials: "include"` and an `Origin` that exactly matches `CORS_ALLOWED_ORIGINS`.
-- Send the CSRF token in `X-CSRF-Token` on every mutation (`POST`, `PATCH`, `PUT`, `DELETE`). After a page reload, get it again from `GET /api/v1/auth/csrf-token`.
+- Send the CSRF token in `X-CSRF-Token` on every mutation (`POST`, `PATCH`, `PUT`, `DELETE`) except sign-up and sign-in. After a page reload, get it again from `GET /api/v1/auth/csrf-token`.
 - Restore the signed-in user after a reload with `GET /api/v1/auth/me`. It returns the user, platform role, session expiry, and `memberships`: the user's projects with the role in each.
-- On sign-out call `POST /api/v1/auth/logout` and Firebase `signOut()`.
+- On sign-out call `POST /api/v1/auth/logout`.
 - On `401` with `SESSION_EXPIRED` or `USER_SUSPENDED` the session cookie is already cleared; send the user back to sign-in.
-
-### Firebase setup
-
-The Firebase project is `ai-research-platform-4ceb9`.
-
-1. **Providers.** In Authentication, enable Google (set its public-facing project name and support email) and Email/Password. Add the frontend's local and deployed hostnames under Authentication → Settings → Authorized domains.
-2. **Backend credentials.** Open Project settings → Service accounts → Firebase Admin SDK, click **Generate new private key**, and copy `client_email` and `private_key` from the downloaded JSON into `.env.local`, keeping the literal `\n` sequences inside the single quotes:
-
-   ```dotenv
-   FIREBASE_CLIENT_EMAIL=firebase-adminsdk-xxxxx@ai-research-platform-4ceb9.iam.gserviceaccount.com
-   FIREBASE_PRIVATE_KEY='-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n'
-   ```
-
-3. **Frontend app.** Register a Web App from the project overview (**Add app → Web**) and put its SDK configuration (`apiKey`, `authDomain`, `projectId`, `appId`) in the frontend's own settings. These are different from the Admin SDK key above.
-
-Keep the downloaded JSON and the private key out of Git, frontend code, screenshots, and chat. If the key is exposed, delete it and generate a replacement. On Google Cloud, the API can use Application Default Credentials instead of a long-lived key.
-
-This repository does not use the Firebase Auth Emulator; local sign-in goes through the real Firebase project.
 
 ## API reference
 
@@ -270,7 +256,9 @@ All paths start with `/api/v1`. Full schemas and error cases are in Swagger UI a
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/auth/login` | Sign in or sign up with a Firebase ID token; sets the session cookie |
+| `POST` | `/auth/register` | Create an account with email and password; sets the session cookie |
+| `POST` | `/auth/login` | Sign in with email and password; sets the session cookie |
+| `POST` | `/auth/change-password` | Change the password; signs out the user's other sessions |
 | `POST` | `/auth/logout` | End the current session |
 | `POST` | `/auth/logout-all` | End every session of the signed-in user, on all devices |
 | `GET` | `/auth/me` | Signed-in user, platform role, session expiry, and project memberships |
@@ -399,7 +387,7 @@ Alembic owns the database schema. App startup never creates or migrates tables. 
 
 ### Production stack
 
-Production uses a separate Compose project, database volume, storage volume, and configuration file. Copy the template inside `docker/`, set strong unique database, session, and Popper secrets and the production Firebase values, then validate and start the stack:
+Production uses a separate Compose project, database volume, storage volume, and configuration file. Copy the template inside `docker/`, set strong unique database, session, and Popper secrets, then validate and start the stack:
 
 ```bash
 cp docker/prod.env.example docker/prod.env.local

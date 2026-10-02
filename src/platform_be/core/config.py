@@ -20,16 +20,14 @@ class Settings(BaseSettings):
     api_prefix: str = "/api/v1"
     database_url: str = "postgresql+asyncpg://platform:platform@localhost:5432/platform"
     cors_allowed_origins: str = "http://localhost:3000,http://localhost:5173"
-    firebase_project_id: str = "ai-research-platform-4ceb9"
-    firebase_client_email: str | None = None
-    firebase_private_key: SecretStr | None = None
     session_cookie_name: str = "platform_session"
     session_signing_secret: SecretStr = SecretStr("local-only-session-secret-change-me-32")
     cookie_secure: bool = False
     cookie_samesite: Literal["lax", "strict", "none"] = "lax"
     session_idle_minutes: int = Field(default=7 * 24 * 60, ge=5, le=30 * 24 * 60)
     session_absolute_days: int = Field(default=30, ge=1, le=30)
-    recent_auth_seconds: int = Field(default=300, ge=60, le=1800)
+    # Cost of hashing a password: scrypt works on 2**n blocks. Tests lower it to stay fast.
+    password_scrypt_log2_n: int = Field(default=15, ge=4, le=17)
     auth_session_rate_limit: int = Field(default=10, ge=1, le=1000)
     auth_session_rate_window_seconds: int = Field(default=60, ge=1, le=3600)
     request_max_body_bytes: int = Field(default=1_048_576, ge=1024, le=10_485_760)
@@ -63,20 +61,6 @@ class Settings(BaseSettings):
             raise ValueError("session_signing_secret must be at least 32 characters")
         return value
 
-    @field_validator("firebase_client_email", mode="before")
-    @classmethod
-    def normalize_client_email(cls, value: object) -> object:
-        return None if isinstance(value, str) and not value.strip() else value
-
-    @field_validator("firebase_private_key", mode="before")
-    @classmethod
-    def normalize_private_key(cls, value: object) -> object:
-        if isinstance(value, str) and not value.strip():
-            return None
-        if isinstance(value, SecretStr) and not value.get_secret_value().strip():
-            return None
-        return value
-
     @field_validator("popper_base_url", "popper_service_key", "popper_callback_key", mode="before")
     @classmethod
     def normalize_blank_popper_setting(cls, value: object) -> object:
@@ -92,10 +76,6 @@ class Settings(BaseSettings):
             raise ValueError(
                 "popper_service_key and popper_callback_key are required with popper_base_url"
             )
-        if bool(self.firebase_client_email) != bool(self.firebase_private_key):
-            raise ValueError(
-                "firebase_client_email and firebase_private_key must be configured together"
-            )
         if self.cookie_samesite == "none" and not self.cookie_secure:
             raise ValueError("SameSite=None cookies require Secure")
         if self.app_env == "production":
@@ -103,6 +83,8 @@ class Settings(BaseSettings):
                 raise ValueError("Production requires secure session cookies")
             if self.session_signing_secret.get_secret_value().startswith("local-only-"):
                 raise ValueError("Production requires a non-development session signing secret")
+            if self.password_scrypt_log2_n < 15:
+                raise ValueError("Production requires password_scrypt_log2_n of at least 15")
             if any(not origin.startswith("https://") for origin in self.allowed_origins):
                 raise ValueError("Production CORS origins must use HTTPS")
             for key in (self.popper_service_key, self.popper_callback_key):

@@ -31,7 +31,6 @@ def create_app(
     *,
     engine: AsyncEngine | None = None,
     session_factory: async_sessionmaker | None = None,
-    token_verifier: object | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
     configure_logging("DEBUG" if settings.debug else "INFO")
@@ -63,7 +62,6 @@ def create_app(
     app.state.settings = settings
     app.state.engine = app_engine
     app.state.session_factory = app_session_factory
-    app.state.token_verifier = token_verifier
     app.state.get_db = get_db
     app.state.file_store = LocalFileStore(settings.storage_local_root)
     app.state.popper_client = build_popper_client(settings)
