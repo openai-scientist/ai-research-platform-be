@@ -11,7 +11,6 @@ from platform_be.db.base import Base
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (
-        Index("ix_audit_org_created", "organization_id", "created_at"),
         Index("ix_audit_project_created", "project_id", "created_at"),
         Index("ix_audit_created_id", "created_at", "id"),
         Index("ix_audit_action_created_id", "action", "created_at", "id"),
@@ -24,7 +23,6 @@ class AuditEvent(Base):
     action: Mapped[str] = mapped_column(String(100), nullable=False)
     resource_type: Mapped[str] = mapped_column(String(80), nullable=False)
     resource_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    organization_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
     project_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
     request_id: Mapped[str | None] = mapped_column(String(64))
     details: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
