@@ -1,3 +1,4 @@
+from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 
@@ -32,6 +33,20 @@ class Settings(BaseSettings):
     auth_session_rate_limit: int = Field(default=10, ge=1, le=1000)
     auth_session_rate_window_seconds: int = Field(default=60, ge=1, le=3600)
     request_max_body_bytes: int = Field(default=1_048_576, ge=1024, le=10_485_760)
+    # Uploaded datasets and run artifacts live in a file store; only "local" exists so far.
+    storage_backend: Literal["local"] = "local"
+    storage_local_root: str = "var/storage"
+    dataset_max_upload_bytes: int = Field(default=52_428_800, ge=1024, le=1_073_741_824)
+    artifact_max_upload_bytes: int = Field(default=52_428_800, ge=1024, le=1_073_741_824)
+    # Popper is a separate service. Runs cannot start until its base URL is configured.
+    popper_base_url: str | None = None
+    popper_service_key: SecretStr | None = None
+    popper_callback_key: SecretStr | None = None
+    popper_timeout_seconds: float = Field(default=30, ge=1, le=300)
+    # Address Popper uses to call this API back, without the API prefix.
+    public_base_url: str = "http://localhost:8000"
+    run_default_budget_usd: Decimal = Field(default=Decimal("5"), gt=0)
+    run_max_budget_usd: Decimal = Field(default=Decimal("20"), gt=0)
 
     @field_validator("cors_allowed_origins")
     @classmethod
@@ -62,8 +77,21 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator("popper_base_url", "popper_service_key", "popper_callback_key", mode="before")
+    @classmethod
+    def normalize_blank_popper_setting(cls, value: object) -> object:
+        if isinstance(value, SecretStr):
+            value = value.get_secret_value()
+        return None if isinstance(value, str) and not value.strip() else value
+
     @model_validator(mode="after")
     def validate_deployment_security(self) -> "Settings":
+        if self.run_default_budget_usd > self.run_max_budget_usd:
+            raise ValueError("run_default_budget_usd must not exceed run_max_budget_usd")
+        if self.popper_base_url and not (self.popper_service_key and self.popper_callback_key):
+            raise ValueError(
+                "popper_service_key and popper_callback_key are required with popper_base_url"
+            )
         if bool(self.firebase_client_email) != bool(self.firebase_private_key):
             raise ValueError(
                 "firebase_client_email and firebase_private_key must be configured together"
@@ -77,6 +105,9 @@ class Settings(BaseSettings):
                 raise ValueError("Production requires a non-development session signing secret")
             if any(not origin.startswith("https://") for origin in self.allowed_origins):
                 raise ValueError("Production CORS origins must use HTTPS")
+            for key in (self.popper_service_key, self.popper_callback_key):
+                if key is not None and len(key.get_secret_value()) < 32:
+                    raise ValueError("Production Popper service keys need at least 32 characters")
         return self
 
     @property

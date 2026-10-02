@@ -20,3 +20,4 @@ dist/
 build/
 .mypy_cache/
 docker/prod.env.local
+/var/
