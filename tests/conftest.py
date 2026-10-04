@@ -63,8 +63,11 @@ async def harness(tmp_path) -> AsyncIterator[Harness]:
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
     app = create_app(settings, engine=engine, session_factory=factory)
-    yield Harness(app, factory, settings)
-    await engine.dispose()
+    try:
+        yield Harness(app, factory, settings)
+    finally:
+        await app.state.notification_hub.close()
+        await engine.dispose()
 
 
 async def login(

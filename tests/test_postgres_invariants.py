@@ -14,7 +14,9 @@ from platform_be.db.base import Base
 from platform_be.main import create_app
 from platform_be.models.identity import User, UserStatus
 from platform_be.models.project import ProjectMembership
+from platform_be.services.notifications import notify_user
 from tests.conftest import CALLBACK_KEY, Harness, login, mutation_headers
+from tests.test_notification_stream import open_stream
 from tests.test_projects_api import PROJECTS, add_member, create_project
 
 
@@ -34,6 +36,7 @@ async def postgres_harness(tmp_path) -> AsyncIterator[Harness]:
         connect_args={"server_settings": {"search_path": schema}},
         pool_pre_ping=True,
     )
+    app = None
     try:
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
@@ -50,6 +53,8 @@ async def postgres_harness(tmp_path) -> AsyncIterator[Harness]:
         app = create_app(settings, engine=engine, session_factory=factory)
         yield Harness(app, factory, settings)
     finally:
+        if app is not None:
+            await app.state.notification_hub.close()
         await engine.dispose()
         async with admin_engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
@@ -286,3 +291,80 @@ async def test_repeated_callbacks_arriving_together_apply_once(postgres_harness:
         ]
         notifications = await client.get("/api/v1/notifications")
         assert [item["kind"] for item in notifications.json()["data"]] == ["run_awaiting_review"]
+
+
+@pytest.mark.asyncio
+async def test_postgres_notification_stream_delivers_across_workers_after_commit(
+    postgres_harness: Harness,
+) -> None:
+    writer = postgres_harness
+    reader_app = create_app(
+        writer.settings, engine=writer.app.state.engine, session_factory=writer.factory
+    )
+    reader = Harness(reader_app, writer.factory, writer.settings)
+    try:
+        async with writer.client() as manager_client, reader.client() as member_client:
+            manager = await login(
+                writer, manager_client, uid="manager", email="manager@example.com"
+            )
+            member = await login(reader, member_client, uid="member", email="member@example.com")
+            project = await create_project(manager_client, manager)
+            async with open_stream(reader, member_client) as (_, stream):
+                assert await stream.snapshot() == {"items": [], "unread_count": 0}
+                await add_member(
+                    manager_client, manager, project["id"], "member@example.com", "researcher"
+                )
+                assert (await stream.snapshot())["unread_count"] == 1
+
+                async with writer.factory() as db:
+                    writer.app.state.notification_hub.bind(db)
+
+                    def notify():
+                        notify_user(
+                            db,
+                            UUID(member["user"]["id"]),
+                            "added_to_project",
+                            project_id=UUID(project["id"]),
+                        )
+
+                    notify()
+                    await db.flush()
+                    with pytest.raises(TimeoutError):
+                        await asyncio.wait_for(stream.frame(), timeout=0.05)
+                    await db.rollback()
+                    with pytest.raises(TimeoutError):
+                        await asyncio.wait_for(stream.frame(), timeout=0.05)
+                    notify()
+                    await db.commit()
+                    assert (await stream.snapshot())["unread_count"] == 2
+            assert not reader_app.state.notification_hub._subscribers
+    finally:
+        await reader_app.state.notification_hub.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_listener_disconnect_closes_stream_and_reconnect_restores_state(
+    postgres_harness: Harness,
+) -> None:
+    harness = postgres_harness
+    async with harness.client() as manager_client, harness.client() as member_client:
+        manager = await login(harness, manager_client, uid="manager", email="manager@example.com")
+        await login(harness, member_client, uid="member", email="member@example.com")
+        project = await create_project(manager_client, manager)
+        membership = await add_member(
+            manager_client, manager, project["id"], "member@example.com", "researcher"
+        )
+        hub = harness.app.state.notification_hub
+        async with open_stream(harness, member_client) as (_, stream):
+            assert (await stream.snapshot())["unread_count"] == 1
+            hub._driver.terminate()
+            with pytest.raises(AssertionError, match="Stream ended"):
+                await stream.frame()
+        async with open_stream(harness, member_client) as (_, stream):
+            assert (await stream.snapshot())["unread_count"] == 1
+            removed = await manager_client.delete(
+                f"{PROJECTS}/{project['id']}/members/{membership['id']}",
+                headers=mutation_headers(manager["csrf_token"]),
+            )
+            assert removed.status_code == 200
+            assert await stream.snapshot() == {"items": [], "unread_count": 0}
