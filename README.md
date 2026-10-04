@@ -210,6 +210,42 @@ Notifications are created for four events:
 
 A notification carries no text; the frontend words it from `kind`. There is no email.
 
+### Realtime notifications for frontend clients
+
+Open authenticated SSE `GET /api/v1/notifications/stream?limit=50` after sign-in. `limit`
+defaults to `50` and accepts `1`–`100`; the server sends `notifications` immediately and
+after each committed notification, read/read-all action, or membership removal:
+
+```text
+event: notifications
+data: {"items":[{"id":"...","kind":"run_finished","project_id":"...","project_name":"...","run_id":null,"actor_user_id":null,"actor_display_name":null,"created_at":"...","read_at":null}],"unread_count":3}
+```
+
+`items` are newest first with the `NotificationItem` fields from `GET /notifications`. Each
+event is a snapshot: replace the window and badge, do not append or poll. `unread_count` is
+the total visible unread count. Reconnection gets another current snapshot; no cursor is used.
+
+```ts
+const stream = new EventSource("/api/v1/notifications/stream?limit=50", { withCredentials: true });
+stream.addEventListener("notifications", (event) => {
+  const { items, unread_count } = JSON.parse((event as MessageEvent<string>).data);
+  replaceNotificationWindow(items); setUnreadBadge(unread_count);
+});
+stream.addEventListener("session-ended", (event) => {
+  const { code } = JSON.parse((event as MessageEvent<string>).data);
+  stream.close(); beginSignInFlow(code); // SESSION_EXPIRED, USER_SUSPENDED, UNAUTHENTICATED
+});
+const stopNotifications = () => stream.close(); // call on logout/unmount; network errors reconnect
+```
+
+Ignore the 15-second keep-alive comment: it rechecks the session but does not extend idle
+expiry. Initial connection and notification snapshots use normal session activity. The proxy
+must disable buffering and use read/idle timeouts over 15 seconds. A separate frontend origin
+needs credential CORS for its exact origin and cross-site-capable cookies. `GET /notifications`
+remains for paginated history; the CSRF-protected read `POST`s trigger a new snapshot.
+
+Frontend integration instructions: [docs/notifications-handoff.md](./docs/notifications-handoff.md).
+
 ### Running without Popper
 
 Leave `POPPER_BASE_URL` empty. Everything works except the three actions that talk to Popper (starting a run, syncing a run, deciding a frame review), which answer `503 POPPER_NOT_CONFIGURED`. The test suite uses an in-memory stand-in (`tests/fakes.py`).
@@ -316,6 +352,7 @@ All paths start with `/api/v1`. Full schemas and error cases are in Swagger UI a
 | `GET` `POST` | `/projects/{id}/runs/{run_id}/comments` | List comments (`artifact_id` filter); add one |
 | `PATCH` `DELETE` | `/projects/{id}/runs/{run_id}/comments/{comment_id}` | Edit own comment; delete |
 | `GET` | `/notifications`, `/notifications/unread-count` | My notifications (`unread_only`); unread count |
+| `GET` | `/notifications/stream` | Real-time SSE snapshots of my latest notifications and unread count |
 | `POST` | `/notifications/{id}/read`, `/notifications/read-all` | Mark as read |
 
 **Called by Popper, not by the frontend**
@@ -329,7 +366,9 @@ Both require the `X-Service-Key` header (`POPPER_CALLBACK_KEY`); a request witho
 
 ### Response format
 
-Every endpoint returns the same envelope. `meta.request_id` matches the `X-Request-ID` response header.
+REST/JSON endpoints return the same envelope. A successful `GET /notifications/stream` uses the
+SSE frames documented above; startup errors still use this JSON envelope. `meta.request_id`
+matches the `X-Request-ID` response header.
 
 ```json
 {
@@ -397,6 +436,11 @@ docker compose --env-file docker/prod.env.local -f docker/docker-compose.prod.ym
 ```
 
 The production API binds to `127.0.0.1` and expects a TLS-terminating reverse proxy in front of it. PostgreSQL has no published host port.
+
+The supplied CLI and Docker commands give Uvicorn a 30-second graceful-shutdown timeout;
+Compose reserves 40 seconds for the API to stop. When starting Uvicorn manually, also pass
+`--timeout-graceful-shutdown 30`. This bounds a restart even with open SSE connections; their
+EventSource clients reconnect to receive a fresh notification snapshot.
 
 ### Limits and deployment security
 
