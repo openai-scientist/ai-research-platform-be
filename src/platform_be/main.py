@@ -21,6 +21,7 @@ from platform_be.core.middleware import RequestProtectionMiddleware
 from platform_be.core.responses import error_response, request_id_context
 from platform_be.db.session import get_db
 from platform_be.services.file_store import LocalFileStore
+from platform_be.services.notification_stream import NotificationHub
 from platform_be.services.popper_client import build_popper_client
 
 logger = logging.getLogger("platform_be.http")
@@ -42,12 +43,18 @@ def create_app(
     app_session_factory = session_factory or async_sessionmaker(
         app_engine, expire_on_commit=False, autoflush=False
     )
+    notification_hub = NotificationHub(app_engine)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        yield
-        if owned_engine:
-            await app_engine.dispose()
+        try:
+            yield
+        finally:
+            try:
+                await notification_hub.close()
+            finally:
+                if owned_engine:
+                    await app_engine.dispose()
 
     app = FastAPI(
         title=settings.app_name,
@@ -65,6 +72,7 @@ def create_app(
     app.state.get_db = get_db
     app.state.file_store = LocalFileStore(settings.storage_local_root)
     app.state.popper_client = build_popper_client(settings)
+    app.state.notification_hub = notification_hub
     app.add_middleware(RequestProtectionMiddleware, settings=settings)
 
     @app.middleware("http")
