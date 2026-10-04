@@ -21,6 +21,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     restart: unless-stopped
+    stop_grace_period: 40s
     environment:
       APP_ENV: production
       DEBUG: "false"

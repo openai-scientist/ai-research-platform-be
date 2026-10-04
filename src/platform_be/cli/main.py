@@ -20,7 +20,13 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "run":
-        uvicorn.run("platform_be.main:app", host=args.host, port=args.port, reload=args.reload)
+        uvicorn.run(
+            "platform_be.main:app",
+            host=args.host,
+            port=args.port,
+            reload=args.reload,
+            timeout_graceful_shutdown=30,
+        )
     elif args.command == "bootstrap-admin":
         try:
             asyncio.run(bootstrap_admin(args.email))

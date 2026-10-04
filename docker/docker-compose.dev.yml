@@ -21,7 +21,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    command: ["uvicorn", "platform_be.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    command: ["uvicorn", "platform_be.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--timeout-graceful-shutdown", "30"]
+    stop_grace_period: 40s
     environment:
       APP_ENV: ${APP_ENV:-local}
       DEBUG: ${DEBUG:-true}
