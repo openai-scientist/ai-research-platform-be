@@ -8,6 +8,7 @@ from platform_be.core.roles import ProjectRole
 from platform_be.models.collaboration import Notification
 from platform_be.models.identity import User, UserStatus
 from platform_be.models.project import ProjectMembership
+from platform_be.services.notification_stream import notifications_changed
 
 
 def notify_user(
@@ -28,6 +29,7 @@ def notify_user(
             actor_user_id=actor_user_id,
         )
     )
+    notifications_changed(db, recipient_user_id)
 
 
 async def notify_project_members(

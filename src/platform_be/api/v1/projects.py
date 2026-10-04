@@ -29,6 +29,7 @@ from platform_be.services.access import (
     require_project_access,
 )
 from platform_be.services.audit import record_audit
+from platform_be.services.notification_stream import notifications_changed
 from platform_be.services.notifications import notify_user
 from platform_be.services.project_status import derive_project_status
 
@@ -635,6 +636,7 @@ async def remove_project_member(
         raise APIError(409, "LAST_PROJECT_MANAGER", "The last Project Manager cannot be removed")
     membership.status = "revoked"
     membership.revoked_at = datetime.now(UTC)
+    notifications_changed(db, membership.user_id)
     record_audit(
         db,
         actor_user_id=principal.user.id,
