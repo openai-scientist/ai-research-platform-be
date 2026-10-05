@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import func, select, text
@@ -24,6 +25,17 @@ async def lock_user(db: AsyncSession, user_id: UUID) -> User:
     if user is None:
         raise APIError(404, "NOT_FOUND", "User was not found")
     return user
+
+
+def invite_expired(membership: ProjectMembership, now: datetime | None = None) -> bool:
+    """True for an invitation that can no longer be accepted. The row itself never changes."""
+    if membership.status != "invited" or membership.invite_expires_at is None:
+        return False
+    expires_at = membership.invite_expires_at
+    if expires_at.tzinfo is None:
+        # SQLite returns naive datetimes.
+        expires_at = expires_at.replace(tzinfo=UTC)
+    return expires_at <= (now or datetime.now(UTC))
 
 
 async def lock_project_scope(db: AsyncSession, project_id: UUID) -> None:
@@ -70,9 +82,10 @@ async def active_manager_count(db: AsyncSession, project_id: UUID) -> int:
 
 
 async def ensure_user_suspension_keeps_project_managers(db: AsyncSession, user: User) -> None:
-    """A project that other people work in must keep an active Project Manager.
+    """Every project keeps an active Project Manager, so its only one cannot be suspended.
 
-    A project the user works in alone leaves nobody stranded, so it never blocks.
+    This holds for a project the user works in alone too: an invitation may be open, and
+    the project must not be left to nobody.
     """
     project_ids = (
         await db.scalars(
@@ -84,10 +97,9 @@ async def ensure_user_suspension_keeps_project_managers(db: AsyncSession, user: 
         )
     ).all()
     for project_id in project_ids:
-        others = _active_members(project_id).where(User.id != user.id)
-        if int(await db.scalar(others) or 0) == 0:
-            continue
-        other_managers = others.where(ProjectMembership.role_code == ProjectRole.MANAGER)
+        other_managers = _active_members(project_id).where(
+            User.id != user.id, ProjectMembership.role_code == ProjectRole.MANAGER
+        )
         if int(await db.scalar(other_managers) or 0) == 0:
             raise APIError(
                 409,
