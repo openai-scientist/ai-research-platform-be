@@ -1,7 +1,7 @@
 import pytest
 
 from platform_be.cli.bootstrap_admin import bootstrap_admin
-from tests.conftest import Harness, login
+from tests.conftest import Harness, login, mutation_headers
 from tests.test_datasets_api import upload_dataset
 from tests.test_projects_api import PROJECTS, add_member, create_project
 
@@ -53,6 +53,22 @@ async def test_list_endpoints_search_and_filter(harness: Harness) -> None:
         assert await _emails(admin, users, status="suspended") == []
         assert len(await _emails(admin, users, status="active")) == 3
         assert (await admin.get(users, params={"status": "bogus"})).status_code == 422
+        assert await _emails(admin, users, platform_role="platform_admin") == ["pa@example.com"]
+        assert "pa@example.com" not in await _emails(admin, users, platform_role="user")
+        assert len(await _emails(admin, users, platform_role="user")) == 2
+        assert (await admin.get(users, params={"platform_role": "owner"})).status_code == 422
+        # An account an admin created has not confirmed its email yet.
+        await admin.post(
+            users,
+            json={"email": "pending@example.com", "send_email": False},
+            headers=mutation_headers(admin_session["csrf_token"]),
+        )
+        assert await _emails(admin, users, email_verified="false") == ["pending@example.com"]
+        assert len(await _emails(admin, users, email_verified="true")) == 3
+        assert (
+            await _emails(admin, users, email_verified="false", platform_role="platform_admin")
+            == []
+        )
 
         # Projects: q searches name and description; status filters the derived status.
         names = lambda data: sorted(item["name"] for item in data)  # noqa: E731

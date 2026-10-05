@@ -148,6 +148,8 @@ async def _active_platform_admin_count(db: AsyncSession) -> int:
 async def list_users(
     q: SearchTerm = None,
     status: UserStatus | None = None,
+    platform_role: PlatformRole | None = None,
+    email_verified: bool | None = None,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     _: Principal = Depends(require_platform_admin),
@@ -159,6 +161,13 @@ async def list_users(
         filters.append(matches(q, User.email, User.display_name))
     if status is not None:
         filters.append(User.status == status)
+    if platform_role is not None:
+        # A stored row means Platform Admin; no row means `user`.
+        is_admin = User.id.in_(select(UserPlatformRole.user_id))
+        filters.append(is_admin if platform_role == PlatformRole.PLATFORM_ADMIN else ~is_admin)
+    if email_verified is not None:
+        verified = User.email_verified_at.is_not(None)
+        filters.append(verified if email_verified else ~verified)
     total = int(await db.scalar(select(func.count()).select_from(User).where(*filters)) or 0)
     rows = (
         await db.execute(
