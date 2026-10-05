@@ -5,6 +5,20 @@ from uuid import UUID
 from platform_be.services.popper_client import PopperNotFound, PopperRunState
 
 
+class FakeEmailSender:
+    """Keeps every message instead of sending it."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, str]] = []
+        # Set to False to answer like a provider that refused the message.
+        self.accept = True
+
+    async def send(self, *, to: str, subject: str, text: str, html: str) -> bool:
+        if self.accept:
+            self.sent.append({"to": to, "subject": subject, "text": text, "html": html})
+        return self.accept
+
+
 class FakePopperClient:
     """Stands in for Popper: remembers what it was asked and answers from memory."""
 
