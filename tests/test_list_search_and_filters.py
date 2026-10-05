@@ -46,6 +46,9 @@ async def test_list_endpoints_search_and_filter(harness: Harness) -> None:
         users = "/api/v1/users"
         assert await _emails(admin, users, q="REVIEWER") == ["reviewer@example.com"]
         assert await _emails(admin, users, q="%%%") == []
+        # Words are matched separately, in any order, and all of them must be found.
+        assert await _emails(admin, users, q="example reviewer") == ["reviewer@example.com"]
+        assert await _emails(admin, users, q="reviewer nobody") == []
         assert (await admin.get(users, params={"q": "ab"})).status_code == 422
         assert await _emails(admin, users, status="suspended") == []
         assert len(await _emails(admin, users, status="active")) == 3

@@ -43,6 +43,12 @@ async def test_platform_admin_sees_runs_and_cost_per_project(harness: Harness) -
         assert float(busy["cost_usd"]) == 4.75
         assert float(busy["budget_usd"]) == 18
         assert busy["last_run_at"] is not None
+
+        found = (await admin_client.get(USAGE, params={"q": project["name"].upper()})).json()
+        assert [item["project_id"] for item in found["data"]] == [project["id"]]
+        assert found["meta"]["pagination"]["total"] == 1
+        nothing = (await admin_client.get(USAGE, params={"q": "no such project"})).json()
+        assert (nothing["data"], nothing["meta"]["pagination"]["total"]) == ([], 0)
         assert idle["project_id"] == quiet["id"]
         assert idle["run_count"] == 0
         assert idle["runs_by_status"] == {}

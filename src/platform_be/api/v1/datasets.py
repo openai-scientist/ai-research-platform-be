@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from platform_be.auth.sessions import Principal, require_active_csrf, require_active_principal
 from platform_be.core.errors import APIError
 from platform_be.core.responses import ApiResponse, ErrorResponse, ok, paginated
-from platform_be.core.search import SearchTerm, contains_text
+from platform_be.core.search import SearchTerm, matches
 from platform_be.db.session import get_db
 from platform_be.models.dataset import Dataset, DatasetVersion
 from platform_be.services.access import (
@@ -193,7 +193,7 @@ async def list_datasets(
     await require_project_access(db, principal, project_id)
     filters = [Dataset.project_id == project_id]
     if q:
-        filters.append(contains_text(Dataset.name, q))
+        filters.append(matches(q, Dataset.name))
     total = int(await db.scalar(select(func.count()).select_from(Dataset).where(*filters)) or 0)
     datasets = (
         await db.scalars(

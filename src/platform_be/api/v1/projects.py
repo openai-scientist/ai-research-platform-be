@@ -4,7 +4,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_be.auth.sessions import (
@@ -17,7 +17,7 @@ from platform_be.core.config import Settings
 from platform_be.core.errors import APIError
 from platform_be.core.responses import ApiResponse, ErrorResponse, ok, paginated
 from platform_be.core.roles import ProjectRole
-from platform_be.core.search import SearchTerm, contains_text
+from platform_be.core.search import SearchTerm, matches
 from platform_be.db.session import get_db
 from platform_be.models.identity import User, UserStatus
 from platform_be.models.project import Project, ProjectMembership
@@ -298,9 +298,7 @@ async def list_projects(
     elif status is not None:
         query = query.where(Project.archived_at.is_(None), Project.status == status)
     if q:
-        query = query.where(
-            or_(contains_text(Project.name, q), contains_text(Project.description, q))
-        )
+        query = query.where(matches(q, Project.name, Project.description))
     total = int(await db.scalar(select(func.count()).select_from(query.subquery())) or 0)
     rows = (
         await db.execute(
@@ -573,7 +571,7 @@ async def list_project_members(
     if role is not None:
         filters.append(ProjectMembership.role_code == role)
     if q:
-        filters.append(or_(contains_text(User.email, q), contains_text(User.display_name, q)))
+        filters.append(matches(q, User.email, User.display_name))
     total = int(
         await db.scalar(
             select(func.count())

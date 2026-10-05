@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from platform_be.auth.sessions import Principal, require_active_csrf, require_active_principal
 from platform_be.core.errors import APIError
 from platform_be.core.responses import ApiResponse, ErrorResponse, ok, paginated
-from platform_be.core.search import SearchTerm, contains_text
+from platform_be.core.search import SearchTerm, matches
 from platform_be.db.session import get_db
 from platform_be.models.project_file import ProjectFile
 from platform_be.services.access import (
@@ -141,7 +141,7 @@ async def list_project_files(
     if kind is not None:
         filters.append(ProjectFile.kind == kind)
     if q:
-        filters.append(contains_text(ProjectFile.original_filename, q))
+        filters.append(matches(q, ProjectFile.original_filename))
     total = int(await db.scalar(select(func.count()).select_from(ProjectFile).where(*filters)) or 0)
     rows = (
         await db.scalars(
