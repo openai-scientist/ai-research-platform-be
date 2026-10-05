@@ -2,19 +2,25 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
+from platform_be.api.v1.auth import Password
 from platform_be.auth.sessions import (
     Principal,
+    normalize_email,
     require_active_csrf,
     require_platform_admin,
     require_user_id,
 )
+from platform_be.core.config import Settings
 from platform_be.core.errors import APIError
-from platform_be.core.responses import ApiResponse, ok, paginated
+from platform_be.core.responses import ApiResponse, ErrorResponse, ok, paginated
 from platform_be.core.roles import PlatformRole
+from platform_be.core.security import hash_password
 from platform_be.db.session import get_db
 from platform_be.models.identity import AuthSession, User, UserPlatformRole, UserStatus
 from platform_be.services.access import (
@@ -34,6 +40,12 @@ class UserAdminItem(BaseModel):
     status: str
     platform_role: PlatformRole | None
     created_at: datetime
+
+
+class UserCreate(BaseModel):
+    email: EmailStr = Field(description="The sign-in name. One account per email.")
+    password: str = Password
+    display_name: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class UserStatusUpdate(BaseModel):
@@ -97,6 +109,58 @@ async def list_users(
         for user, role in rows
     ]
     return paginated(items, total=total, limit=limit, offset=offset)
+
+
+@router.post(
+    "",
+    status_code=201,
+    response_model=ApiResponse[UserAdminItem],
+    summary="Create an account for someone else",
+    description=(
+        "A Platform Admin creates an active account with an initial password. Nobody is "
+        "signed in; the new user signs in with `login` and can then change the password."
+    ),
+    responses={
+        409: {"model": ErrorResponse, "description": "An account with this email already exists"},
+    },
+)
+async def create_user(
+    body: UserCreate,
+    request: Request,
+    principal: Principal = Depends(require_active_csrf),
+    _: Principal = Depends(require_platform_admin),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[UserAdminItem]:
+    settings: Settings = request.app.state.settings
+    normalized = normalize_email(body.email)
+    taken = APIError(409, "EMAIL_ALREADY_REGISTERED", "An account with this email already exists")
+    if await db.scalar(select(User.id).where(User.email_normalized == normalized)) is not None:
+        raise taken
+    user = User(
+        email=body.email,
+        email_normalized=normalized,
+        display_name=body.display_name.strip() if body.display_name else None,
+        password_hash=await run_in_threadpool(
+            hash_password, body.password, settings.password_scrypt_log2_n
+        ),
+        status=UserStatus.ACTIVE,
+    )
+    db.add(user)
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # Someone took the same email between the check and the insert.
+        raise taken from exc
+    record_audit(
+        db,
+        actor_user_id=principal.user.id,
+        action="user.created",
+        resource_type="user",
+        resource_id=user.id,
+        request_id=getattr(request.state, "request_id", None),
+        details={"status": UserStatus.ACTIVE},
+    )
+    return ok(await _user_item(db, user), "User created")
 
 
 @router.patch("/{user_id}/status", response_model=ApiResponse[UserAdminItem])

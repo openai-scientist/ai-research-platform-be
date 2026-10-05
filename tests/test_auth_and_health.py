@@ -6,8 +6,9 @@ from sqlalchemy import select
 from platform_be.auth.sessions import normalize_email
 from platform_be.cli.bootstrap_admin import bootstrap_admin
 from platform_be.core.errors import APIError
+from platform_be.models.audit import AuditEvent
 from platform_be.models.identity import AuthSession, User, UserPlatformRole
-from tests.conftest import ORIGIN, PASSWORD, Harness, login
+from tests.conftest import ORIGIN, PASSWORD, Harness, login, mutation_headers
 
 
 @pytest.mark.asyncio
@@ -392,3 +393,66 @@ async def test_logout_all_revokes_every_session_of_the_user(harness: Harness) ->
         assert (await phone.get("/api/v1/auth/me")).status_code == 401
         assert (await laptop.get("/api/v1/auth/me")).status_code == 401
         assert (await other.get("/api/v1/auth/me")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_platform_admin_creates_a_user_who_can_then_sign_in(harness: Harness) -> None:
+    new_user = {"email": "Hired@Example.com", "password": PASSWORD, "display_name": " New Hire "}
+    async with harness.client() as admin, harness.client() as member:
+        admin_session = await login(harness, admin, uid="pa", email="pa@example.com")
+        await bootstrap_admin(
+            "pa@example.com", settings=harness.settings, session_factory=harness.factory
+        )
+        member_session = await login(harness, member, uid="member", email="member@example.com")
+        headers = mutation_headers(admin_session["csrf_token"])
+
+        missing_csrf = await admin.post("/api/v1/users", json=new_user, headers={"Origin": ORIGIN})
+        not_admin = await member.post(
+            "/api/v1/users", json=new_user, headers=mutation_headers(member_session["csrf_token"])
+        )
+        created = await admin.post("/api/v1/users", json=new_user, headers=headers)
+        again = await admin.post(
+            "/api/v1/users",
+            json={"email": "hired@example.com", "password": "another password"},
+            headers=headers,
+        )
+        too_short = await admin.post(
+            "/api/v1/users",
+            json={"email": "short@example.com", "password": "1234567"},
+            headers=headers,
+        )
+        # Creating an account must not replace the admin's own session.
+        assert (await admin.get("/api/v1/auth/me")).json()["data"]["user"]["email"] == (
+            "pa@example.com"
+        )
+        listed = await admin.get("/api/v1/users", params={"email": "hired@example.com"})
+    async with harness.client() as client:
+        signed_in = await client.post(
+            "/api/v1/auth/login",
+            json={"email": "hired@example.com", "password": PASSWORD},
+            headers={"Origin": ORIGIN},
+        )
+
+    assert missing_csrf.status_code == 403
+    assert missing_csrf.json()["error"]["code"] == "CSRF_INVALID"
+    assert not_admin.status_code == 403
+    assert not_admin.json()["error"]["code"] == "ROLE_REQUIRED"
+    assert created.status_code == 201, created.text
+    assert created.json()["message"] == "User created"
+    user = created.json()["data"]
+    assert user["email"] == "Hired@example.com"
+    assert user["display_name"] == "New Hire"
+    assert user["status"] == "active"
+    assert user["platform_role"] is None
+    assert "password" not in created.text
+    assert again.status_code == 409
+    assert again.json()["error"]["code"] == "EMAIL_ALREADY_REGISTERED"
+    assert too_short.status_code == 422
+    assert [item["id"] for item in listed.json()["data"]] == [user["id"]]
+    assert signed_in.status_code == 200, signed_in.text
+    assert signed_in.json()["data"]["user"]["id"] == user["id"]
+
+    async with harness.factory() as db:
+        event = await db.scalar(select(AuditEvent).where(AuditEvent.action == "user.created"))
+    assert str(event.actor_user_id) == admin_session["user"]["id"]
+    assert event.resource_id == user["id"]
