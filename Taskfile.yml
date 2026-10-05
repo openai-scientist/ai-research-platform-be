@@ -3,6 +3,8 @@ version: '3'
 vars:
   DEV_COMPOSE: docker/docker-compose.dev.yml
   DEV_ENV_FILE: .env.local
+  PROD_COMPOSE: docker/docker-compose.prod.yml
+  PROD_ENV_FILE: docker/prod.env.local
 
 tasks:
   default:
@@ -47,3 +49,41 @@ tasks:
         msg: Copy the sample settings file to the local settings file before migrating.
     cmds:
       - docker compose --env-file {{.DEV_ENV_FILE}} -f {{.DEV_COMPOSE}} run --rm api alembic upgrade head
+
+  prod:config:
+    desc: Check the production Compose file and settings without starting anything
+    preconditions: &prod_env
+      - sh: test -f {{.PROD_ENV_FILE}}
+        msg: Copy docker/prod.env.example to docker/prod.env.local and fill it in first.
+    cmds:
+      - docker compose --env-file {{.PROD_ENV_FILE}} -f {{.PROD_COMPOSE}} config --quiet
+
+  prod:up:
+    desc: Start or rebuild the production API and PostgreSQL
+    preconditions: *prod_env
+    cmds:
+      - docker compose --env-file {{.PROD_ENV_FILE}} -f {{.PROD_COMPOSE}} up -d --build
+
+  prod:down:
+    desc: Stop production services and preserve the database and storage volumes
+    preconditions: *prod_env
+    cmds:
+      - docker compose --env-file {{.PROD_ENV_FILE}} -f {{.PROD_COMPOSE}} down
+
+  prod:status:
+    desc: Show production container status
+    preconditions: *prod_env
+    cmds:
+      - docker compose --env-file {{.PROD_ENV_FILE}} -f {{.PROD_COMPOSE}} ps
+
+  prod:logs:
+    desc: Follow production container logs
+    preconditions: *prod_env
+    cmds:
+      - docker compose --env-file {{.PROD_ENV_FILE}} -f {{.PROD_COMPOSE}} logs --tail=100 --follow
+
+  prod:migrate:
+    desc: Apply pending database migrations in production
+    preconditions: *prod_env
+    cmds:
+      - docker compose --env-file {{.PROD_ENV_FILE}} -f {{.PROD_COMPOSE}} run --rm api alembic upgrade head
