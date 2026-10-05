@@ -146,6 +146,7 @@ Someone who is not a member gets `404` for everything in a project, so its exist
 | Read datasets, research context, runs, reviews, result files, comments | ✓ | ✓ | ✓ | ✓ |
 | Download dataset and result files | ✓ | ✓ | ✓ | ✓ |
 | Upload a dataset or a new version; rename a dataset | ✓ | ✓ | ✓ | 403 |
+| Upload or delete a project file | ✓ | ✓ | ✓ | 403 |
 | Save the research context | ✓ | ✓ | ✓ | 403 |
 | Start or sync a run; decide a frame review | ✓ | ✓ | ✓ | 403 |
 | Abandon a run | ✓ | ✓ | 403 | 403 |
@@ -159,6 +160,12 @@ Someone who is not a member gets `404` for everything in a project, so its exist
 CSV only. A file must be UTF-8, have a header row of unique, non-empty column names, at least one data row, and the same number of values on every row. The size limit is 50 MiB by default (`DATASET_MAX_UPLOAD_BYTES`); a header may have at most 2000 columns with names of at most 200 characters.
 
 The Platform records the row count, column names, size, and SHA-256. A file that fails a check is refused and nothing is stored.
+
+### Project files
+
+Documents attached to a project: PDF, CSV and Excel (`.xlsx`, `.xls`), up to 50 MiB each by default (`PROJECT_FILE_MAX_UPLOAD_BYTES`). They are reference material for the members and are never sent to Popper; data for a run is uploaded as a dataset.
+
+The type comes from the file name, not from the content type the browser sends, and the first bytes must match it: a renamed file is refused with `INVALID_FILE`. Files are downloaded as attachments, never rendered by the API.
 
 ### Research context
 
@@ -332,6 +339,9 @@ All paths start with `/api/v1`. Full schemas and error cases are in Swagger UI a
 | `GET` `PATCH` | `/projects/{id}/datasets/{dataset_id}` | Read; rename or describe |
 | `GET` `POST` | `/projects/{id}/datasets/{dataset_id}/versions` | List versions; upload a new version |
 | `GET` | `/projects/{id}/datasets/{dataset_id}/versions/{version_id}/download` | Download a version's file |
+| `GET` `POST` | `/projects/{id}/files` | List files (`q`, `kind`); upload a PDF, CSV or Excel file (multipart: `file`) |
+| `GET` | `/projects/{id}/files/{file_id}/download` | Download a file |
+| `DELETE` | `/projects/{id}/files/{file_id}` | Delete a file |
 | `GET` `PUT` | `/projects/{id}/research-context` | Newest research context; save a new version |
 | `GET` | `/projects/{id}/research-context/versions`, `/versions/{n}` | Version history; one version |
 
@@ -401,7 +411,12 @@ Settings come from environment variables; `.env.example` lists them all with saf
 
 | Variable | Purpose |
 |---|---|
-| `STORAGE_LOCAL_ROOT` | Directory that holds uploaded and produced files (`var/storage` on the host). |
+| `STORAGE_BACKEND` | `local` (default) keeps files in a directory; `r2` keeps them in a Cloudflare R2 bucket. |
+| `STORAGE_LOCAL_ROOT` | Directory used by the `local` store (`var/storage` on the host). |
+| `R2_ACCOUNT_ID`, `R2_BUCKET` | The Cloudflare account and the bucket. Required with `r2`. |
+| `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` | An R2 API token with Object Read & Write on that bucket. Required with `r2`. |
+| `R2_ENDPOINT_URL` | Only for a bucket with a jurisdiction; replaces the endpoint built from the account ID. |
+| `PROJECT_FILE_MAX_UPLOAD_BYTES` | Largest project file (default 50 MiB). |
 | `DATASET_MAX_UPLOAD_BYTES` | Largest dataset file (default 50 MiB). |
 | `ARTIFACT_MAX_UPLOAD_BYTES` | Largest result file Popper may deliver (default 50 MiB). |
 | `POPPER_BASE_URL` | Popper's address. Empty: runs cannot start. |
@@ -418,10 +433,22 @@ The two Popper keys are different secrets of at least 32 characters in productio
 
 ### File storage
 
-Dataset files, review requests and decisions, and result files are kept in a file store, outside the database. The only store today is a directory (a named volume under Compose). Until a cloud store is added:
+Dataset files, project files, review requests and decisions, and result files are kept in a file store, outside the database. `STORAGE_BACKEND` chooses it.
+
+**`local`** — a directory (a named volume under Compose):
 
 - Run a single API replica, or give every replica the same volume.
 - Back up the storage volume together with the database: rows point at files by key.
+
+**`r2`** — a Cloudflare R2 bucket, reached through its S3-compatible API:
+
+1. Create a bucket in the Cloudflare dashboard (R2 > Create bucket). Keep it private: no public access, no custom domain. Every download goes through this API, which checks project membership.
+2. Create an API token (R2 > Manage API tokens) with **Object Read & Write**, limited to that bucket. Copy the Access Key ID and the Secret Access Key; the secret is shown once.
+3. Set `STORAGE_BACKEND=r2`, `R2_ACCOUNT_ID`, `R2_BUCKET`, `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`, then restart the API. It refuses to start when one is missing.
+
+Files pass through the API in both directions, so the browser never needs R2 credentials or a CORS policy on the bucket. A stored file is never overwritten: uploads use a conditional write that fails when the key exists.
+
+Switching the store does not move files. Rows written under one store point at keys the other does not have, so copy the files across with the same keys (for example `rclone copy`) before switching a database that already has uploads.
 
 ### Migrations
 
@@ -447,7 +474,7 @@ EventSource clients reconnect to receive a fresh notification snapshot.
 
 ### Limits and deployment security
 
-- Request bodies are limited to 1 MiB (`REQUEST_MAX_BODY_BYTES`); dataset uploads and result files have their own limits, above.
+- Request bodies are limited to 1 MiB (`REQUEST_MAX_BODY_BYTES`); dataset uploads, project files and result files have their own limits, above.
 - `POST /api/v1/auth/login` allows 10 attempts per client IP per 60 seconds per API process (`AUTH_SESSION_RATE_LIMIT`, `AUTH_SESSION_RATE_WINDOW_SECONDS`).
 - Production Compose does not configure Uvicorn's trusted proxy addresses, so behind a proxy all requests may share one IP and one login quota. Before public deployment, make Uvicorn trust only the real proxy addresses and add a shared rate limit at the ingress. Do not use caller-supplied forwarding headers as client identity.
 - The hosting platform is not selected yet.
