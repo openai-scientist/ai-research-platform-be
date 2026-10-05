@@ -31,11 +31,18 @@ class Settings(BaseSettings):
     auth_session_rate_limit: int = Field(default=10, ge=1, le=1000)
     auth_session_rate_window_seconds: int = Field(default=60, ge=1, le=3600)
     request_max_body_bytes: int = Field(default=1_048_576, ge=1024, le=10_485_760)
-    # Uploaded datasets and run artifacts live in a file store; only "local" exists so far.
-    storage_backend: Literal["local"] = "local"
+    # Uploaded and produced files live in a file store: a local directory or a Cloudflare R2 bucket.
+    storage_backend: Literal["local", "r2"] = "local"
     storage_local_root: str = "var/storage"
+    r2_account_id: str | None = None
+    # Only for buckets with a jurisdiction (EU, FedRAMP), whose endpoint differs from the default.
+    r2_endpoint_url: str | None = None
+    r2_bucket: str | None = None
+    r2_access_key_id: str | None = None
+    r2_secret_access_key: SecretStr | None = None
     dataset_max_upload_bytes: int = Field(default=52_428_800, ge=1024, le=1_073_741_824)
     artifact_max_upload_bytes: int = Field(default=52_428_800, ge=1024, le=1_073_741_824)
+    project_file_max_upload_bytes: int = Field(default=52_428_800, ge=1024, le=1_073_741_824)
     # Popper is a separate service. Runs cannot start until its base URL is configured.
     popper_base_url: str | None = None
     popper_service_key: SecretStr | None = None
@@ -61,9 +68,19 @@ class Settings(BaseSettings):
             raise ValueError("session_signing_secret must be at least 32 characters")
         return value
 
-    @field_validator("popper_base_url", "popper_service_key", "popper_callback_key", mode="before")
+    @field_validator(
+        "popper_base_url",
+        "popper_service_key",
+        "popper_callback_key",
+        "r2_account_id",
+        "r2_endpoint_url",
+        "r2_bucket",
+        "r2_access_key_id",
+        "r2_secret_access_key",
+        mode="before",
+    )
     @classmethod
-    def normalize_blank_popper_setting(cls, value: object) -> object:
+    def normalize_blank_optional_setting(cls, value: object) -> object:
         if isinstance(value, SecretStr):
             value = value.get_secret_value()
         return None if isinstance(value, str) and not value.strip() else value
@@ -75,6 +92,16 @@ class Settings(BaseSettings):
         if self.popper_base_url and not (self.popper_service_key and self.popper_callback_key):
             raise ValueError(
                 "popper_service_key and popper_callback_key are required with popper_base_url"
+            )
+        if self.storage_backend == "r2" and not (
+            self.r2_bucket
+            and self.r2_access_key_id
+            and self.r2_secret_access_key
+            and (self.r2_account_id or self.r2_endpoint_url)
+        ):
+            raise ValueError(
+                "storage_backend=r2 requires r2_bucket, r2_access_key_id, r2_secret_access_key, "
+                "and r2_account_id (or r2_endpoint_url)"
             )
         if self.cookie_samesite == "none" and not self.cookie_secure:
             raise ValueError("SameSite=None cookies require Secure")
@@ -91,6 +118,12 @@ class Settings(BaseSettings):
                 if key is not None and len(key.get_secret_value()) < 32:
                     raise ValueError("Production Popper service keys need at least 32 characters")
         return self
+
+    @property
+    def r2_endpoint(self) -> str:
+        return (
+            self.r2_endpoint_url or f"https://{self.r2_account_id}.r2.cloudflarestorage.com"
+        ).rstrip("/")
 
     @property
     def allowed_origins(self) -> list[str]:

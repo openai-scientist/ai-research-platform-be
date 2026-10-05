@@ -1,7 +1,7 @@
 """Where uploaded datasets and run files live.
 
-Routes depend on the ``FileStore`` protocol; ``LocalFileStore`` keeps files on disk.
-A cloud driver can replace it later without changing any route.
+Routes depend on the ``FileStore`` protocol. ``LocalFileStore`` keeps files on disk and
+``R2FileStore`` (in ``r2_file_store``) keeps them in a Cloudflare R2 bucket.
 """
 
 import asyncio
@@ -18,7 +18,17 @@ from uuid import uuid4
 
 from fastapi import Request
 
+from platform_be.core.config import Settings
+
 CHUNK_BYTES = 64 * 1024
+
+
+def key_parts(key: str) -> tuple[str, ...]:
+    """Split a storage key, refusing anything that is not a plain relative path."""
+    parts = PurePosixPath(key).parts
+    if not parts or key.startswith("/") or any(part in {"..", "."} for part in parts):
+        raise ValueError("storage key must be a relative path inside the store")
+    return parts
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,10 +53,7 @@ class LocalFileStore:
         self.root = Path(root).resolve()
 
     def _path(self, key: str) -> Path:
-        parts = PurePosixPath(key).parts
-        if not parts or key.startswith("/") or any(part in {"..", "."} for part in parts):
-            raise ValueError("storage key must be a relative path inside the store")
-        path = self.root.joinpath(*parts).resolve()
+        path = self.root.joinpath(*key_parts(key)).resolve()
         if not path.is_relative_to(self.root):
             raise ValueError("storage key must be a relative path inside the store")
         return path
@@ -80,6 +87,20 @@ class LocalFileStore:
 
     async def delete(self, key: str) -> None:
         await asyncio.to_thread(self._path(key).unlink, missing_ok=True)
+
+
+def build_file_store(settings: Settings) -> FileStore:
+    if settings.storage_backend == "r2":
+        # Imported here so the local store never needs the R2 client library loaded.
+        from platform_be.services.r2_file_store import R2FileStore
+
+        return R2FileStore(
+            bucket=settings.r2_bucket,
+            endpoint_url=settings.r2_endpoint,
+            access_key_id=settings.r2_access_key_id,
+            secret_access_key=settings.r2_secret_access_key.get_secret_value(),
+        )
+    return LocalFileStore(settings.storage_local_root)
 
 
 def get_file_store(request: Request) -> FileStore:

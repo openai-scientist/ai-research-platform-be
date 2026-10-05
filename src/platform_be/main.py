@@ -20,7 +20,7 @@ from platform_be.core.logging import configure_logging
 from platform_be.core.middleware import RequestProtectionMiddleware
 from platform_be.core.responses import error_response, request_id_context
 from platform_be.db.session import get_db
-from platform_be.services.file_store import LocalFileStore
+from platform_be.services.file_store import build_file_store
 from platform_be.services.notification_stream import NotificationHub
 from platform_be.services.popper_client import build_popper_client
 
@@ -70,7 +70,7 @@ def create_app(
     app.state.engine = app_engine
     app.state.session_factory = app_session_factory
     app.state.get_db = get_db
-    app.state.file_store = LocalFileStore(settings.storage_local_root)
+    app.state.file_store = build_file_store(settings)
     app.state.popper_client = build_popper_client(settings)
     app.state.notification_hub = notification_hub
     app.add_middleware(RequestProtectionMiddleware, settings=settings)
