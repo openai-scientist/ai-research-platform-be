@@ -440,7 +440,7 @@ async def test_platform_admin_creates_a_user_who_can_then_sign_in(harness: Harne
         assert (await admin.get("/api/v1/auth/me")).json()["data"]["user"]["email"] == (
             "pa@example.com"
         )
-        listed = await admin.get("/api/v1/users", params={"email": "hired@example.com"})
+        listed = await admin.get("/api/v1/users", params={"q": "hired@example.com"})
         async with harness.client() as client:
             # The first sign-in asks for the code emailed to the new user.
             signed_in = await sign_in(harness, client, "hired@example.com", "hired")

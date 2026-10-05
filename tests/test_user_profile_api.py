@@ -35,7 +35,7 @@ async def test_created_user_gets_name_and_temporary_password_from_the_email(
         blank = await admin.post(
             USERS, json={"email": "d@example.com", "display_name": "   "}, headers=headers
         )
-        listed = await admin.get(USERS, params={"email": "dat.ngo@example.com"})
+        listed = await admin.get(USERS, params={"q": "dat.ngo@example.com"})
         # A password in the body is ignored: only the local part signs in.
         with_sent_password = await sign_in(harness, client, "dat.ngo@example.com", PASSWORD)
         with_local_part = await sign_in(harness, client, "dat.ngo@example.com", "dat.ngo")
@@ -104,11 +104,11 @@ async def test_created_user_must_change_the_temporary_password_first(harness: Ha
     async with harness.client() as admin, harness.client() as client:
         headers = await _admin(harness, admin)
         await admin.post(USERS, json={"email": "hire@example.com"}, headers=headers)
-        before = (await admin.get(USERS, params={"email": "hire@example.com"})).json()["data"][0]
+        before = (await admin.get(USERS, params={"q": "hire@example.com"})).json()["data"][0]
 
         signed_in = await sign_in(harness, client, "hire@example.com", "hire")
         own = mutation_headers(signed_in.json()["data"]["csrf_token"])
-        after = (await admin.get(USERS, params={"email": "hire@example.com"})).json()["data"][0]
+        after = (await admin.get(USERS, params={"q": "hire@example.com"})).json()["data"][0]
         blocked_list = await client.get(PROJECTS)
         blocked_count = await client.get("/api/v1/notifications/unread-count")
         blocked_stream = await client.get("/api/v1/notifications/stream")
