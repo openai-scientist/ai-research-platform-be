@@ -84,11 +84,14 @@ async def test_list_endpoints_search_and_filter(harness: Harness) -> None:
         assert (await admin.get(runs, params={"status": "running"})).json()["data"] == []
         assert (await admin.get(runs, params={"status": "bogus"})).status_code == 422
 
-        # Notifications: kind filter, for the person who was added to the project.
+        # Notifications: kind filter, for the person whose invitations were accepted.
         notifications = "/api/v1/notifications"
-        added = await researcher.get(notifications, params={"kind": "added_to_project"})
+        added = await admin.get(notifications, params={"kind": "invite_accepted"})
         assert added.status_code == 200, added.text
-        assert [item["kind"] for item in added.json()["data"]] == ["added_to_project"]
+        assert [item["kind"] for item in added.json()["data"]] == ["invite_accepted"] * 2
+        assert (await admin.get(notifications, params={"kind": "project_invited"})).json()[
+            "data"
+        ] == []
         assert (await researcher.get(notifications, params={"kind": "run_finished"})).json()[
             "data"
         ] == []
