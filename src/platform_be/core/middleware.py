@@ -23,6 +23,7 @@ class RequestProtectionMiddleware:
         self._dataset_upload_path = re.compile(
             rf"{prefix}/projects/[^/]+/datasets(/[^/]+/versions)?/?"
         )
+        self._project_file_upload_path = re.compile(rf"{prefix}/projects/[^/]+/files/?")
         self._artifact_upload_path = re.compile(rf"{prefix}/internal/popper/runs/[^/]+/artifacts/?")
         self._popper_callback_prefix = f"{settings.api_prefix.rstrip('/')}/internal/popper/"
 
@@ -131,6 +132,8 @@ class RequestProtectionMiddleware:
             path = scope.get("path", "")
             if self._dataset_upload_path.fullmatch(path):
                 return self.settings.dataset_max_upload_bytes
+            if self._project_file_upload_path.fullmatch(path):
+                return self.settings.project_file_max_upload_bytes
             if self._artifact_upload_path.fullmatch(path):
                 return self.settings.artifact_max_upload_bytes
         return self.settings.request_max_body_bytes
