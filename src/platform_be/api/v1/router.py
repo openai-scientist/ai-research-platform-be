@@ -8,6 +8,7 @@ from platform_be.api.v1.datasets import router as datasets_router
 from platform_be.api.v1.frame_reviews import router as frame_reviews_router
 from platform_be.api.v1.health import router as health_router
 from platform_be.api.v1.internal_popper import router as internal_popper_router
+from platform_be.api.v1.invitations import router as invitations_router
 from platform_be.api.v1.notifications import router as notifications_router
 from platform_be.api.v1.project_files import router as project_files_router
 from platform_be.api.v1.projects import router as projects_router
@@ -26,6 +27,7 @@ router.include_router(auth_router)
 router.include_router(users_router)
 router.include_router(audit_router)
 router.include_router(projects_router)
+router.include_router(invitations_router)
 router.include_router(datasets_router)
 router.include_router(project_files_router)
 router.include_router(research_contexts_router)

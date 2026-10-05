@@ -159,12 +159,13 @@ async def test_notifications_reach_the_right_people(harness: Harness) -> None:
         manager, researcher, reviewer, project, version, members = await team(
             harness, manager_client, researcher_client, reviewer_client
         )
-        assert await kinds(manager_client) == []
-        assert await kinds(researcher_client) == ["added_to_project"]
-        added = (await researcher_client.get(NOTIFICATIONS)).json()["data"][0]
-        assert added["project_name"] == project["name"]
-        assert added["actor_display_name"] == "Manager"
-        assert added["run_id"] is None
+        # Joining follows the member's own acceptance, so only the inviter is told.
+        assert await kinds(manager_client) == ["invite_accepted", "invite_accepted"]
+        assert await kinds(researcher_client) == []
+        accepted = (await manager_client.get(NOTIFICATIONS)).json()["data"][0]
+        assert accepted["project_name"] == project["name"]
+        assert accepted["actor_display_name"] == "Reviewer"
+        assert accepted["run_id"] is None
 
         run = (await start_run(researcher_client, researcher, project["id"], version["id"])).json()[
             "data"
@@ -172,9 +173,10 @@ async def test_notifications_reach_the_right_people(harness: Harness) -> None:
         await report(manager_client, run["id"], status="awaiting_review", review=REVIEW)
         # A repeated callback does not notify twice.
         await report(manager_client, run["id"], status="awaiting_review", review=REVIEW)
-        assert await kinds(manager_client) == ["run_awaiting_review"]
-        assert await kinds(researcher_client) == ["run_awaiting_review", "added_to_project"]
-        assert await kinds(reviewer_client) == ["added_to_project"]
+        assert (await kinds(manager_client))[0] == "run_awaiting_review"
+        assert (await kinds(manager_client)).count("run_awaiting_review") == 1
+        assert await kinds(researcher_client) == ["run_awaiting_review"]
+        assert await kinds(reviewer_client) == []
 
         comments = f"{PROJECTS}/{project['id']}/runs/{run['id']}/comments"
         for client, session in ((reviewer_client, reviewer), (researcher_client, researcher)):
@@ -196,13 +198,14 @@ async def test_notifications_reach_the_right_people(harness: Harness) -> None:
         await report(manager_client, run["id"], status="completed")
         assert (await kinds(manager_client))[0] == "run_finished"
         assert (await kinds(researcher_client))[0] == "run_finished"
-        assert await kinds(reviewer_client) == []
-        assert await unread(reviewer_client) == 0
+        # Someone removed sees that they were removed and nothing else of the project.
+        assert await kinds(reviewer_client) == ["removed_from_project"]
+        assert await unread(reviewer_client) == 1
 
         # Reading.
-        assert await unread(researcher_client) == 4
+        assert await unread(researcher_client) == 3
         mine = (await researcher_client.get(NOTIFICATIONS)).json()
-        assert mine["meta"]["pagination"]["total"] == 4
+        assert mine["meta"]["pagination"]["total"] == 3
         read_url = f"{NOTIFICATIONS}/{mine['data'][0]['id']}/read"
         not_mine = await manager_client.post(
             read_url, headers=mutation_headers(manager["csrf_token"])
@@ -213,15 +216,15 @@ async def test_notifications_reach_the_right_people(harness: Harness) -> None:
             read_url, headers=mutation_headers(researcher["csrf_token"])
         )
         assert read.json()["data"]["read_at"] is not None
-        assert await unread(researcher_client) == 3
-        assert len(await kinds(researcher_client, unread_only=True)) == 3
+        assert await unread(researcher_client) == 2
+        assert len(await kinds(researcher_client, unread_only=True)) == 2
         everything = await researcher_client.post(
             f"{NOTIFICATIONS}/read-all", headers=mutation_headers(researcher["csrf_token"])
         )
-        assert everything.json()["data"]["marked"] == 3
+        assert everything.json()["data"]["marked"] == 2
         assert await unread(researcher_client) == 0
-        assert len(await kinds(researcher_client)) == 4
-        assert await unread(manager_client) == 2
+        assert len(await kinds(researcher_client)) == 3
+        assert await unread(manager_client) == 4
 
 
 @pytest.mark.asyncio
@@ -252,8 +255,8 @@ async def test_a_failed_callback_leaves_no_notification(harness: Harness) -> Non
             store.put = working_put
         assert failed.status_code == 500
 
-        assert await kinds(researcher_client) == ["added_to_project"]
-        assert await kinds(manager_client) == []
+        assert await kinds(researcher_client) == []
+        assert await kinds(manager_client) == ["invite_accepted"]
         assert (await manager_client.get(f"{runs}/{run['id']}")).json()["data"][
             "status"
         ] == "running"
@@ -261,4 +264,4 @@ async def test_a_failed_callback_leaves_no_notification(harness: Harness) -> Non
         # Popper retries and this time everything is recorded once.
         retried = await report(manager_client, run["id"], status="awaiting_review", review=REVIEW)
         assert retried.status_code == 200
-        assert await kinds(manager_client) == ["run_awaiting_review"]
+        assert await kinds(manager_client) == ["run_awaiting_review", "invite_accepted"]

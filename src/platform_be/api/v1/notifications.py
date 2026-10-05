@@ -7,7 +7,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import exists, func, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -25,12 +25,22 @@ from platform_be.db.session import get_db
 from platform_be.models.collaboration import Notification
 from platform_be.models.identity import User
 from platform_be.models.project import Project, ProjectMembership
+from platform_be.services.avatars import api_prefix, avatar_url
 from platform_be.services.notification_stream import notifications_changed
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
 NotificationKind = Literal[
-    "run_awaiting_review", "run_finished", "added_to_project", "run_commented"
+    "run_awaiting_review",
+    "run_finished",
+    # No longer created: joining a project now follows the user's own acceptance.
+    "added_to_project",
+    "run_commented",
+    "project_invited",
+    "invite_accepted",
+    "invite_declined",
+    "member_role_changed",
+    "removed_from_project",
 ]
 NOT_FOUND = {404: {"model": ErrorResponse, "description": "The notification is not yours"}}
 KEEP_ALIVE_SECONDS = 15
@@ -46,6 +56,7 @@ class NotificationItem(BaseModel):
     run_id: str | None
     actor_user_id: str | None
     actor_display_name: str | None
+    actor_avatar_url: str | None
     created_at: datetime
     read_at: datetime | None
 
@@ -64,18 +75,37 @@ class MarkedRead(BaseModel):
 
 
 def _mine(user_id: UUID) -> list:
-    """The user's notifications for projects they are still a member of."""
-    return [
-        Notification.recipient_user_id == user_id,
-        exists().where(
+    """The user's notifications that still concern them.
+
+    Those of projects they are a member of, an invitation while it is open, and the
+    notice that they were removed from a project.
+    """
+
+    def has_row(status: str):
+        return exists().where(
             ProjectMembership.project_id == Notification.project_id,
             ProjectMembership.user_id == user_id,
-            ProjectMembership.status == "active",
+            ProjectMembership.status == status,
+        )
+
+    is_invitation = Notification.kind == "project_invited"
+    return [
+        Notification.recipient_user_id == user_id,
+        or_(
+            and_(has_row("active"), ~is_invitation),
+            and_(has_row("invited"), is_invitation),
+            Notification.kind == "removed_from_project",
         ),
     ]
 
 
-def _item(notification: Notification, project_name: str, actor_name: str | None):
+def _item(
+    notification: Notification,
+    project_name: str,
+    actor_name: str | None,
+    actor_avatar_key: str | None,
+    prefix: str,
+) -> NotificationItem:
     return NotificationItem(
         id=str(notification.id),
         kind=notification.kind,
@@ -84,6 +114,7 @@ def _item(notification: Notification, project_name: str, actor_name: str | None)
         run_id=str(notification.run_id) if notification.run_id else None,
         actor_user_id=str(notification.actor_user_id) if notification.actor_user_id else None,
         actor_display_name=actor_name,
+        actor_avatar_url=avatar_url(prefix, notification.actor_user_id, actor_avatar_key),
         created_at=notification.created_at,
         read_at=notification.read_at,
     )
@@ -92,7 +123,7 @@ def _item(notification: Notification, project_name: str, actor_name: str | None)
 def _with_names(*filters):
     actor = aliased(User)
     return (
-        select(Notification, Project.name, actor.display_name)
+        select(Notification, Project.name, actor.display_name, actor.avatar_storage_key)
         .join(Project, Project.id == Notification.project_id)
         .outerjoin(actor, actor.id == Notification.actor_user_id)
         .where(*filters)
@@ -111,6 +142,7 @@ async def list_notifications(
     offset: int = Query(default=0, ge=0),
     principal: Principal = Depends(require_active_principal),
     db: AsyncSession = Depends(get_db),
+    prefix: str = Depends(api_prefix),
 ) -> ApiResponse[list[NotificationItem]]:
     filters = _mine(principal.user.id)
     if unread_only:
@@ -128,7 +160,7 @@ async def list_notifications(
             .offset(offset)
         )
     ).all()
-    return paginated([_item(*row) for row in rows], total=total, limit=limit, offset=offset)
+    return paginated([_item(*row, prefix) for row in rows], total=total, limit=limit, offset=offset)
 
 
 @router.get(
@@ -157,6 +189,7 @@ async def stream_notifications(
     if request.headers.get("Origin") is not None:
         require_origin(request)
     factory = request.app.state.session_factory
+    prefix = api_prefix(request)
     # Authenticate with a short-lived session instead of a yield dependency,
     # which would keep its transaction/connection open for the entire response.
     async with factory() as db:
@@ -197,7 +230,8 @@ async def stream_notifications(
                                 )
                             ).all()
                             snapshot = NotificationSnapshot(
-                                items=[_item(*row) for row in rows], unread_count=int(count or 0)
+                                items=[_item(*row, prefix) for row in rows],
+                                unread_count=int(count or 0),
                             )
                             await db.commit()
                         # Keep-alives only validate. Closing the read session
@@ -252,7 +286,8 @@ async def mark_all_read(
 ) -> ApiResponse[MarkedRead]:
     result = await db.execute(
         update(Notification)
-        .where(Notification.recipient_user_id == principal.user.id, Notification.read_at.is_(None))
+        .where(*_mine(principal.user.id), Notification.read_at.is_(None))
+        .execution_options(synchronize_session=False)
         .values(read_at=datetime.now(UTC))
     )
     if result.rowcount:
@@ -270,6 +305,7 @@ async def mark_read(
     notification_id: UUID,
     principal: Principal = Depends(require_active_csrf),
     db: AsyncSession = Depends(get_db),
+    prefix: str = Depends(api_prefix),
 ) -> ApiResponse[NotificationItem]:
     row = (
         await db.execute(_with_names(*_mine(principal.user.id), Notification.id == notification_id))
@@ -281,4 +317,4 @@ async def mark_read(
         notification.read_at = datetime.now(UTC)
         notifications_changed(db, principal.user.id)
         await db.flush()
-    return ok(_item(*row), "Notification marked as read")
+    return ok(_item(*row, prefix), "Notification marked as read")

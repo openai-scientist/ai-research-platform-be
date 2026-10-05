@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import UUID
 
@@ -13,6 +13,7 @@ from platform_be.auth.sessions import (
     require_active_csrf,
     require_active_principal,
 )
+from platform_be.core.config import Settings
 from platform_be.core.errors import APIError
 from platform_be.core.responses import ApiResponse, ErrorResponse, ok, paginated
 from platform_be.core.roles import ProjectRole
@@ -24,14 +25,22 @@ from platform_be.models.research import ACTIVE_RUN_STATUSES, ResearchRun
 from platform_be.services.access import (
     active_manager_count,
     ensure_writable_project,
+    invite_expired,
     is_platform_admin,
     lock_project_scope,
     lock_user,
     require_project_access,
 )
 from platform_be.services.audit import record_audit
+from platform_be.services.avatars import api_prefix, avatar_url
+from platform_be.services.email_sender import EmailSender, get_email_sender
+from platform_be.services.invite_emails import project_invite
 from platform_be.services.notification_stream import notifications_changed
-from platform_be.services.notifications import notify_user
+from platform_be.services.notifications import (
+    drop_invitation_notices,
+    notify_project_members,
+    notify_user,
+)
 from platform_be.services.project_status import derive_project_status
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -126,7 +135,22 @@ class ProjectMemberItem(BaseModel):
     user_id: str
     email: str
     display_name: str | None
+    avatar_url: str | None
     role: ProjectRole
+    status: Literal["invited", "active"] = Field(
+        description="`invited` until the user accepts; an invited user has no access yet."
+    )
+    invite_sent_at: datetime | None = Field(
+        description="When the invitation was last sent; null for a member who was never invited."
+    )
+    invite_expires_at: datetime | None
+    invite_expired: bool = Field(
+        description="True for an invitation past its expiry: only then can it be sent again."
+    )
+    invite_email_sent: bool | None = Field(
+        default=None,
+        description="Only on the two responses that send the invitation: whether the email went.",
+    )
     created_at: datetime
 
 
@@ -146,15 +170,68 @@ def _project_item(project: Project, membership: ProjectMembership | None) -> Pro
     )
 
 
-def _member_item(membership: ProjectMembership, user: User) -> ProjectMemberItem:
+def _member_item(
+    membership: ProjectMembership,
+    user: User,
+    prefix: str,
+    *,
+    invite_email_sent: bool | None = None,
+) -> ProjectMemberItem:
     return ProjectMemberItem(
         id=str(membership.id),
         user_id=str(user.id),
         email=user.email,
         display_name=user.display_name,
+        avatar_url=avatar_url(prefix, user.id, user.avatar_storage_key),
         role=membership.role_code,
+        status=membership.status,
+        invite_sent_at=membership.invite_sent_at,
+        invite_expires_at=membership.invite_expires_at,
+        invite_expired=invite_expired(membership),
+        invite_email_sent=invite_email_sent,
         created_at=membership.created_at,
     )
+
+
+OPEN_STATUSES = ("invited", "active")
+
+
+def _send_invitation(
+    db: AsyncSession, settings: Settings, membership: ProjectMembership, actor_user_id: UUID
+) -> None:
+    """Start the invitation's validity and tell the user in the app, replacing older notices."""
+    now = datetime.now(UTC)
+    membership.invite_sent_at = now
+    membership.invite_expires_at = now + timedelta(hours=settings.project_invite_ttl_hours)
+    if membership.user_id != actor_user_id:
+        notify_user(
+            db,
+            membership.user_id,
+            "project_invited",
+            project_id=membership.project_id,
+            actor_user_id=actor_user_id,
+        )
+
+
+async def _email_invitation(
+    settings: Settings,
+    sender: EmailSender,
+    *,
+    project: Project,
+    membership: ProjectMembership,
+    user: User,
+    inviter: User,
+) -> bool:
+    subject, text, html = project_invite(
+        recipient_name=user.display_name or user.email,
+        project_name=project.name,
+        role=membership.role_code,
+        inviter_name=inviter.display_name or inviter.email,
+        expires_at=membership.invite_expires_at,
+        expires_hours=settings.project_invite_ttl_hours,
+        app_url=settings.app_url,
+    )
+    return await sender.send(to=user.email, subject=subject, text=text, html=html)
 
 
 async def _manage_project(
@@ -169,7 +246,7 @@ async def _locked_member(db: AsyncSession, project_id: UUID, membership_id: UUID
     membership_filter = (
         ProjectMembership.id == membership_id,
         ProjectMembership.project_id == project_id,
-        ProjectMembership.status == "active",
+        ProjectMembership.status.in_(OPEN_STATUSES),
     )
     target_user_id = await db.scalar(select(ProjectMembership.user_id).where(*membership_filter))
     if target_user_id is None:
@@ -473,20 +550,26 @@ async def reopen_project(
 @router.get(
     "/{project_id}/members",
     response_model=ApiResponse[list[ProjectMemberItem]],
-    summary="List project members",
+    summary="List project members and pending invitations",
+    description="An item with `status: invited` has not accepted yet and has no access.",
     responses={404: PROJECT_ERRORS[404]},
 )
 async def list_project_members(
     project_id: UUID,
     q: SearchTerm = None,
     role: ProjectRole | None = None,
+    status: Literal["invited", "active"] | None = None,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     principal: Principal = Depends(require_active_principal),
     db: AsyncSession = Depends(get_db),
+    prefix: str = Depends(api_prefix),
 ) -> ApiResponse[list[ProjectMemberItem]]:
     await require_project_access(db, principal, project_id)
-    filters = [ProjectMembership.project_id == project_id, ProjectMembership.status == "active"]
+    filters = [
+        ProjectMembership.project_id == project_id,
+        ProjectMembership.status.in_([status] if status else OPEN_STATUSES),
+    ]
     if role is not None:
         filters.append(ProjectMembership.role_code == role)
     if q:
@@ -511,7 +594,7 @@ async def list_project_members(
         )
     ).all()
     return paginated(
-        [_member_item(membership, user) for membership, user in rows],
+        [_member_item(membership, user, prefix) for membership, user in rows],
         total=total,
         limit=limit,
         offset=offset,
@@ -522,8 +605,12 @@ async def list_project_members(
     "/{project_id}/members",
     response_model=ApiResponse[ProjectMemberItem],
     status_code=201,
-    summary="Add a registered user to the project",
-    description="The person must already have an account; there is no invitation email.",
+    summary="Invite a registered user to the project",
+    description=(
+        "The person must already have an account. They are told in the app and by email "
+        "and join with the given role once they accept; until then they have no access. "
+        "The invitation can be accepted for 24 hours."
+    ),
     responses=PROJECT_ERRORS,
 )
 async def add_project_member(
@@ -532,13 +619,19 @@ async def add_project_member(
     request: Request,
     principal: Principal = Depends(require_active_csrf),
     db: AsyncSession = Depends(get_db),
+    prefix: str = Depends(api_prefix),
+    sender: EmailSender = Depends(get_email_sender),
 ) -> ApiResponse[ProjectMemberItem]:
+    settings: Settings = request.app.state.settings
     await lock_project_scope(db, project_id)
     await require_project_access(db, principal, project_id, manage=True)
     # User rows are locked before the project row, the same order a suspension uses.
     user = await db.scalar(
         select(User)
-        .where(User.email_normalized == normalize_email(str(body.email)))
+        .where(
+            User.email_normalized == normalize_email(str(body.email)),
+            User.email_verified_at.is_not(None),
+        )
         .with_for_update()
     )
     if user is None:
@@ -553,45 +646,102 @@ async def add_project_member(
         select(ProjectMembership.id).where(
             ProjectMembership.project_id == project_id,
             ProjectMembership.user_id == user.id,
-            ProjectMembership.status == "active",
+            ProjectMembership.status.in_(OPEN_STATUSES),
         )
     )
     if existing:
-        raise APIError(409, "MEMBERSHIP_EXISTS", "User is already an active project member")
+        raise APIError(
+            409, "MEMBERSHIP_EXISTS", "User is already a project member or already invited"
+        )
     membership = ProjectMembership(
         project_id=project_id,
         user_id=user.id,
         role_code=body.role,
-        status="active",
+        status="invited",
         created_by_user_id=principal.user.id,
     )
+    _send_invitation(db, settings, membership, principal.user.id)
     db.add(membership)
     await db.flush()
     record_audit(
         db,
         actor_user_id=principal.user.id,
-        action="project.member_added",
+        action="project.member_invited",
         resource_type="project_membership",
         resource_id=membership.id,
         project_id=project_id,
         request_id=getattr(request.state, "request_id", None),
         details={"user_id": str(user.id), "role": body.role},
     )
-    if user.id != principal.user.id:
-        notify_user(
-            db,
-            user.id,
-            "added_to_project",
-            project_id=project_id,
-            actor_user_id=principal.user.id,
+    # Commit first: the email must never describe an invitation that was rolled back.
+    await db.commit()
+    sent = await _email_invitation(
+        settings, sender, project=project, membership=membership, user=user, inviter=principal.user
+    )
+    return ok(_member_item(membership, user, prefix, invite_email_sent=sent), "Invitation sent")
+
+
+@router.post(
+    "/{project_id}/members/{membership_id}/invite",
+    response_model=ApiResponse[ProjectMemberItem],
+    summary="Send an expired invitation again",
+    description=(
+        "Only an invitation that has expired can be sent again; that starts a new 24 hours. "
+        "To reach the user sooner, cancel the invitation and invite them again."
+    ),
+    responses=PROJECT_ERRORS,
+)
+async def resend_project_invitation(
+    project_id: UUID,
+    membership_id: UUID,
+    request: Request,
+    principal: Principal = Depends(require_active_csrf),
+    db: AsyncSession = Depends(get_db),
+    prefix: str = Depends(api_prefix),
+    sender: EmailSender = Depends(get_email_sender),
+) -> ApiResponse[ProjectMemberItem]:
+    settings: Settings = request.app.state.settings
+    await lock_project_scope(db, project_id)
+    await require_project_access(db, principal, project_id, manage=True)
+    membership, user = await _locked_member(db, project_id, membership_id)
+    project, _ = await require_project_access(db, principal, project_id, manage=True, lock=True)
+    ensure_writable_project(project)
+    if membership.status != "invited":
+        raise APIError(409, "INVITE_NOT_PENDING", "This user is already a project member")
+    if user.status == UserStatus.SUSPENDED:
+        raise APIError(409, "USER_SUSPENDED", "A suspended user cannot be invited")
+    if not invite_expired(membership):
+        raise APIError(
+            409, "INVITE_STILL_VALID", "The invitation can be sent again once it has expired"
         )
-    return ok(_member_item(membership, user), "Project member added")
+    # The new notice replaces the one about the expired invitation.
+    await drop_invitation_notices(db, user.id, project_id)
+    # Whoever sends it again is the inviter from now on, and is told the answer.
+    membership.created_by_user_id = principal.user.id
+    _send_invitation(db, settings, membership, principal.user.id)
+    record_audit(
+        db,
+        actor_user_id=principal.user.id,
+        action="project.member_invite_sent",
+        resource_type="project_membership",
+        resource_id=membership.id,
+        project_id=project_id,
+        request_id=getattr(request.state, "request_id", None),
+        details={"user_id": str(user.id), "role": membership.role_code},
+    )
+    await db.commit()
+    sent = await _email_invitation(
+        settings, sender, project=project, membership=membership, user=user, inviter=principal.user
+    )
+    return ok(
+        _member_item(membership, user, prefix, invite_email_sent=sent), "Invitation sent again"
+    )
 
 
 @router.put(
     "/{project_id}/members/{membership_id}",
     response_model=ApiResponse[ProjectMemberItem],
-    summary="Change a member's project role",
+    summary="Change the project role of a member or of a pending invitation",
     responses=PROJECT_ERRORS,
 )
 async def update_project_member_role(
@@ -601,6 +751,7 @@ async def update_project_member_role(
     request: Request,
     principal: Principal = Depends(require_active_csrf),
     db: AsyncSession = Depends(get_db),
+    prefix: str = Depends(api_prefix),
 ) -> ApiResponse[ProjectMemberItem]:
     await lock_project_scope(db, project_id)
     await require_project_access(db, principal, project_id, manage=True)
@@ -608,9 +759,10 @@ async def update_project_member_role(
     project, _ = await require_project_access(db, principal, project_id, manage=True, lock=True)
     ensure_writable_project(project)
     if membership.role_code == body.role:
-        return ok(_member_item(membership, user))
+        return ok(_member_item(membership, user, prefix))
     if (
-        membership.role_code == ProjectRole.MANAGER
+        membership.status == "active"
+        and membership.role_code == ProjectRole.MANAGER
         and user.status == UserStatus.ACTIVE
         and await active_manager_count(db, project_id) <= 1
     ):
@@ -630,13 +782,22 @@ async def update_project_member_role(
         request_id=getattr(request.state, "request_id", None),
         details={"user_id": str(membership.user_id), "before": before, "after": body.role},
     )
-    return ok(_member_item(membership, user), "Project member role updated")
+    if membership.user_id != principal.user.id:
+        # Reaches active members only: someone still invited sees the role in the invitation.
+        await notify_project_members(
+            db,
+            project_id,
+            "member_role_changed",
+            actor_user_id=principal.user.id,
+            only_user_id=membership.user_id,
+        )
+    return ok(_member_item(membership, user, prefix), "Project member role updated")
 
 
 @router.delete(
     "/{project_id}/members/{membership_id}",
     response_model=ApiResponse[None],
-    summary="Remove a member from the project",
+    summary="Remove a member from the project, or cancel a pending invitation",
     responses=PROJECT_ERRORS,
 )
 async def remove_project_member(
@@ -651,24 +812,41 @@ async def remove_project_member(
     membership, user = await _locked_member(db, project_id, membership_id)
     project, _ = await require_project_access(db, principal, project_id, manage=True, lock=True)
     ensure_writable_project(project)
+    was_invitation = membership.status == "invited"
     if (
-        membership.role_code == ProjectRole.MANAGER
+        not was_invitation
+        and membership.role_code == ProjectRole.MANAGER
         and user.status == UserStatus.ACTIVE
         and await active_manager_count(db, project_id) <= 1
     ):
         raise APIError(409, "LAST_PROJECT_MANAGER", "The last Project Manager cannot be removed")
     membership.status = "revoked"
     membership.revoked_at = datetime.now(UTC)
-    notifications_changed(db, membership.user_id)
+    if was_invitation:
+        await drop_invitation_notices(db, membership.user_id, project_id)
+    else:
+        notifications_changed(db, membership.user_id)
     record_audit(
         db,
         actor_user_id=principal.user.id,
-        action="project.member_revoked",
+        action="project.member_invite_cancelled" if was_invitation else "project.member_revoked",
         resource_type="project_membership",
         resource_id=membership.id,
         project_id=project_id,
         request_id=getattr(request.state, "request_id", None),
         details={"user_id": str(membership.user_id)},
     )
+    if (
+        not was_invitation
+        and membership.user_id != principal.user.id
+        and user.status == UserStatus.ACTIVE
+    ):
+        notify_user(
+            db,
+            membership.user_id,
+            "removed_from_project",
+            project_id=project_id,
+            actor_user_id=principal.user.id,
+        )
     await db.flush()
-    return ok(None, "Project member removed")
+    return ok(None, "Invitation cancelled" if was_invitation else "Project member removed")

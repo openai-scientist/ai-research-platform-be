@@ -16,7 +16,7 @@ from platform_be.services.notification_stream import notifications_changed
 from platform_be.services.popper_client import PopperUnavailable
 from tests.conftest import ORIGIN, Harness, login, mutation_headers
 from tests.test_comments_and_notifications_api import NOTIFICATIONS, team
-from tests.test_projects_api import PROJECTS, add_member, create_project
+from tests.test_projects_api import PROJECTS, add_member, create_project, invite_member
 from tests.test_runs_api import REVIEW, ready_project, report, start_run
 
 STREAM = f"{NOTIFICATIONS}/stream"
@@ -108,12 +108,12 @@ async def test_stream_delivers_new_notifications_and_read_changes(harness: Harne
             assert headers[b"x-accel-buffering"] == b"no"
             assert await stream.snapshot() == {"items": [], "unread_count": 0}
 
-            membership = await add_member(
+            membership = await invite_member(
                 manager_client, manager, project["id"], "member@example.com", "researcher"
             )
             created = await stream.snapshot()
             assert created["unread_count"] == 1
-            assert [item["kind"] for item in created["items"]] == ["added_to_project"]
+            assert [item["kind"] for item in created["items"]] == ["project_invited"]
             assert created["items"][0]["project_name"] == project["name"]
             notification_id = created["items"][0]["id"]
 
@@ -148,7 +148,9 @@ async def test_read_all_reaches_every_tab_and_reconnect_restores_state(harness: 
         manager = await login(harness, manager_client, uid="manager", email="manager@example.com")
         member = await login(harness, member_client, uid="member", email="member@example.com")
         project = await create_project(manager_client, manager)
-        await add_member(manager_client, manager, project["id"], "member@example.com", "researcher")
+        await invite_member(
+            manager_client, manager, project["id"], "member@example.com", "researcher"
+        )
 
         async with (
             open_stream(harness, member_client) as (_, first),
@@ -188,7 +190,7 @@ async def test_failed_callback_never_pushes_a_rolled_back_notification(harness: 
             "data"
         ]
         async with open_stream(harness, researcher_client) as (_, stream):
-            assert (await stream.snapshot())["unread_count"] == 1
+            assert (await stream.snapshot())["unread_count"] == 0
 
             async def broken_put(_key, _chunks):
                 raise OSError("disk full")
@@ -210,11 +212,8 @@ async def test_failed_callback_never_pushes_a_rolled_back_notification(harness: 
             )
             assert retried.status_code == 200
             snapshot = await stream.snapshot()
-            assert snapshot["unread_count"] == 2
-            assert [item["kind"] for item in snapshot["items"]] == [
-                "run_awaiting_review",
-                "added_to_project",
-            ]
+            assert snapshot["unread_count"] == 1
+            assert [item["kind"] for item in snapshot["items"]] == ["run_awaiting_review"]
 
 
 @pytest.mark.asyncio
@@ -337,11 +336,8 @@ async def test_stream_delivers_the_failure_committed_before_a_run_start_error(
             failed = await start_run(manager_client, manager, project["id"], version["id"])
             assert failed.status_code == 502
             snapshot = await stream.snapshot()
-            assert [item["kind"] for item in snapshot["items"]] == [
-                "run_finished",
-                "added_to_project",
-            ]
-            assert snapshot["unread_count"] == 2
+            assert [item["kind"] for item in snapshot["items"]] == ["run_finished"]
+            assert snapshot["unread_count"] == 1
             with pytest.raises(TimeoutError):
                 await asyncio.wait_for(stream.frame(), timeout=0.05)
 
