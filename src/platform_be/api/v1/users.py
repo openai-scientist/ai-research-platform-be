@@ -3,7 +3,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -20,6 +20,7 @@ from platform_be.core.config import Settings
 from platform_be.core.errors import APIError
 from platform_be.core.responses import ApiResponse, ErrorResponse, ok, paginated
 from platform_be.core.roles import PlatformRole
+from platform_be.core.search import SearchTerm, contains_text
 from platform_be.core.security import hash_password
 from platform_be.db.session import get_db
 from platform_be.models.identity import AuthSession, User, UserPlatformRole, UserStatus
@@ -78,6 +79,8 @@ async def _active_platform_admin_count(db: AsyncSession) -> int:
 @router.get("", response_model=ApiResponse[list[UserAdminItem]])
 async def list_users(
     email: str | None = Query(default=None, min_length=3, max_length=320),
+    q: SearchTerm = None,
+    status: UserStatus | None = None,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     _: Principal = Depends(require_platform_admin),
@@ -86,6 +89,10 @@ async def list_users(
     filters = []
     if email:
         filters.append(User.email_normalized == email.strip().casefold())
+    if q:
+        filters.append(or_(contains_text(User.email, q), contains_text(User.display_name, q)))
+    if status is not None:
+        filters.append(User.status == status)
     total = int(await db.scalar(select(func.count()).select_from(User).where(*filters)) or 0)
     rows = (
         await db.execute(

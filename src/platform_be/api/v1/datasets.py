@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from platform_be.auth.sessions import Principal, require_active_csrf, require_active_principal
 from platform_be.core.errors import APIError
 from platform_be.core.responses import ApiResponse, ErrorResponse, ok, paginated
+from platform_be.core.search import SearchTerm, contains_text
 from platform_be.db.session import get_db
 from platform_be.models.dataset import Dataset, DatasetVersion
 from platform_be.services.access import (
@@ -183,22 +184,21 @@ def _storage_key(project_id: UUID, dataset_id: UUID, version_id: UUID) -> str:
 )
 async def list_datasets(
     project_id: UUID,
+    q: SearchTerm = None,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     principal: Principal = Depends(require_active_principal),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[list[DatasetItem]]:
     await require_project_access(db, principal, project_id)
-    total = int(
-        await db.scalar(
-            select(func.count()).select_from(Dataset).where(Dataset.project_id == project_id)
-        )
-        or 0
-    )
+    filters = [Dataset.project_id == project_id]
+    if q:
+        filters.append(contains_text(Dataset.name, q))
+    total = int(await db.scalar(select(func.count()).select_from(Dataset).where(*filters)) or 0)
     datasets = (
         await db.scalars(
             select(Dataset)
-            .where(Dataset.project_id == project_id)
+            .where(*filters)
             .order_by(Dataset.created_at.desc(), Dataset.id)
             .limit(limit)
             .offset(offset)

@@ -106,6 +106,7 @@ def _with_names(*filters):
 )
 async def list_notifications(
     unread_only: bool = False,
+    kind: NotificationKind | None = None,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     principal: Principal = Depends(require_active_principal),
@@ -114,6 +115,8 @@ async def list_notifications(
     filters = _mine(principal.user.id)
     if unread_only:
         filters.append(Notification.read_at.is_(None))
+    if kind is not None:
+        filters.append(Notification.kind == kind)
     total = int(
         await db.scalar(select(func.count()).select_from(Notification).where(*filters)) or 0
     )

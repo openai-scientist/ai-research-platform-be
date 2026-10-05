@@ -173,24 +173,21 @@ def _unknown_columns(context: ResearchContext, version: DatasetVersion) -> list[
 )
 async def list_runs(
     project_id: UUID,
+    status: RunStatus | None = None,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     principal: Principal = Depends(require_active_principal),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[list[RunItem]]:
     await require_project_access(db, principal, project_id)
-    total = int(
-        await db.scalar(
-            select(func.count())
-            .select_from(ResearchRun)
-            .where(ResearchRun.project_id == project_id)
-        )
-        or 0
-    )
+    filters = [ResearchRun.project_id == project_id]
+    if status is not None:
+        filters.append(ResearchRun.status == status)
+    total = int(await db.scalar(select(func.count()).select_from(ResearchRun).where(*filters)) or 0)
     rows = (
         await db.execute(
             _run_query()
-            .where(ResearchRun.project_id == project_id)
+            .where(*filters)
             .order_by(ResearchRun.created_at.desc(), ResearchRun.id)
             .limit(limit)
             .offset(offset)

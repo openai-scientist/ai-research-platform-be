@@ -4,7 +4,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_be.auth.sessions import (
@@ -16,6 +16,7 @@ from platform_be.auth.sessions import (
 from platform_be.core.errors import APIError
 from platform_be.core.responses import ApiResponse, ErrorResponse, ok, paginated
 from platform_be.core.roles import ProjectRole
+from platform_be.core.search import SearchTerm, contains_text
 from platform_be.db.session import get_db
 from platform_be.models.identity import User, UserStatus
 from platform_be.models.project import Project, ProjectMembership
@@ -196,6 +197,8 @@ async def _locked_member(db: AsyncSession, project_id: UUID, membership_id: UUID
 )
 async def list_projects(
     include_archived: bool = False,
+    q: SearchTerm = None,
+    status: ProjectStatus | None = None,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     principal: Principal = Depends(require_active_principal),
@@ -213,6 +216,14 @@ async def list_projects(
         query = query.join(ProjectMembership, own_membership)
     if not include_archived:
         query = query.where(Project.archived_at.is_(None))
+    if status == "archived":
+        query = query.where(Project.archived_at.is_not(None))
+    elif status is not None:
+        query = query.where(Project.archived_at.is_(None), Project.status == status)
+    if q:
+        query = query.where(
+            or_(contains_text(Project.name, q), contains_text(Project.description, q))
+        )
     total = int(await db.scalar(select(func.count()).select_from(query.subquery())) or 0)
     rows = (
         await db.execute(
@@ -467,15 +478,27 @@ async def reopen_project(
 )
 async def list_project_members(
     project_id: UUID,
+    q: SearchTerm = None,
+    role: ProjectRole | None = None,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     principal: Principal = Depends(require_active_principal),
     db: AsyncSession = Depends(get_db),
 ) -> ApiResponse[list[ProjectMemberItem]]:
     await require_project_access(db, principal, project_id)
-    filters = (ProjectMembership.project_id == project_id, ProjectMembership.status == "active")
+    filters = [ProjectMembership.project_id == project_id, ProjectMembership.status == "active"]
+    if role is not None:
+        filters.append(ProjectMembership.role_code == role)
+    if q:
+        filters.append(or_(contains_text(User.email, q), contains_text(User.display_name, q)))
     total = int(
-        await db.scalar(select(func.count()).select_from(ProjectMembership).where(*filters)) or 0
+        await db.scalar(
+            select(func.count())
+            .select_from(ProjectMembership)
+            .join(User, User.id == ProjectMembership.user_id)
+            .where(*filters)
+        )
+        or 0
     )
     rows = (
         await db.execute(

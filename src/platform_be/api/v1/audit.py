@@ -34,6 +34,8 @@ class AuditItem(BaseModel):
 async def list_audit_events(
     project_id: UUID | None = None,
     action: str | None = Query(default=None, min_length=1, max_length=120),
+    resource_type: str | None = Query(default=None, min_length=1, max_length=80),
+    actor_user_id: UUID | None = None,
     from_time: datetime | None = Query(
         default=None,
         alias="from",
@@ -75,6 +77,10 @@ async def list_audit_events(
         query = query.where(AuditEvent.project_id == project_id)
     if action is not None:
         query = query.where(AuditEvent.action == action.strip())
+    if resource_type is not None:
+        query = query.where(AuditEvent.resource_type == resource_type)
+    if actor_user_id is not None:
+        query = query.where(AuditEvent.actor_user_id == actor_user_id)
     if from_time is not None:
         query = query.where(AuditEvent.created_at >= from_time)
     if to_time is not None:
