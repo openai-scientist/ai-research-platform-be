@@ -107,9 +107,9 @@ async def test_only_real_images_within_the_limit_are_stored(harness: Harness, tm
         assert stored_avatars(tmp_path) == []
 
         # Above the general 1 MiB body limit, below the avatar limit.
-        fits = await upload(client, session, PNG + b"\x00" * (1536 * 1024))
+        fits = await upload(client, session, PNG + b"\x00" * (3 * 1024 * 1024))
         assert fits.status_code == 200, fits.text
-        too_big = await upload(client, session, PNG + b"\x00" * (3 * 1024 * 1024))
+        too_big = await upload(client, session, PNG + b"\x00" * (5 * 1024 * 1024))
         assert too_big.status_code == 413
         assert too_big.json()["error"]["code"] == "REQUEST_BODY_TOO_LARGE"
         assert len(stored_avatars(tmp_path)) == 1

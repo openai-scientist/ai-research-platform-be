@@ -366,7 +366,7 @@ What the Platform does not do: a code at every sign-in (two-factor), changing th
 
 ### Profile pictures
 
-A picture is a PNG, JPEG or WebP image of at most 2 MiB (`AVATAR_MAX_UPLOAD_BYTES`). The type is read from the first bytes of the file; its name and declared content type are ignored, so SVG, GIF and renamed files are refused.
+A picture is a PNG, JPEG or WebP image of at most 4 MiB (`AVATAR_MAX_UPLOAD_BYTES`). The type is read from the first bytes of the file; its name and declared content type are ignored, so SVG, GIF and renamed files are refused.
 
 - A user sets or removes their own picture at `/api/v1/auth/me/avatar`; a Platform Admin does it for anyone at `/api/v1/users/{id}/avatar`.
 - `avatar_url` is returned wherever a user's name is: `me` and sign-in, the user list, project members (`avatar_url`), comments (`author_avatar_url`) and notifications (`actor_avatar_url`). It is `null` without a picture.
@@ -523,7 +523,7 @@ Settings come from environment variables; `.env.example` lists them all with saf
 | `PROJECT_FILE_MAX_UPLOAD_BYTES` | Largest project file (default 50 MiB). |
 | `DATASET_MAX_UPLOAD_BYTES` | Largest dataset file (default 50 MiB). |
 | `ARTIFACT_MAX_UPLOAD_BYTES` | Largest result file Popper may deliver (default 50 MiB). |
-| `AVATAR_MAX_UPLOAD_BYTES` | Largest profile picture (default 2 MiB, at most 5 MiB). |
+| `AVATAR_MAX_UPLOAD_BYTES` | Largest profile picture (default 4 MiB, at most 5 MiB). |
 | `RESEND_API_KEY` | Resend key used to send email. Empty in `local`: each message is written to the API log instead. Required in `staging` and `production`. |
 | `EMAIL_FROM` | Sender shown on emails; must be an address on the domain verified in Resend. |
 | `AUTH_CODE_RATE_LIMIT` | Requests per window and client address to the four code endpoints (default 20). |

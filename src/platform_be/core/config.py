@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     dataset_max_upload_bytes: int = Field(default=52_428_800, ge=1024, le=1_073_741_824)
     artifact_max_upload_bytes: int = Field(default=52_428_800, ge=1024, le=1_073_741_824)
     project_file_max_upload_bytes: int = Field(default=52_428_800, ge=1024, le=1_073_741_824)
-    avatar_max_upload_bytes: int = Field(default=2_097_152, ge=65_536, le=5_242_880)
+    avatar_max_upload_bytes: int = Field(default=4_194_304, ge=65_536, le=5_242_880)
     # Popper is a separate service. Runs cannot start until its base URL is configured.
     popper_base_url: str | None = None
     popper_service_key: SecretStr | None = None
