@@ -305,9 +305,12 @@ All paths start with `/api/v1`. Full schemas and error cases are in Swagger UI a
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/users` | List users (Platform Admin) |
+| `POST` | `/users` | Create a user with an initial password (Platform Admin) |
 | `PATCH` | `/users/{id}/status` | Activate or suspend a user (Platform Admin) |
 | `PUT` | `/users/{id}/platform-role` | Grant or remove Platform Admin |
-| `GET` | `/audit` | Audit events: global for a Platform Admin, one project (`project_id`) for its Project Manager |
+| `GET` | `/audit` | Audit events: global for a Platform Admin, one project (`project_id`) for its Project Manager; filter by `action`, `resource_type`, `actor_user_id`, `from`/`to` |
+
+**Search.** The `q` parameter matches a substring, case-insensitively, and needs at least 3 characters. It is backed by `pg_trgm` GIN indexes on `users.email`, `users.display_name`, `projects.name`, `projects.description` and `datasets.name` (migration `20261005_0011`). Full-text search (`tsvector`) is the next step only when searching document content is needed.
 | `GET` | `/admin/usage/projects` | Runs and cost per project (Platform Admin; `from`, `to`) |
 
 **Projects and members**
