@@ -29,3 +29,6 @@ def configure_logging(level: str = "INFO") -> None:
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(level.upper())
+    # The storage SDK logs every request at debug level, signed headers included.
+    for name in ("boto3", "botocore", "s3transfer", "urllib3"):
+        logging.getLogger(name).setLevel(logging.INFO)
