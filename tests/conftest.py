@@ -38,6 +38,9 @@ class Harness:
 @pytest_asyncio.fixture
 async def harness(tmp_path) -> AsyncIterator[Harness]:
     settings = Settings(
+        # Never read the developer's settings file: it may point at real services.
+        _env_file=None,
+        storage_backend="local",
         app_env="test",
         storage_local_root=str(tmp_path / "storage"),
         popper_callback_key=CALLBACK_KEY,
