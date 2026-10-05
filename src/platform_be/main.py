@@ -20,6 +20,8 @@ from platform_be.core.logging import configure_logging
 from platform_be.core.middleware import RequestProtectionMiddleware
 from platform_be.core.responses import error_response, request_id_context
 from platform_be.db.session import get_db
+from platform_be.services.default_admin import ensure_default_admin
+from platform_be.services.email_sender import build_email_sender
 from platform_be.services.file_store import build_file_store
 from platform_be.services.notification_stream import NotificationHub
 from platform_be.services.popper_client import build_popper_client
@@ -47,6 +49,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        await ensure_default_admin(app_session_factory, settings)
         try:
             yield
         finally:
@@ -72,6 +75,7 @@ def create_app(
     app.state.get_db = get_db
     app.state.file_store = build_file_store(settings)
     app.state.popper_client = build_popper_client(settings)
+    app.state.email_sender = build_email_sender(settings)
     app.state.notification_hub = notification_hub
     app.add_middleware(RequestProtectionMiddleware, settings=settings)
 
@@ -126,7 +130,13 @@ def create_app(
 
     @app.exception_handler(APIError)
     async def api_error_handler(request: Request, exc: APIError) -> JSONResponse:
-        response = error_response(exc.status_code, exc.code, exc.message, request_id_of(request))
+        response = error_response(
+            exc.status_code,
+            exc.code,
+            exc.message,
+            request_id_of(request),
+            headers={"Retry-After": str(exc.retry_after)} if exc.retry_after else None,
+        )
         if exc.clear_session_cookie:
             clear_session_cookie(response, settings)
         return response

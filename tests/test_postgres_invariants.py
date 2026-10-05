@@ -1,23 +1,40 @@
 import asyncio
 import os
 from collections.abc import AsyncIterator
+from datetime import timedelta
 from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from platform_be.cli.bootstrap_admin import bootstrap_admin
 from platform_be.core.config import Settings
 from platform_be.db.base import Base
 from platform_be.main import create_app
-from platform_be.models.identity import User, UserStatus
+from platform_be.models.collaboration import Notification
+from platform_be.models.identity import AuthSession, EmailOtp, User, UserStatus
 from platform_be.models.project import ProjectMembership
 from platform_be.services.notifications import notify_user
-from tests.conftest import CALLBACK_KEY, Harness, login, mutation_headers
+from tests.conftest import (
+    CALLBACK_KEY,
+    PASSWORD,
+    Harness,
+    emailed_code,
+    login,
+    mutation_headers,
+    verify,
+)
+from tests.test_email_verification import post, register
 from tests.test_notification_stream import open_stream
-from tests.test_projects_api import PROJECTS, add_member, create_project
+from tests.test_projects_api import (
+    INVITATIONS,
+    PROJECTS,
+    add_member,
+    create_project,
+    invite_member,
+)
 
 
 @pytest_asyncio.fixture
@@ -51,6 +68,8 @@ async def postgres_harness(tmp_path) -> AsyncIterator[Harness]:
             cors_allowed_origins="http://localhost:3000",
             session_signing_secret="postgres-test-session-signing-secret",
             password_scrypt_log2_n=4,
+            auth_session_rate_limit=1000,
+            auth_code_rate_limit=1000,
         )
         factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
         app = create_app(settings, engine=engine, session_factory=factory)
@@ -188,7 +207,7 @@ async def test_concurrent_adds_of_one_user_create_one_membership(
             await db.scalars(
                 select(ProjectMembership).where(
                     ProjectMembership.user_id == UUID(colleague["user"]["id"]),
-                    ProjectMembership.status == "active",
+                    ProjectMembership.status == "invited",
                 )
             )
         ).all()
@@ -314,7 +333,7 @@ async def test_postgres_notification_stream_delivers_across_workers_after_commit
             project = await create_project(manager_client, manager)
             async with open_stream(reader, member_client) as (_, stream):
                 assert await stream.snapshot() == {"items": [], "unread_count": 0}
-                await add_member(
+                await invite_member(
                     manager_client, manager, project["id"], "member@example.com", "researcher"
                 )
                 assert (await stream.snapshot())["unread_count"] == 1
@@ -326,7 +345,7 @@ async def test_postgres_notification_stream_delivers_across_workers_after_commit
                         notify_user(
                             db,
                             UUID(member["user"]["id"]),
-                            "added_to_project",
+                            "project_invited",
                             project_id=UUID(project["id"]),
                         )
 
@@ -354,7 +373,7 @@ async def test_postgres_listener_disconnect_closes_stream_and_reconnect_restores
         manager = await login(harness, manager_client, uid="manager", email="manager@example.com")
         await login(harness, member_client, uid="member", email="member@example.com")
         project = await create_project(manager_client, manager)
-        membership = await add_member(
+        membership = await invite_member(
             manager_client, manager, project["id"], "member@example.com", "researcher"
         )
         hub = harness.app.state.notification_hub
@@ -371,3 +390,193 @@ async def test_postgres_listener_disconnect_closes_stream_and_reconnect_restores
             )
             assert removed.status_code == 200
             assert await stream.snapshot() == {"items": [], "unread_count": 0}
+
+
+@pytest.mark.asyncio
+async def test_an_invitation_is_answered_once_under_concurrency(
+    postgres_harness: Harness,
+) -> None:
+    harness = postgres_harness
+    async with (
+        harness.client() as manager_client,
+        harness.client() as invitee_client,
+        harness.client() as second_tab,
+    ):
+        manager = await login(harness, manager_client, uid="manager", email="manager@example.com")
+        invitee = await login(harness, invitee_client, uid="invitee", email="invitee@example.com")
+        other_tab = await login(harness, second_tab, uid="invitee", email="invitee@example.com")
+        project = await create_project(manager_client, manager)
+
+        def accept(client, session, membership_id):
+            return client.post(
+                f"{INVITATIONS}/{membership_id}/accept",
+                headers=mutation_headers(session["csrf_token"]),
+            )
+
+        # Two tabs accept at once: one answer counts.
+        first = await invite_member(
+            manager_client, manager, project["id"], "invitee@example.com", "researcher"
+        )
+        responses = await asyncio.gather(
+            accept(invitee_client, invitee, first["id"]), accept(second_tab, other_tab, first["id"])
+        )
+        assert sorted(response.status_code for response in responses) == [200, 404]
+        removed = await manager_client.delete(
+            f"{PROJECTS}/{project['id']}/members/{first['id']}",
+            headers=mutation_headers(manager["csrf_token"]),
+        )
+        assert removed.status_code == 200, removed.text
+
+        # Accepting races the manager cancelling: exactly one of them wins.
+        second = await invite_member(
+            manager_client, manager, project["id"], "invitee@example.com", "researcher"
+        )
+        accepted, cancelled = await asyncio.gather(
+            accept(invitee_client, invitee, second["id"]),
+            manager_client.delete(
+                f"{PROJECTS}/{project['id']}/members/{second['id']}",
+                headers=mutation_headers(manager["csrf_token"]),
+            ),
+        )
+        assert cancelled.status_code == 200, cancelled.text
+        assert accepted.status_code in (200, 404)
+        visible = await invitee_client.get(f"{PROJECTS}/{project['id']}")
+        assert visible.status_code == 404
+
+    async with harness.factory() as db:
+        rows = (
+            await db.scalars(
+                select(ProjectMembership.status).where(
+                    ProjectMembership.user_id == UUID(invitee["user"]["id"])
+                )
+            )
+        ).all()
+        notices = await db.scalar(
+            select(func.count())
+            .select_from(Notification)
+            .where(Notification.actor_user_id == UUID(invitee["user"]["id"]))
+        )
+    assert sorted(rows) == ["revoked", "revoked"]
+    # One accepted notice from the first invitation, at most one more from the race.
+    assert notices in (1, 2)
+
+
+async def _let_another_code_go(harness: Harness) -> None:
+    """Move the last send back in time, as if the resend wait had passed."""
+    async with harness.factory() as db:
+        await db.execute(update(EmailOtp).values(sent_at=EmailOtp.sent_at - timedelta(minutes=5)))
+        await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_code_checks_and_sends_respect_the_limits(
+    postgres_harness: Harness,
+) -> None:
+    harness = postgres_harness
+    email = "new@example.com"
+    async with harness.client() as first, harness.client() as second:
+        await register(first, email)
+        code = emailed_code(harness, email)
+        wrong = f"{(int(code) + 1) % 10**6:06d}"
+
+        # Two wrong codes at once are two checks, not one.
+        responses = await asyncio.gather(
+            *(
+                post(client, "verify-email", email=email, code=wrong, password=PASSWORD)
+                for client in (first, second)
+            )
+        )
+        assert [response.status_code for response in responses] == [400, 400]
+        async with harness.factory() as db:
+            row = await db.scalar(select(EmailOtp))
+        assert (row.attempts, row.failed_attempts) == (2, 2)
+
+        # Two requests for a new code at once send one.
+        await _let_another_code_go(harness)
+        await asyncio.gather(
+            *(post(client, "resend-verification", email=email) for client in (first, second))
+        )
+        assert len(harness.emails.sent) == 1
+        async with harness.factory() as db:
+            assert (await db.scalar(select(EmailOtp))).send_count == 2
+
+
+@pytest.mark.asyncio
+async def test_registering_again_racing_a_verification_never_swaps_the_password(
+    postgres_harness: Harness,
+) -> None:
+    harness = postgres_harness
+    async with harness.client() as owner, harness.client() as stranger:
+        for attempt in range(6):
+            email = f"race-{attempt}@example.com"
+            await register(owner, email, "the owner's password")
+            code = emailed_code(harness, email)
+            await _let_another_code_go(harness)
+            verified, _ = await asyncio.gather(
+                post(
+                    owner, "verify-email", email=email, code=code, password="the owner's password"
+                ),
+                post(stranger, "register", email=email, password="the stranger's password"),
+            )
+            async with harness.factory() as db:
+                user = await db.scalar(select(User).where(User.email_normalized == email))
+            # Whoever verified is the one whose password the account has.
+            assert (user.email_verified_at is not None) == (verified.status_code == 200)
+            as_owner = await post(owner, "login", email=email, password="the owner's password")
+            as_stranger = await post(
+                stranger, "login", email=email, password="the stranger's password"
+            )
+            if verified.status_code == 200:
+                assert (as_owner.status_code, as_stranger.status_code) == (200, 401)
+            else:
+                assert (as_owner.status_code, as_stranger.status_code) == (401, 403)
+            harness.emails.sent.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_reset_outlasts_a_sign_in_or_a_change_racing_it(
+    postgres_harness: Harness,
+) -> None:
+    harness = postgres_harness
+    old, new = "the leaked password", "the owner's new password"
+
+    async def forgot(client, email: str) -> str:
+        await post(client, "forgot-password", email=email)
+        return emailed_code(harness, email)
+
+    def reset(client, email: str, code: str):
+        return post(client, "reset-password", email=email, code=code, new_password=new)
+
+    async with harness.client() as owner, harness.client() as other, harness.client() as thief:
+        for attempt in range(6):
+            email = f"reset-race-{attempt}@example.com"
+            await register(owner, email, old)
+            session = await verify(harness, owner, email, old)
+            assert (await post(other, "login", email=email, password=old)).status_code == 200
+
+            if attempt % 2:
+                racer = owner.post(
+                    "/api/v1/auth/change-password",
+                    json={"current_password": old, "new_password": "the thief's choice"},
+                    headers=mutation_headers(session["csrf_token"]),
+                )
+            else:
+                racer = post(thief, "login", email=email, password=old)
+            code = await forgot(owner, email)
+            done, raced = await asyncio.gather(reset(owner, email, code), racer)
+
+            assert done.status_code == 200, done.text
+            assert raced.status_code in (200, 401), raced.text
+            async with harness.factory() as db:
+                user = await db.scalar(select(User).where(User.email_normalized == email))
+                live = await db.scalar(
+                    select(func.count())
+                    .select_from(AuthSession)
+                    .where(AuthSession.user_id == user.id, AuthSession.revoked_at.is_(None))
+                )
+            # Nothing made with the old password is left, and the reset's password stands.
+            assert live == 0
+            assert (await post(thief, "login", email=email, password=new)).status_code == 200
+            harness.emails.sent.clear()
+            for client in (owner, other, thief):
+                client.cookies.clear()
