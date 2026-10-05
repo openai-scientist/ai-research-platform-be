@@ -30,6 +30,16 @@ class Settings(BaseSettings):
     password_scrypt_log2_n: int = Field(default=15, ge=4, le=17)
     auth_session_rate_limit: int = Field(default=10, ge=1, le=1000)
     auth_session_rate_window_seconds: int = Field(default=60, ge=1, le=3600)
+    # The endpoints that take or send a one-time code share their own limit, same window.
+    auth_code_rate_limit: int = Field(default=20, ge=1, le=1000)
+    # One-time codes emailed for sign-up and password reset.
+    otp_ttl_minutes: int = Field(default=10, ge=1, le=60)
+    otp_max_attempts: int = Field(default=5, ge=1, le=10)
+    otp_resend_cooldown_seconds: int = Field(default=60, ge=0, le=3600)
+    otp_max_sends_per_hour: int = Field(default=5, ge=1, le=20)
+    # Wrong codes, counted across reissued codes, before the purpose is locked.
+    otp_lock_after_failures: int = Field(default=10, ge=5, le=50)
+    otp_lock_minutes: int = Field(default=60, ge=5, le=1440)
     request_max_body_bytes: int = Field(default=1_048_576, ge=1024, le=10_485_760)
     # Uploaded and produced files live in a file store: a local directory or a Cloudflare R2 bucket.
     storage_backend: Literal["local", "r2"] = "local"
@@ -43,6 +53,7 @@ class Settings(BaseSettings):
     dataset_max_upload_bytes: int = Field(default=52_428_800, ge=1024, le=1_073_741_824)
     artifact_max_upload_bytes: int = Field(default=52_428_800, ge=1024, le=1_073_741_824)
     project_file_max_upload_bytes: int = Field(default=52_428_800, ge=1024, le=1_073_741_824)
+    avatar_max_upload_bytes: int = Field(default=2_097_152, ge=65_536, le=5_242_880)
     # Popper is a separate service. Runs cannot start until its base URL is configured.
     popper_base_url: str | None = None
     popper_service_key: SecretStr | None = None
@@ -52,6 +63,20 @@ class Settings(BaseSettings):
     public_base_url: str = "http://localhost:8000"
     run_default_budget_usd: Decimal = Field(default=Decimal("5"), gt=0)
     run_max_budget_usd: Decimal = Field(default=Decimal("20"), gt=0)
+    # Email goes through Resend. Without a key, local and test write each message to the log.
+    resend_api_key: SecretStr | None = None
+    email_from: str = "AI Research Platform <no-reply@beyond8.io.vn>"
+    email_timeout_seconds: float = Field(default=10, ge=1, le=30)
+    # Address of the frontend, put in emails as the sign-in link. No link when empty.
+    app_url: str | None = None
+    # How long an admin waits before sending a user's sign-in details again.
+    invite_resend_cooldown_seconds: int = Field(default=60, ge=0, le=3600)
+    # How long a project invitation can be accepted after it was last sent.
+    project_invite_ttl_hours: int = Field(default=24, ge=1, le=168)
+    # A Platform Admin created at startup when both are set. For development only: the
+    # password is a known value, so production refuses these settings.
+    default_admin_email: str | None = None
+    default_admin_password: SecretStr | None = None
 
     @field_validator("cors_allowed_origins")
     @classmethod
@@ -77,6 +102,10 @@ class Settings(BaseSettings):
         "r2_bucket",
         "r2_access_key_id",
         "r2_secret_access_key",
+        "resend_api_key",
+        "app_url",
+        "default_admin_email",
+        "default_admin_password",
         mode="before",
     )
     @classmethod
@@ -103,6 +132,12 @@ class Settings(BaseSettings):
                 "storage_backend=r2 requires r2_bucket, r2_access_key_id, r2_secret_access_key, "
                 "and r2_account_id (or r2_endpoint_url)"
             )
+        if self.app_env in ("staging", "production") and self.resend_api_key is None:
+            raise ValueError("resend_api_key is required in staging and production")
+        if (self.default_admin_email is None) != (self.default_admin_password is None):
+            raise ValueError("default_admin_email and default_admin_password go together")
+        if self.default_admin_email and self.app_env in ("staging", "production"):
+            raise ValueError("A default admin account is for local development only")
         if self.cookie_samesite == "none" and not self.cookie_secure:
             raise ValueError("SameSite=None cookies require Secure")
         if self.app_env == "production":
@@ -114,6 +149,8 @@ class Settings(BaseSettings):
                 raise ValueError("Production requires password_scrypt_log2_n of at least 15")
             if any(not origin.startswith("https://") for origin in self.allowed_origins):
                 raise ValueError("Production CORS origins must use HTTPS")
+            if self.app_url and not self.app_url.startswith("https://"):
+                raise ValueError("Production app_url must use HTTPS")
             for key in (self.popper_service_key, self.popper_callback_key):
                 if key is not None and len(key.get_secret_value()) < 32:
                     raise ValueError("Production Popper service keys need at least 32 characters")
