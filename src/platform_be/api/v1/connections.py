@@ -75,9 +75,8 @@ ConnectionName = Annotated[
 ]
 
 
-class PostgresConfig(BaseModel, extra="forbid"):
+class _ServerConfig(BaseModel, extra="forbid"):
     host: ConfigText = Field(description="A DNS name or an IP address, without port or scheme.")
-    port: int = Field(default=5432, ge=1, le=65535)
     database: ConfigText
     username: ConfigText
     ssl: Literal["disable", "require", "verify-full"] = Field(
@@ -100,7 +99,15 @@ class PostgresConfig(BaseModel, extra="forbid"):
         return value
 
 
-class PostgresSecret(BaseModel, extra="forbid"):
+class PostgresConfig(_ServerConfig):
+    port: int = Field(default=5432, ge=1, le=65535)
+
+
+class MysqlConfig(_ServerConfig):
+    port: int = Field(default=3306, ge=1, le=65535)
+
+
+class PasswordSecret(BaseModel, extra="forbid"):
     password: Annotated[str, StringConstraints(max_length=1024, pattern=r"^[^\x00]*$")] = ""
 
 
@@ -108,11 +115,21 @@ class CreatePostgresConnection(BaseModel, extra="forbid"):
     name: ConnectionName
     kind: Literal["postgres"]
     config: PostgresConfig
-    secret: PostgresSecret
+    secret: PasswordSecret
 
 
-# Becomes a discriminated union on `kind` once a second connection kind exists.
-CreateConnection = CreatePostgresConnection
+class CreateMysqlConnection(BaseModel, extra="forbid"):
+    """MySQL or MariaDB. The database is the only schema the connection browses."""
+
+    name: ConnectionName
+    kind: Literal["mysql"]
+    config: MysqlConfig
+    secret: PasswordSecret
+
+
+CreateConnection = Annotated[
+    CreatePostgresConnection | CreateMysqlConnection, Field(discriminator="kind")
+]
 
 
 class RenameConnection(BaseModel, extra="forbid"):

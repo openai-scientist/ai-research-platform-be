@@ -419,8 +419,9 @@ async def test_text_pasted_into_the_host_is_refused_and_never_recorded(harness: 
 
         assert response.status_code == 422
         assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+        # The kind is part of the path, as the type of a source is in a preview or an import.
         assert [detail["field"] for detail in response.json()["error"]["details"]] == [
-            "body.config.host"
+            "body.postgres.config.host"
         ]
         assert SECRET not in response.text
         assert harness.connectors.tests_started == 0
@@ -535,3 +536,69 @@ async def test_internal_hosts_are_refused_by_the_real_connector_factory(harness:
         assert listed.json()["data"] == []
     failures = await audit_events(harness, "connection.test_failed")
     assert [event.details["host"] for event in failures] == hosts
+
+
+@pytest.mark.asyncio
+async def test_a_mysql_connection_is_created_with_its_own_defaults(harness: Harness) -> None:
+    async with harness.client() as client:
+        session = await login(harness, client, uid="owner", email="owner@example.com")
+        project = await create_project(client, session)
+        base = f"{PROJECTS}/{project['id']}/connections"
+        headers = mutation_headers(session["csrf_token"])
+        body = {**connection_body(name="Rfam"), "kind": "mysql"}
+
+        response = await client.post(base, json=body, headers=headers)
+        assert response.status_code == 201, response.text
+        created = response.json()["data"]
+        assert created["kind"] == "mysql"
+        assert created["config"] == {
+            "host": "db.example.com",
+            "port": 3306,
+            "database": "analytics",
+            "username": "reader",
+            "ssl": "require",
+        }
+        assert SECRET not in response.text
+        built = harness.connectors.built[-1]
+        assert (built["kind"], built["secret"]) == ("mysql", {"password": SECRET})
+
+        # A public server may have no password at all, but there is always a database.
+        open_to_all = {**body, "name": "Open", "secret": {}}
+        assert (await client.post(base, json=open_to_all, headers=headers)).status_code == 201
+        assert harness.connectors.built[-1]["secret"] == {"password": ""}
+
+        attempts_before = harness.connectors.tests_started
+        without_database = {**body, "name": "B", "config": {"host": "h.example.com"}}
+        bad_bodies = [
+            without_database,
+            {**body, "name": "B", "config": {**body["config"], "database": ""}},
+            {**body, "name": "B", "config": {**body["config"], "ssl": "prefer"}},
+            {**body, "name": "B", "config": {**body["config"], "local_infile": True}},
+            {**body, "name": "B", "config": {**body["config"], "host": "h.example.com:3306"}},
+            {key: value for key, value in body.items() if key != "kind"},
+        ]
+        for bad in bad_bodies:
+            refused = await client.post(base, json=bad, headers=headers)
+            assert refused.status_code == 422, bad
+            assert refused.json()["error"]["code"] == "VALIDATION_ERROR"
+            assert SECRET not in refused.text
+        assert harness.connectors.tests_started == attempts_before
+
+
+@pytest.mark.asyncio
+async def test_the_real_factory_guards_and_builds_a_mysql_connection(harness: Harness) -> None:
+    async def resolver(host: str, port: int) -> list[str]:
+        return {"internal.example.com": ["10.0.0.5"], "db.example.com": ["93.184.216.34"]}[host]
+
+    factory = build_connector_factory(harness.settings, resolver)
+    config = {"host": "internal.example.com", "port": 3306, "database": "d", "username": "u"}
+    with pytest.raises(ConnectorError) as raised:
+        await factory("mysql", config, {"password": ""})
+    assert raised.value.reason == "host_not_allowed"
+
+    connector = await factory("mysql", {**config, "host": "db.example.com"}, {"password": ""})
+    assert type(connector).__name__ == "MysqlConnector"
+    # The app keeps one set of threads for every blocking driver, apart from the default ones.
+    assert harness.app.state.connector_executor._max_workers == (
+        harness.settings.connection_max_concurrent_queries
+    )
