@@ -3,7 +3,9 @@ from uuid import uuid4
 
 import pytest
 
+from platform_be.core.config import Settings
 from platform_be.core.errors import APIError
+from platform_be.main import create_app
 from platform_be.services.connectors import gate as gate_module
 from platform_be.services.connectors.gate import ConnectionGate
 
@@ -113,3 +115,28 @@ def test_reads_and_attempts_are_counted_apart() -> None:
 
     gate.check_query_rate(bob)
     gate.check_rate(bob)
+
+
+@pytest.mark.asyncio
+async def test_the_share_of_one_project_or_user_comes_from_the_settings() -> None:
+    settings = Settings(
+        _env_file=None,
+        app_env="test",
+        database_url="sqlite+aiosqlite:///:memory:",
+        connection_max_concurrent_queries=8,
+        connection_max_concurrent_per_owner=3,
+    )
+    gate = create_app(settings).state.connection_gate
+    project, user = uuid4(), uuid4()
+
+    async with gate.slot(project, uuid4()), gate.slot(project, uuid4()), gate.slot(uuid4(), user):
+        async with gate.slot(project, user):
+            # Three in the project and two by the user: the project is full, the user is not.
+            with pytest.raises(APIError) as refused:
+                async with gate.slot(project, uuid4()):
+                    pass
+            assert refused.value.code == "CONNECTION_BUSY"
+            async with gate.slot(uuid4(), user):
+                with pytest.raises(APIError):
+                    async with gate.slot(uuid4(), user):
+                        pass

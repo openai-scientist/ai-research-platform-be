@@ -1,7 +1,19 @@
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import IO, Any
 from uuid import UUID
 
+from platform_be.services.connectors.base import (
+    Column,
+    ConnectorError,
+    QuerySource,
+    RowStream,
+    TableRef,
+    TableSource,
+)
 from platform_be.services.popper_client import PopperNotFound, PopperRunState
 
 
@@ -82,3 +94,95 @@ class FakePopperClient:
         self.reviews.append(
             {"popper_run_id": popper_run_id, "review_sequence": review_sequence, **decision}
         )
+
+
+class FakeConnector:
+    def __init__(self, factory: "FakeConnectorFactory") -> None:
+        self._factory = factory
+
+    async def _call(self) -> None:
+        self._factory.tests_started += 1
+        if self._factory.hold is not None:
+            await self._factory.hold.wait()
+        if self._factory.fail_with is not None:
+            raise self._factory.fail_with
+
+    async def test(self) -> None:
+        await self._call()
+
+    async def list_schemas(self) -> list[str]:
+        await self._call()
+        return sorted({schema for schema, _ in self._factory.tables})
+
+    async def list_tables(self, schema: str, *, search: str | None, limit: int) -> list[TableRef]:
+        await self._call()
+        found = [
+            TableRef(schema=schema, name=name, type="table", column_count=len(table.columns))
+            for (table_schema, name), table in sorted(self._factory.tables.items())
+            if table_schema == schema and (search or "").lower() in name.lower()
+        ]
+        return found[:limit]
+
+    def _table(self, schema: str, name: str) -> "FakeTable":
+        try:
+            return self._factory.tables[schema, name]
+        except KeyError:
+            raise ConnectorError("source_not_found") from None
+
+    async def list_columns(self, schema: str, table: str) -> list[Column]:
+        await self._call()
+        return self._table(schema, table).columns
+
+    @asynccontextmanager
+    async def open_rows(
+        self, source: TableSource | QuerySource, *, max_rows: int | None
+    ) -> AsyncIterator[RowStream]:
+        await self._call()
+        self._factory.sources.append(source)
+        self._factory.row_limits.append(max_rows)
+        if isinstance(source, QuerySource):
+            table = self._factory.query_result
+        else:
+            table = self._table(source.schema_name, source.name)
+
+        async def rows() -> AsyncIterator[tuple[Any, ...]]:
+            for row in table.rows[:max_rows]:
+                # An error among the rows is a failure part-way through the result.
+                if isinstance(row, ConnectorError):
+                    raise row
+                yield row
+
+        try:
+            yield RowStream(columns=table.columns, rows=rows())
+        finally:
+            self._factory.streams_closed += 1
+
+
+@dataclass
+class FakeTable:
+    columns: list[Column]
+    rows: list[tuple[Any, ...] | ConnectorError] = field(default_factory=list)
+
+
+class FakeConnectorFactory:
+    """Stands in for external databases. It skips the network guard, so any host is accepted."""
+
+    def __init__(self) -> None:
+        self.built: list[dict[str, Any]] = []
+        self.tests_started = 0
+        # Set to make every connection attempt fail with it.
+        self.fail_with: ConnectorError | None = None
+        # Set to an event to keep every attempt waiting until the event is set.
+        self.hold: asyncio.Event | None = None
+        # The external database: tables by (schema, name), and what any query returns.
+        self.tables: dict[tuple[str, str], FakeTable] = {}
+        self.query_result = FakeTable(columns=[Column("n", "integer")], rows=[(1,)])
+        self.sources: list[TableSource | QuerySource] = []
+        self.row_limits: list[int | None] = []
+        self.streams_closed = 0
+
+    async def __call__(
+        self, kind: str, config: dict[str, Any], secret: dict[str, Any]
+    ) -> FakeConnector:
+        self.built.append({"kind": kind, "config": config, "secret": secret})
+        return FakeConnector(self)

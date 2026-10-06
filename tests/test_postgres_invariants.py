@@ -13,12 +13,15 @@ from platform_be.cli.bootstrap_admin import bootstrap_admin
 from platform_be.core.config import Settings
 from platform_be.db.base import Base
 from platform_be.main import create_app
+from platform_be.models.audit import AuditEvent
 from platform_be.models.collaboration import Notification
 from platform_be.models.identity import AuthSession, EmailOtp, User, UserStatus
 from platform_be.models.project import ProjectMembership
+from platform_be.services.connectors.base import Column
 from platform_be.services.notifications import notify_user
 from tests.conftest import (
     CALLBACK_KEY,
+    CONNECTION_KEY,
     PASSWORD,
     Harness,
     emailed_code,
@@ -26,6 +29,8 @@ from tests.conftest import (
     mutation_headers,
     verify,
 )
+from tests.fakes import FakeTable
+from tests.test_connections_api import create_connection, wait_until
 from tests.test_email_verification import post, register
 from tests.test_notification_stream import open_stream
 from tests.test_projects_api import (
@@ -64,6 +69,7 @@ async def postgres_harness(tmp_path) -> AsyncIterator[Harness]:
             app_env="test",
             storage_local_root=str(tmp_path / "storage"),
             popper_callback_key=CALLBACK_KEY,
+            connection_secret_key=CONNECTION_KEY,
             database_url=database_url,
             cors_allowed_origins="http://localhost:3000",
             session_signing_secret="postgres-test-session-signing-secret",
@@ -638,3 +644,96 @@ async def test_candidate_stream_delivers_across_workers_after_commit(postgres_ha
     finally:
         await reader_app.state.notification_hub.close()
         await reader_app.state.invite_candidates_hub.close()
+
+
+async def test_connection_attempts_hold_no_database_connection_and_names_stay_unique(
+    postgres_harness: Harness,
+) -> None:
+    harness = postgres_harness
+    harness.connectors.hold = asyncio.Event()
+    pool = harness.app.state.engine.pool
+    async with harness.client() as client:
+        session = await login(harness, client, uid="conn-owner", email="conn-owner@example.com")
+        project = await create_project(client, session, name="Connections")
+
+        # Two requests for one name both pass the first name check, then meet at the server.
+        racing = [
+            asyncio.create_task(create_connection(client, session, project["id"])) for _ in range(2)
+        ]
+        await wait_until(lambda: harness.connectors.tests_started == 2)
+        borrowed = pool.checkedout()
+        harness.connectors.hold.set()
+        responses = await asyncio.gather(*racing)
+
+        # While the external server was being contacted, nothing was borrowed from the pool.
+        assert borrowed == 0
+        assert sorted(response.status_code for response in responses) == [201, 409]
+        refused = next(response for response in responses if response.status_code == 409)
+        assert refused.json()["error"]["code"] == "CONNECTION_NAME_EXISTS"
+        created = next(response for response in responses if response.status_code == 201)
+        created = created.json()["data"]
+
+        url = f"{PROJECTS}/{project['id']}/connections/{created['id']}"
+        assert (await client.get(url)).json()["data"] == created
+
+        harness.connectors.hold = asyncio.Event()
+        testing = asyncio.create_task(
+            client.post(f"{url}/test", headers=mutation_headers(session["csrf_token"]))
+        )
+        await wait_until(lambda: harness.connectors.tests_started == 3)
+        borrowed = pool.checkedout()
+        harness.connectors.hold.set()
+        tested = await testing
+        assert borrowed == 0
+        assert tested.status_code == 200, tested.text
+        assert tested.json()["data"]["last_tested_at"] is not None
+        assert (await client.get(url)).json()["data"] == tested.json()["data"]
+
+
+async def test_reading_through_a_connection_holds_no_database_connection(
+    postgres_harness: Harness,
+) -> None:
+    harness = postgres_harness
+    harness.connectors.tables = {("public", "orders"): FakeTable([Column("id", "integer")], [(1,)])}
+    pool = harness.app.state.engine.pool
+    async with harness.client() as client:
+        session = await login(harness, client, uid="conn-reader", email="conn-reader@example.com")
+        project = await create_project(client, session, name="Reads")
+        created = await create_connection(client, session, project["id"])
+        url = f"{PROJECTS}/{project['id']}/connections/{created.json()['data']['id']}"
+        source = {"type": "table", "schema": "public", "name": "orders"}
+
+        reads = {
+            "schemas": lambda: client.get(f"{url}/schemas"),
+            "tables": lambda: client.get(f"{url}/tables", params={"schema": "public"}),
+            "columns": lambda: client.get(
+                f"{url}/columns", params={"schema": "public", "table": "orders"}
+            ),
+            "preview": lambda: client.post(
+                f"{url}/preview",
+                json={"source": source},
+                headers=mutation_headers(session["csrf_token"]),
+            ),
+        }
+        borrowed = {}
+        for name, read in reads.items():
+            started = harness.connectors.tests_started
+            harness.connectors.hold = asyncio.Event()
+            pending = asyncio.create_task(read())
+            await wait_until(lambda: harness.connectors.tests_started == started + 1)  # noqa: B023
+            borrowed[name] = pool.checkedout()
+            harness.connectors.hold.set()
+            response = await pending
+            assert response.status_code == 200, (name, response.text)
+
+        # While the external database was being read, nothing was borrowed from the pool.
+        assert borrowed == dict.fromkeys(reads, 0)
+
+    # The preview was recorded before its query ran, not left in an open transaction.
+    async with harness.factory() as db:
+        previews = await db.scalars(
+            select(AuditEvent).where(AuditEvent.action == "connection.previewed")
+        )
+        assert [event.details for event in previews] == [
+            {"source_type": "table", "schema": "public", "name": "orders"}
+        ]

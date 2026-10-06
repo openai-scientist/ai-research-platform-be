@@ -11,7 +11,7 @@ from sqlalchemy.pool import StaticPool
 from platform_be.core.config import Settings
 from platform_be.db.base import Base
 from platform_be.main import create_app
-from tests.fakes import FakeEmailSender, FakePopperClient
+from tests.fakes import FakeConnectorFactory, FakeEmailSender, FakePopperClient
 
 ORIGIN = "http://localhost:3000"
 CALLBACK_KEY = "test-popper-callback-key"
@@ -34,6 +34,8 @@ class Harness:
         app.state.popper_client = self.popper
         self.emails = FakeEmailSender()
         app.state.email_sender = self.emails
+        self.connectors = FakeConnectorFactory()
+        app.state.connector_factory = self.connectors
         self.transport = ASGITransport(app=app, raise_app_exceptions=False)
 
     def client(self) -> AsyncClient:

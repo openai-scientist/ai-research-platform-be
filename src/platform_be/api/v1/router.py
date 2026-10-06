@@ -4,6 +4,7 @@ from platform_be.api.v1.admin_usage import router as admin_usage_router
 from platform_be.api.v1.audit import router as audit_router
 from platform_be.api.v1.auth import router as auth_router
 from platform_be.api.v1.comments import router as comments_router
+from platform_be.api.v1.connections import router as connections_router
 from platform_be.api.v1.datasets import router as datasets_router
 from platform_be.api.v1.frame_reviews import router as frame_reviews_router
 from platform_be.api.v1.health import router as health_router
@@ -28,6 +29,7 @@ router.include_router(users_router)
 router.include_router(audit_router)
 router.include_router(projects_router)
 router.include_router(invitations_router)
+router.include_router(connections_router)
 router.include_router(datasets_router)
 router.include_router(project_files_router)
 router.include_router(research_contexts_router)

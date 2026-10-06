@@ -20,12 +20,15 @@ from platform_be.core.logging import configure_logging
 from platform_be.core.middleware import RequestProtectionMiddleware
 from platform_be.core.responses import error_response, request_id_context
 from platform_be.db.session import get_db
+from platform_be.services.connectors import build_connector_factory
+from platform_be.services.connectors.gate import ConnectionGate
 from platform_be.services.default_admin import ensure_default_admin
 from platform_be.services.email_sender import build_email_sender
 from platform_be.services.file_store import build_file_store
 from platform_be.services.invite_candidates_stream import InviteCandidatesHub
 from platform_be.services.notification_stream import NotificationHub
 from platform_be.services.popper_client import build_popper_client
+from platform_be.services.secret_box import SecretBox
 
 logger = logging.getLogger("platform_be.http")
 
@@ -83,6 +86,20 @@ def create_app(
     app.state.email_sender = build_email_sender(settings)
     app.state.notification_hub = notification_hub
     app.state.invite_candidates_hub = invite_candidates_hub
+    app.state.secret_box = (
+        SecretBox(settings.connection_secret_key.get_secret_value())
+        if settings.connection_secret_key
+        else None
+    )
+    app.state.connector_factory = build_connector_factory(settings)
+    app.state.connection_gate = ConnectionGate(
+        max_concurrent=settings.connection_max_concurrent_queries,
+        max_per_project=settings.connection_max_concurrent_per_owner,
+        max_per_user=settings.connection_max_concurrent_per_owner,
+        rate_limit=settings.connection_probe_rate_limit,
+        query_rate_limit=settings.connection_query_rate_limit,
+        rate_window_seconds=settings.auth_session_rate_window_seconds,
+    )
     app.add_middleware(RequestProtectionMiddleware, settings=settings)
 
     @app.middleware("http")
