@@ -43,6 +43,7 @@ async def test_upload_versions_and_download(harness: Harness) -> None:
         assert first["row_count"] == 2
         assert first["column_names"] == ["student_id", "school", "exam_score"]
         assert first["original_filename"] == "scores.csv"
+        assert (first["source_type"], first["source"]) == ("upload", None)
 
         status = (await client.get(f"{PROJECTS}/{project['id']}")).json()["data"]["status"]
         assert status == "data_ready"
@@ -56,6 +57,7 @@ async def test_upload_versions_and_download(harness: Harness) -> None:
         assert second.status_code == 201, second.text
         assert second.json()["data"]["version_number"] == 2
         assert second.json()["data"]["row_count"] == 3
+        assert second.json()["data"]["source_type"] == "upload"
 
         versions = (await client.get(f"{base}/{dataset['id']}/versions")).json()
         assert [item["version_number"] for item in versions["data"]] == [2, 1]

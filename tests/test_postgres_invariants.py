@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 from collections.abc import AsyncIterator
 from datetime import timedelta
@@ -737,3 +738,192 @@ async def test_reading_through_a_connection_holds_no_database_connection(
         assert [event.details for event in previews] == [
             {"source_type": "table", "schema": "public", "name": "orders"}
         ]
+
+
+async def test_versions_added_together_get_consecutive_numbers(postgres_harness: Harness) -> None:
+    from tests.test_datasets_api import CSV, upload_dataset
+
+    harness = postgres_harness
+    async with harness.client() as client:
+        session = await login(harness, client, uid="data-owner", email="data-owner@example.com")
+        project = await create_project(client, session, name="Versions")
+        created = await upload_dataset(client, session, project["id"])
+        assert created.status_code == 201, created.text
+        url = f"{PROJECTS}/{project['id']}/datasets/{created.json()['data']['id']}/versions"
+
+        responses = await asyncio.gather(
+            *(
+                client.post(
+                    url,
+                    files={"file": (f"scores-{n}.csv", CSV, "text/csv")},
+                    headers=mutation_headers(session["csrf_token"]),
+                )
+                for n in range(4)
+            )
+        )
+        # Each request reads the newest number and adds one; only the project lock keeps two
+        # of them from reading the same number.
+        assert [response.status_code for response in responses] == [201] * 4
+        assert sorted(response.json()["data"]["version_number"] for response in responses) == [
+            2,
+            3,
+            4,
+            5,
+        ]
+        listed = (await client.get(url)).json()
+        assert [item["version_number"] for item in listed["data"]] == [5, 4, 3, 2, 1]
+
+
+async def test_an_import_holds_no_database_connection_and_names_stay_unique(
+    postgres_harness: Harness, tmp_path
+) -> None:
+    from tests.test_dataset_imports_api import import_dataset, import_version, stored_files
+
+    harness = postgres_harness
+    harness.connectors.tables = {("public", "scores"): FakeTable([Column("id", "integer")], [(1,)])}
+    source = {"type": "table", "schema": "public", "name": "scores"}
+    pool = harness.app.state.engine.pool
+    async with harness.client() as client:
+        session = await login(harness, client, uid="importer", email="importer@example.com")
+        project = await create_project(client, session, name="Imports")
+        created = await create_connection(client, session, project["id"])
+        connection_id = created.json()["data"]["id"]
+
+        # Two imports under one name both pass the first name check, then read side by side.
+        started = harness.connectors.tests_started
+        harness.connectors.hold = asyncio.Event()
+        racing = [
+            asyncio.create_task(
+                import_dataset(client, session, project["id"], connection_id, source)
+            )
+            for _ in range(2)
+        ]
+        await wait_until(lambda: harness.connectors.tests_started == started + 2)
+        borrowed = pool.checkedout()
+        harness.connectors.hold.set()
+        responses = await asyncio.gather(*racing)
+        harness.connectors.hold = None
+
+        # While the external database was being read, nothing was borrowed from the pool.
+        assert borrowed == 0
+        assert sorted(response.status_code for response in responses) == [201, 409]
+        refused = next(response for response in responses if response.status_code == 409)
+        assert refused.json()["error"]["code"] == "DATASET_NAME_EXISTS"
+        # The import that lost took its file back out of the store.
+        assert len(stored_files(tmp_path)) == 1
+        dataset = next(r for r in responses if r.status_code == 201).json()["data"]
+
+        added = await asyncio.gather(
+            *(
+                import_version(client, session, project["id"], dataset["id"], connection_id, source)
+                for _ in range(2)
+            )
+        )
+        assert [response.status_code for response in added] == [201, 201]
+        assert sorted(response.json()["data"]["version_number"] for response in added) == [2, 3]
+        assert len(stored_files(tmp_path)) == 3
+
+    # Both imports were recorded as started before either query ran.
+    async with harness.factory() as db:
+        events = await db.scalars(
+            select(AuditEvent).where(AuditEvent.action == "connection.import_started")
+        )
+        assert len(events.all()) == 4
+
+
+async def test_a_real_table_is_imported_and_a_run_starts_from_it(
+    postgres_harness: Harness,
+) -> None:
+    from sqlalchemy.engine import make_url
+
+    from platform_be.services.connectors import build_connector_factory
+    from tests.test_dataset_imports_api import import_dataset, import_version
+    from tests.test_postgres_connector import sample_schema
+    from tests.test_research_context_api import save_context
+    from tests.test_runs_api import start_run
+
+    harness = postgres_harness
+    url = make_url(os.environ["PLATFORM_POSTGRES_TEST_URL"])
+    # The real factory, host check included; the test database is on a private address.
+    harness.settings.connection_allow_private_hosts = True
+    harness.app.state.connector_factory = build_connector_factory(harness.settings)
+    async with harness.client() as client, sample_schema(url) as schema:
+        session = await login(harness, client, uid="real-import", email="real-import@example.com")
+        project = await create_project(client, session, name="Real import")
+        created = await client.post(
+            f"{PROJECTS}/{project['id']}/connections",
+            json={
+                "name": "Test database",
+                "kind": "postgres",
+                "config": {
+                    "host": url.host,
+                    "port": url.port or 5432,
+                    "database": url.database,
+                    "username": url.username,
+                    "ssl": "disable",
+                },
+                "secret": {"password": url.password or ""},
+            },
+            headers=mutation_headers(session["csrf_token"]),
+        )
+        assert created.status_code == 201, created.text
+        connection_id = created.json()["data"]["id"]
+        base = f"{PROJECTS}/{project['id']}/datasets"
+
+        table = {"type": "table", "schema": schema, "name": "orders"}
+        imported = await import_dataset(client, session, project["id"], connection_id, table)
+        assert imported.status_code == 201, imported.text
+        dataset = imported.json()["data"]
+        version = dataset["latest_version"]
+        assert version["row_count"] == 250
+        assert version["column_names"] == ["id", "note", "amount", "tags", "payload", "placed_on"]
+        assert version["source"]["source"] == table
+        download = await client.get(f"{base}/{dataset['id']}/versions/{version['id']}/download")
+        lines = download.content.decode().split("\r\n")
+        assert lines[0] == "id,note,amount,tags,payload,placed_on"
+        assert '1,note 1,1.50,"[""a"",""b""]","{""k"": 1}",2026-01-02' in lines
+        assert hashlib.sha256(download.content).hexdigest() == version["sha256"]
+
+        query = {
+            "type": "query",
+            "sql": f"SELECT id, amount FROM {schema}.orders WHERE id <= 3 ORDER BY id",
+        }
+        second = await import_version(
+            client, session, project["id"], dataset["id"], connection_id, query
+        )
+        assert second.status_code == 201, second.text
+        second = second.json()["data"]
+        again = await client.get(f"{base}/{dataset['id']}/versions/{second['id']}/download")
+        assert again.content == b"id,amount\r\n1,1.50\r\n2,3.00\r\n3,4.50\r\n"
+
+        # A join gives two columns one name: refused, with nothing stored for it.
+        joined = await import_version(
+            client,
+            session,
+            project["id"],
+            dataset["id"],
+            connection_id,
+            {
+                "type": "query",
+                "sql": f"SELECT * FROM {schema}.orders a JOIN {schema}.orders b ON a.id = b.id",
+            },
+        )
+        assert joined.status_code == 422
+        assert joined.json()["error"]["code"] == "INVALID_DATASET"
+        nothing = await import_version(
+            client,
+            session,
+            project["id"],
+            dataset["id"],
+            connection_id,
+            {"type": "query", "sql": f"SELECT id FROM {schema}.orders WHERE id < 0"},
+        )
+        assert nothing.json()["error"]["code"] == "INVALID_DATASET"
+        versions = (await client.get(f"{base}/{dataset['id']}/versions")).json()["data"]
+        assert [item["version_number"] for item in versions] == [2, 1]
+
+        saved = await save_context(client, session, project["id"], front_matter=None)
+        assert saved.status_code == 201, saved.text
+        run = await start_run(client, session, project["id"], second["id"])
+        assert run.status_code == 201, run.text
+        assert harness.popper.started[0]["dataset"] == again.content

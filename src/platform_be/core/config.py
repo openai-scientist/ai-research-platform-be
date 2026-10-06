@@ -85,6 +85,8 @@ class Settings(BaseSettings):
     connection_allow_private_hosts: bool = False
     connection_connect_timeout_seconds: float = Field(default=10, ge=1, le=60)
     connection_query_timeout_seconds: int = Field(default=60, ge=1, le=600)
+    # An import reads a whole table, so it gets longer than one query does.
+    connection_import_timeout_seconds: int = Field(default=300, ge=1, le=3600)
     connection_max_concurrent_queries: int = Field(default=4, ge=1, le=32)
     # How many of those one project, and one user, may hold: a slow server cannot take them all.
     connection_max_concurrent_per_owner: int = Field(default=2, ge=1, le=32)

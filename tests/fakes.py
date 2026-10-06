@@ -150,6 +150,11 @@ class FakeConnector:
                 # An error among the rows is a failure part-way through the result.
                 if isinstance(row, ConnectorError):
                     raise row
+                # An event among the rows is a server that stops sending until it is set.
+                if isinstance(row, asyncio.Event):
+                    await row.wait()
+                    continue
+                self._factory.rows_read += 1
                 yield row
 
         try:
@@ -161,7 +166,7 @@ class FakeConnector:
 @dataclass
 class FakeTable:
     columns: list[Column]
-    rows: list[tuple[Any, ...] | ConnectorError] = field(default_factory=list)
+    rows: list[tuple[Any, ...] | ConnectorError | asyncio.Event] = field(default_factory=list)
 
 
 class FakeConnectorFactory:
@@ -179,6 +184,8 @@ class FakeConnectorFactory:
         self.query_result = FakeTable(columns=[Column("n", "integer")], rows=[(1,)])
         self.sources: list[TableSource | QuerySource] = []
         self.row_limits: list[int | None] = []
+        # Rows handed out so far, over every stream.
+        self.rows_read = 0
         self.streams_closed = 0
 
     async def __call__(
