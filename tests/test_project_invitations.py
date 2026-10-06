@@ -80,6 +80,57 @@ async def raw_invite(client: AsyncClient, session: dict, project_id: str, email:
 
 
 @pytest.mark.asyncio
+async def test_invitation_search_is_scoped_and_filters_before_pagination(harness: Harness) -> None:
+    async with harness.client() as pm, harness.client() as invitee, harness.client() as other:
+        manager = await login(harness, pm, uid="dr-scientist", email="lab-owner@example.com")
+        await login(harness, invitee, uid="invitee", email="invitee@example.com")
+        await login(harness, other, uid="other", email="other@example.com")
+        own = []
+        for name in ("Protein Folding", "Protein Modeling", "Climate Risk"):
+            project = await create_project(pm, manager, name=name)
+            own.append(
+                await invite_member(pm, manager, project["id"], "invitee@example.com", "researcher")
+            )
+            await invite_member(pm, manager, project["id"], "other@example.com", "reviewer")
+        await expire(harness, own[0]["id"])
+        all_items = await invitee.get(INVITATIONS)
+        assert len(all_items.json()["data"]) == 3
+        for q, total in (
+            ("PROTEIN", 2),
+            ("scientist", 3),
+            ("OWNER", 3),
+            ("protein scientist", 2),
+            ("protein nobody", 0),
+            ("%%%", 0),
+        ):
+            response = await invitee.get(INVITATIONS, params={"q": q})
+            assert response.status_code == 200, response.text
+            data = response.json()
+            assert len(data["data"]) == total
+            assert data["meta"]["pagination"]["total"] == total
+            assert {item["id"] for item in data["data"]} <= {item["id"] for item in own}
+        found_ids = []
+        for offset in (0, 1):
+            page = await invitee.get(
+                INVITATIONS, params={"q": "protein", "limit": 1, "offset": offset}
+            )
+            data = page.json()
+            assert data["meta"]["pagination"] == {"total": 2, "limit": 1, "offset": offset}
+            assert len(data["data"]) == 1
+            found_ids.append(data["data"][0]["id"])
+        assert set(found_ids) == {own[0]["id"], own[1]["id"]}
+        assert (await invitee.get(INVITATIONS, params={"q": "protein", "offset": 2})).json()[
+            "data"
+        ] == []
+        assert (await remove(pm, manager, project["id"], own[2]["id"])).status_code == 200
+        climate = await invitee.get(INVITATIONS, params={"q": "climate"})
+        assert climate.json()["data"] == []
+        assert climate.json()["meta"]["pagination"]["total"] == 0
+        for q in ("ab", "x" * 121):
+            assert (await invitee.get(INVITATIONS, params={"q": q})).status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_an_invitation_gives_access_only_once_accepted(harness: Harness) -> None:
     async with harness.client() as manager_client, harness.client() as invitee_client:
         manager = await login(harness, manager_client, uid="manager", email="manager@example.com")

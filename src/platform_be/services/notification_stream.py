@@ -16,9 +16,13 @@ RECIPIENTS_KEY = "notification_stream_recipients"
 
 def notifications_changed(db: AsyncSession, user_id: UUID) -> None:
     """Invalidate this user's snapshot if the current transaction commits."""
-    session = db.sync_session
+    stream_changed(db.sync_session, RECIPIENTS_KEY, user_id)
+
+
+def stream_changed(session: Session, recipients_key: str, recipient_id: UUID) -> None:
+    """Record an invalidation in its owning transaction, including savepoints."""
     transaction = session.get_nested_transaction() or session.get_transaction() or session.begin()
-    session.info.setdefault(RECIPIENTS_KEY, {}).setdefault(transaction, set()).add(user_id)
+    session.info.setdefault(recipients_key, {}).setdefault(transaction, set()).add(recipient_id)
 
 
 class NotificationHub:
@@ -29,8 +33,12 @@ class NotificationHub:
     with local delivery after commit, for tests and local non-PostgreSQL use.
     """
 
-    def __init__(self, engine: AsyncEngine) -> None:
+    def __init__(
+        self, engine: AsyncEngine, *, channel: str = CHANNEL, recipients_key: str = RECIPIENTS_KEY
+    ) -> None:
         self._engine = engine
+        self._channel = channel
+        self._recipients_key = recipients_key
         self._postgres = engine.dialect.name == "postgresql"
         self._subscribers: dict[UUID, set[asyncio.Queue[bool]]] = {}
         self._connection: AsyncConnection | None = None
@@ -49,15 +57,15 @@ class NotificationHub:
             return
         # PostgreSQL delivers these only after commit; rollback cancels them.
         transaction = session.get_transaction()
-        for user_id in session.info.get(RECIPIENTS_KEY, {}).get(transaction, ()):
+        for user_id in session.info.get(self._recipients_key, {}).get(transaction, ()):
             session.execute(
                 text("SELECT pg_notify(:channel, :recipient)"),
-                {"channel": CHANNEL, "recipient": str(user_id)},
+                {"channel": self._channel, "recipient": str(user_id)},
             )
 
     def _after_commit(self, session: Session) -> None:
         transaction = session.get_nested_transaction() or session.get_transaction()
-        pending = session.info.get(RECIPIENTS_KEY, {})
+        pending = session.info.get(self._recipients_key, {})
         recipients = pending.pop(transaction, ())
         if transaction is not None and transaction.nested:
             # Releasing a savepoint only merges into its parent; the outer
@@ -69,10 +77,10 @@ class NotificationHub:
                 self._signal(user_id)
 
     def _after_transaction_end(self, session: Session, transaction: SessionTransaction) -> None:
-        pending = session.info.get(RECIPIENTS_KEY, {})
+        pending = session.info.get(self._recipients_key, {})
         pending.pop(transaction, None)
         if not pending:
-            session.info.pop(RECIPIENTS_KEY, None)
+            session.info.pop(self._recipients_key, None)
 
     def _signal(self, user_id: UUID, *, connected: bool = True) -> None:
         for queue in self._subscribers.get(user_id, ()):
@@ -111,7 +119,7 @@ class NotificationHub:
                 await connection.execution_options(isolation_level="AUTOCOMMIT")
                 raw = await connection.get_raw_connection()
                 driver = raw.driver_connection
-                await driver.add_listener(CHANNEL, self._notification)
+                await driver.add_listener(self._channel, self._notification)
                 driver.add_termination_listener(self._terminated)
             except BaseException:
                 try:
@@ -146,7 +154,7 @@ class NotificationHub:
             try:
                 if driver is not None and not driver.is_closed():
                     driver.remove_termination_listener(self._terminated)
-                    await driver.remove_listener(CHANNEL, self._notification)
+                    await driver.remove_listener(self._channel, self._notification)
             finally:
                 if connection is not None:
                     await connection.close()

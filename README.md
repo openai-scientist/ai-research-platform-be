@@ -230,10 +230,14 @@ A notification carries no text; the frontend words it from `kind`. Only invitati
 
 ### Project invitations
 
+`GET /projects/{id}/invite-candidates` gives Project Managers and Platform Admins a paginated user picker (`q`, `limit`, `offset`). It returns only active, email-verified regular user accounts (excluding Platform Admins) with `id`, `email`, `display_name` and `avatar_url`. Active members and pending invitations, even expired ones, are excluded before counting and pagination. Revoked membership history does not exclude a user. Archived projects answer `409 PROJECT_ARCHIVED`. See [the frontend handoff](docs/api/project-invite-candidates-handoff.md) for examples.
+
+`GET /projects/{id}/invite-candidates/stream` accepts the same query parameters and follows that page with SSE. Each `invite-candidates` event contains the full GET envelope: replace the page and pagination. Snapshots arrive immediately and after committed membership/account changes, across API workers through PostgreSQL LISTEN/NOTIFY. Rollbacks publish nothing. `session-ended` or `access-ended` tells the frontend to close the stream; reconnect gets current state. Heartbeats revalidate access without polling candidates.
+
 `POST /projects/{id}/members` invites a registered user with a role. The member row is returned with `status: "invited"`, `invite_sent_at`, `invite_expires_at`, `invite_expired` and `invite_email_sent` (false when the email provider refused the message; the invitation still exists). The user gets a `project_invited` notification and an email.
 
 - An invitation is valid for 24 hours (`PROJECT_INVITE_TTL_HOURS`).
-- The invited user reads `GET /invitations` and answers with `POST /invitations/{membership_id}/accept` or `/decline`. Accepting makes them a member with the offered role; declining can be done at any time, also after expiry.
+- The invited user reads `GET /invitations` and answers with `POST /invitations/{membership_id}/accept` or `/decline`. Optional `q` (3–120 characters) searches project name and inviter display name/email, case-insensitively, before counting and pagination. Accepting makes them a member with the offered role; declining can be done at any time, also after expiry.
 - `GET /projects/{id}/members` lists invited and active rows; filter with `status=invited` or `status=active`. An invited Project Manager does not count as a manager yet.
 - The manager can change the role of an open invitation, cancel it (`DELETE` on the member row) and, **only after it has expired**, send it again with `POST /projects/{id}/members/{membership_id}/invite`, which starts a new 24 hours.
 - A declined or cancelled invitation can be made again with a new `POST /projects/{id}/members`.
@@ -433,6 +437,8 @@ All paths start with `/api/v1`. Full schemas and error cases are in Swagger UI a
 | `POST` | `/projects/{id}/archive`, `/restore` | Archive or restore a project |
 | `POST` | `/projects/{id}/complete`, `/reopen` | Mark the project completed; reopen it |
 | `GET` `POST` | `/projects/{id}/members` | List members and open invitations (`status`); invite a registered user by email |
+| `GET` | `/projects/{id}/invite-candidates` | Search eligible users to invite; excludes existing members and open invitations (Project Manager or Platform Admin) |
+| `GET` | `/projects/{id}/invite-candidates/stream` | SSE snapshots of the filtered candidate page after committed changes (Project Manager or Platform Admin) |
 | `PUT` `DELETE` | `/projects/{id}/members/{membership_id}` | Change a role; remove a member or cancel an invitation |
 | `POST` | `/projects/{id}/members/{membership_id}/invite` | Send an expired invitation again |
 | `GET` | `/invitations` | My open project invitations |

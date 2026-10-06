@@ -23,6 +23,7 @@ from platform_be.db.session import get_db
 from platform_be.services.default_admin import ensure_default_admin
 from platform_be.services.email_sender import build_email_sender
 from platform_be.services.file_store import build_file_store
+from platform_be.services.invite_candidates_stream import InviteCandidatesHub
 from platform_be.services.notification_stream import NotificationHub
 from platform_be.services.popper_client import build_popper_client
 
@@ -46,6 +47,7 @@ def create_app(
         app_engine, expire_on_commit=False, autoflush=False
     )
     notification_hub = NotificationHub(app_engine)
+    invite_candidates_hub = InviteCandidatesHub(app_engine)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -56,8 +58,11 @@ def create_app(
             try:
                 await notification_hub.close()
             finally:
-                if owned_engine:
-                    await app_engine.dispose()
+                try:
+                    await invite_candidates_hub.close()
+                finally:
+                    if owned_engine:
+                        await app_engine.dispose()
 
     app = FastAPI(
         title=settings.app_name,
@@ -77,6 +82,7 @@ def create_app(
     app.state.popper_client = build_popper_client(settings)
     app.state.email_sender = build_email_sender(settings)
     app.state.notification_hub = notification_hub
+    app.state.invite_candidates_hub = invite_candidates_hub
     app.add_middleware(RequestProtectionMiddleware, settings=settings)
 
     @app.middleware("http")

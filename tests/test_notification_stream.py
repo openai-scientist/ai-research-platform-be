@@ -37,18 +37,18 @@ class EventStream:
         frame, self.buffer = self.buffer.split(b"\n\n", 1)
         return frame.decode()
 
-    async def snapshot(self) -> dict:
+    async def snapshot(self, event_name: str = "notifications") -> dict:
         frame = await self.frame()
-        assert frame.startswith("event: notifications\n"), frame
+        assert frame.startswith(f"event: {event_name}\n"), frame
         return json.loads(frame.split("data: ", 1)[1])
 
 
 @asynccontextmanager
 async def open_stream(
-    harness: Harness, client: AsyncClient
+    harness: Harness, client: AsyncClient, path: str = STREAM
 ) -> AsyncIterator[tuple[dict, EventStream]]:
     """Exercise the real ASGI stream; HTTPX's in-process transport buffers forever."""
-    request = client.build_request("GET", STREAM, headers={"Origin": ORIGIN})
+    request = client.build_request("GET", path, headers={"Origin": ORIGIN})
     messages = asyncio.Queue()
     disconnected = asyncio.Event()
     request_received = False
@@ -72,10 +72,10 @@ async def open_stream(
                 "http_version": "1.1",
                 "method": "GET",
                 "scheme": "http",
-                "path": STREAM,
-                "raw_path": STREAM.encode(),
+                "path": request.url.path,
+                "raw_path": request.url.path.encode(),
                 "root_path": "",
-                "query_string": b"",
+                "query_string": request.url.query,
                 "headers": [(name.lower(), value) for name, value in request.headers.raw],
                 "client": ("127.0.0.1", 12345),
                 "server": ("test", 80),

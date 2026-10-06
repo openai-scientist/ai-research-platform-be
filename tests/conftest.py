@@ -76,6 +76,7 @@ async def harness(tmp_path) -> AsyncIterator[Harness]:
         yield Harness(app, factory, settings)
     finally:
         await app.state.notification_hub.close()
+        await app.state.invite_candidates_hub.close()
         await engine.dispose()
 
 

@@ -77,6 +77,7 @@ async def postgres_harness(tmp_path) -> AsyncIterator[Harness]:
     finally:
         if app is not None:
             await app.state.notification_hub.close()
+            await app.state.invite_candidates_hub.close()
         await engine.dispose()
         async with admin_engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
@@ -588,3 +589,52 @@ async def test_a_reset_outlasts_a_sign_in_or_a_change_racing_it(
             harness.emails.sent.clear()
             for client in (owner, other, thief):
                 client.cookies.clear()
+
+
+@pytest.mark.asyncio
+async def test_candidate_stream_delivers_across_workers_after_commit(postgres_harness: Harness):
+    writer = postgres_harness
+    reader_app = create_app(
+        writer.settings, engine=writer.app.state.engine, session_factory=writer.factory
+    )
+    reader = Harness(reader_app, writer.factory, writer.settings)
+    try:
+        async with writer.client() as pm, reader.client() as second_tab, writer.client() as user:
+            manager = await login(writer, pm, uid="pm", email="pm@example.com")
+            await login(reader, second_tab, uid="pm", email="pm@example.com")
+            candidate = await login(writer, user, uid="candidate", email="candidate@example.com")
+            project = await create_project(pm, manager)
+            path = f"{PROJECTS}/{project['id']}/invite-candidates/stream"
+            async with open_stream(reader, second_tab, path) as (_, stream):
+                assert (await stream.snapshot("invite-candidates"))["data"][0][
+                    "email"
+                ] == "candidate@example.com"
+                invited = await invite_member(
+                    pm, manager, project["id"], "candidate@example.com", "researcher"
+                )
+                assert (await stream.snapshot("invite-candidates"))["data"] == []
+                await pm.delete(
+                    f"{PROJECTS}/{project['id']}/members/{invited['id']}",
+                    headers=mutation_headers(manager["csrf_token"]),
+                )
+                assert len((await stream.snapshot("invite-candidates"))["data"]) == 1
+                async with writer.factory() as db:
+                    writer.app.state.invite_candidates_hub.bind(db)
+                    row = await db.get(User, UUID(candidate["user"]["id"]))
+                    row.display_name = "Before commit"
+                    await db.flush()
+                    with pytest.raises(TimeoutError):
+                        await asyncio.wait_for(stream.frame(), timeout=0.05)
+                    await db.rollback()
+                    with pytest.raises(TimeoutError):
+                        await asyncio.wait_for(stream.frame(), timeout=0.05)
+                    row = await db.get(User, UUID(candidate["user"]["id"]))
+                    row.display_name = "Committed name"
+                    # No manual flush: before_commit must detect the pending change.
+                    await db.commit()
+                    assert (await stream.snapshot("invite-candidates"))["data"][0][
+                        "display_name"
+                    ] == "Committed name"
+    finally:
+        await reader_app.state.notification_hub.close()
+        await reader_app.state.invite_candidates_hub.close()

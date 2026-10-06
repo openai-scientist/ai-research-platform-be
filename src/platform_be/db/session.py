@@ -8,6 +8,7 @@ async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
     factory: async_sessionmaker[AsyncSession] = request.app.state.session_factory
     async with factory() as session:
         request.app.state.notification_hub.bind(session)
+        request.app.state.invite_candidates_hub.bind(session)
         try:
             yield session
             await session.commit()

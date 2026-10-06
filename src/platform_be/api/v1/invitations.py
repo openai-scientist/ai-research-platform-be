@@ -13,6 +13,7 @@ from platform_be.auth.sessions import Principal, require_active_csrf, require_ac
 from platform_be.core.errors import APIError
 from platform_be.core.responses import ApiResponse, ErrorResponse, ok, paginated
 from platform_be.core.roles import ProjectRole
+from platform_be.core.search import SearchTerm, matches
 from platform_be.db.session import get_db
 from platform_be.models.identity import User, UserStatus
 from platform_be.models.project import Project, ProjectMembership
@@ -103,9 +104,13 @@ async def _locked_invitation(
     "",
     response_model=ApiResponse[list[InvitationItem]],
     summary="List my open project invitations, newest first",
-    description="Expired invitations stay in the list, marked `invite_expired`, until answered.",
+    description=(
+        "Expired invitations stay in the list, marked `invite_expired`, until answered. "
+        "q searches the project name and the inviter's display name or email, before pagination."
+    ),
 )
 async def list_invitations(
+    q: SearchTerm = None,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     principal: Principal = Depends(require_active_principal),
@@ -113,17 +118,19 @@ async def list_invitations(
     prefix: str = Depends(api_prefix),
 ) -> ApiResponse[list[InvitationItem]]:
     filters = _mine(principal.user.id)
-    total = int(
-        await db.scalar(select(func.count()).select_from(ProjectMembership).where(*filters)) or 0
-    )
     inviter = aliased(User)
+    if q:
+        filters.append(matches(q, Project.name, inviter.display_name, inviter.email))
+    query = (
+        select(ProjectMembership, Project.name, inviter)
+        .join(Project, Project.id == ProjectMembership.project_id)
+        .join(inviter, inviter.id == ProjectMembership.created_by_user_id)
+        .where(*filters)
+    )
+    total = int(await db.scalar(select(func.count()).select_from(query.subquery())) or 0)
     rows = (
         await db.execute(
-            select(ProjectMembership, Project.name, inviter)
-            .join(Project, Project.id == ProjectMembership.project_id)
-            .join(inviter, inviter.id == ProjectMembership.created_by_user_id)
-            .where(*filters)
-            .order_by(ProjectMembership.invite_sent_at.desc(), ProjectMembership.id)
+            query.order_by(ProjectMembership.invite_sent_at.desc(), ProjectMembership.id)
             .limit(limit)
             .offset(offset)
         )

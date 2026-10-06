@@ -1,17 +1,24 @@
+import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import UUID
 
+import asyncpg
 from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import and_, func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_be.auth.sessions import (
     Principal,
+    get_principal,
     normalize_email,
     require_active_csrf,
     require_active_principal,
+    require_origin,
 )
 from platform_be.core.config import Settings
 from platform_be.core.errors import APIError
@@ -19,7 +26,7 @@ from platform_be.core.responses import ApiResponse, ErrorResponse, ok, paginated
 from platform_be.core.roles import ProjectRole
 from platform_be.core.search import SearchTerm, matches
 from platform_be.db.session import get_db
-from platform_be.models.identity import User, UserStatus
+from platform_be.models.identity import User, UserPlatformRole, UserStatus
 from platform_be.models.project import Project, ProjectMembership
 from platform_be.models.research import ACTIVE_RUN_STATUSES, ResearchRun
 from platform_be.services.access import (
@@ -44,6 +51,7 @@ from platform_be.services.notifications import (
 from platform_be.services.project_status import derive_project_status
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+INVITE_CANDIDATES_KEEP_ALIVE_SECONDS = 15
 
 ProjectStatus = Literal[
     "draft", "data_ready", "researching", "needs_review", "completed", "archived"
@@ -152,6 +160,13 @@ class ProjectMemberItem(BaseModel):
         description="Only on the two responses that send the invitation: whether the email went.",
     )
     created_at: datetime
+
+
+class ProjectInviteCandidate(BaseModel):
+    id: str
+    email: str
+    display_name: str | None
+    avatar_url: str | None
 
 
 def _project_item(project: Project, membership: ProjectMembership | None) -> ProjectItem:
@@ -596,6 +611,166 @@ async def list_project_members(
         total=total,
         limit=limit,
         offset=offset,
+    )
+
+
+@router.get(
+    "/{project_id}/invite-candidates",
+    response_model=ApiResponse[list[ProjectInviteCandidate]],
+    summary="List users available for a project invitation",
+    description=(
+        "Project Managers and Platform Admins can choose active, email-verified regular users. "
+        "Platform Admin accounts are excluded from the candidates. "
+        "Existing active members and pending invitations (including expired ones) are "
+        "excluded before pagination. Removed members and cancelled or declined invitations "
+        "can be invited again. Archived projects are read-only."
+    ),
+    responses={
+        401: {"model": ErrorResponse, "description": "An active session is required"},
+        **PROJECT_ERRORS,
+    },
+)
+async def list_project_invite_candidates(
+    project_id: UUID,
+    q: SearchTerm = None,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(require_active_principal),
+    db: AsyncSession = Depends(get_db),
+    prefix: str = Depends(api_prefix),
+) -> ApiResponse[list[ProjectInviteCandidate]]:
+    project, _ = await require_project_access(db, principal, project_id, manage=True)
+    ensure_writable_project(project)
+    return await _invite_candidates(db, project_id, q, limit, offset, prefix)
+
+
+async def _invite_candidates(
+    db: AsyncSession, project_id: UUID, q: str | None, limit: int, offset: int, prefix: str
+) -> ApiResponse[list[ProjectInviteCandidate]]:
+    existing_membership = (
+        select(ProjectMembership.id)
+        .where(
+            ProjectMembership.project_id == project_id,
+            ProjectMembership.user_id == User.id,
+            ProjectMembership.status.in_(OPEN_STATUSES),
+        )
+        .exists()
+    )
+    filters = [
+        User.status == UserStatus.ACTIVE,
+        User.email_verified_at.is_not(None),
+        User.id.not_in(select(UserPlatformRole.user_id)),
+        ~existing_membership,
+    ]
+    if q:
+        filters.append(matches(q, User.email, User.display_name))
+    total = int(await db.scalar(select(func.count()).select_from(User).where(*filters)) or 0)
+    users = (
+        await db.scalars(
+            select(User)
+            .where(*filters)
+            .order_by(User.email_normalized, User.id)
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+    return paginated(
+        [
+            ProjectInviteCandidate(
+                id=str(user.id),
+                email=user.email,
+                display_name=user.display_name,
+                avatar_url=avatar_url(prefix, user.id, user.avatar_storage_key),
+            )
+            for user in users
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get(
+    "/{project_id}/invite-candidates/stream",
+    response_class=StreamingResponse,
+    summary="Follow project invitation candidates in realtime",
+    description=(
+        "Authenticated SSE for Project Managers and Platform Admins. An invite-candidates "
+        "event contains the same envelope and filtered page as the GET list, immediately "
+        "and after committed changes. Replace the page on every snapshot. session-ended "
+        "or access-ended means close the stream. Reconnect to obtain current state."
+    ),
+    responses={
+        200: {"content": {"text/event-stream": {"schema": {"type": "string"}}}},
+        401: {"model": ErrorResponse, "description": "An active session is required"},
+        **PROJECT_ERRORS,
+        503: {"model": ErrorResponse, "description": "Candidate realtime is unavailable"},
+    },
+)
+async def stream_project_invite_candidates(
+    project_id: UUID,
+    request: Request,
+    q: SearchTerm = None,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> StreamingResponse:
+    if request.headers.get("Origin") is not None:
+        require_origin(request)
+    factory = request.app.state.session_factory
+    prefix = api_prefix(request)
+
+    async def authorize(db: AsyncSession) -> None:
+        principal = await get_principal(request, db)
+        project, _ = await require_project_access(db, principal, project_id, manage=True)
+        ensure_writable_project(project)
+
+    async with factory() as db:
+        await authorize(db)
+        await db.commit()
+    hub = request.app.state.invite_candidates_hub
+    try:
+        await hub.start()
+    except (SQLAlchemyError, OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as exc:
+        raise APIError(
+            503, "INVITE_CANDIDATES_UNAVAILABLE", "Candidate realtime is unavailable"
+        ) from exc
+
+    async def events():
+        async with hub.subscribe(project_id) as changes:
+            refresh = True
+            while True:
+                try:
+                    # Never keep a database transaction/connection across an SSE wait.
+                    async with factory() as db:
+                        await authorize(db)
+                        if refresh:
+                            snapshot = await _invite_candidates(
+                                db, project_id, q, limit, offset, prefix
+                            )
+                            await db.commit()
+                except APIError as exc:
+                    event_name = "session-ended" if exc.status_code == 401 else "access-ended"
+                    yield f"event: {event_name}\ndata: {json.dumps({'code': exc.code})}\n\n"
+                    return
+                if refresh:
+                    yield f"event: invite-candidates\ndata: {snapshot.model_dump_json()}\n\n"
+                else:
+                    yield ": keep-alive\n\n"
+                try:
+                    if not await asyncio.wait_for(
+                        changes.get(), timeout=INVITE_CANDIDATES_KEEP_ALIVE_SECONDS
+                    ):
+                        return
+                    refresh = True
+                except TimeoutError:
+                    # Only check authorization on heartbeats; do not poll candidates
+                    # or persist activity touches that would extend the idle session.
+                    refresh = False
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
