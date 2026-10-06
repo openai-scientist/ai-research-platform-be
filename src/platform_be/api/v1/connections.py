@@ -3,6 +3,7 @@ import hashlib
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
@@ -30,7 +31,7 @@ from platform_be.services.connectors import (
     ConnectorFactory,
     get_connector_factory,
 )
-from platform_be.services.connectors.base import Identifier, QuerySource, Source
+from platform_be.services.connectors.base import Identifier, QuerySource, Source, TableSource
 from platform_be.services.connectors.gate import ConnectionGate, get_connection_gate
 from platform_be.services.connectors.network_guard import is_host
 from platform_be.services.connectors.values import approximate_size, to_text
@@ -213,15 +214,24 @@ def _open_secret(box: SecretBox, row: DataConnection) -> dict[str, Any]:
         ) from None
 
 
-async def _saved_connection(
+@dataclass(frozen=True, slots=True)
+class SavedConnection:
+    name: str
+    kind: str
+    config: dict[str, Any]
+    # Kept out of the repr, so it cannot reach a log or a traceback through this object.
+    secret: dict[str, Any] = field(repr=False)
+
+
+async def saved_connection(
     db: AsyncSession,
     principal: Principal,
     project_id: UUID,
     connection_id: UUID,
     box: SecretBox | None,
     gate: ConnectionGate,
-) -> tuple[str, dict[str, Any], dict[str, Any]]:
-    """Check that the caller may read through a connection; return its kind, config and secret.
+) -> SavedConnection:
+    """Check that the caller may read through a connection; return what a read needs of it.
 
     Everything a read needs from the Platform's database, so the caller can commit before it
     contacts the external server.
@@ -231,33 +241,36 @@ async def _saved_connection(
     box = _require_box(box)
     gate.check_query_rate(principal.user.id)
     row = await _get_connection(db, project_id, connection_id)
-    return row.kind, row.config, _open_secret(box, row)
+    return SavedConnection(row.name, row.kind, row.config, _open_secret(box, row))
 
 
 @asynccontextmanager
-async def _reading(
+async def reading(
     request: Request,
     db: AsyncSession,
     gate: ConnectionGate,
     factory: ConnectorFactory,
     project_id: UUID,
     user_id: UUID,
-    saved: tuple[str, dict[str, Any], dict[str, Any]],
+    saved: SavedConnection,
+    *,
+    deadline: float | None = None,
 ) -> AsyncIterator[Connector]:
     """A connector to use within a slot and a deadline; its failures become 422 responses.
 
     The Platform's own transaction is committed once the slot is held: nothing of it stays
     open while the external server is contacted, and a request that finds no slot leaves
-    nothing behind.
+    nothing behind. The deadline is the one for a query unless another is given.
     """
-    deadline = request.app.state.settings.connection_query_timeout_seconds
+    if deadline is None:
+        deadline = request.app.state.settings.connection_query_timeout_seconds
     async with gate.slot(project_id, user_id):
         await db.commit()
         try:
             # The server-side timeout cannot be relied on: the server is whatever the user
             # pointed at, and may simply stop answering.
             async with asyncio.timeout(deadline):
-                yield await factory(*saved)
+                yield await factory(saved.kind, saved.config, saved.secret)
         except TimeoutError:
             logger.info("connection read abandoned after %s seconds", deadline)
             raise _read_failed(ConnectorError("query_timeout")) from None
@@ -269,6 +282,17 @@ def _read_failed(error: ConnectorError) -> APIError:
     about_source = error.reason in ("source_not_found", "query_failed", "query_timeout")
     code = "SOURCE_INVALID" if about_source else "CONNECTION_FAILED"
     return APIError(422, code, error.message, reason=error.reason)
+
+
+def source_audit_details(source: TableSource | QuerySource) -> dict[str, Any]:
+    """What an audit event records about a source that was read."""
+    if isinstance(source, QuerySource):
+        # Not the text: SQL can carry sensitive constants.
+        return {
+            "source_type": "query",
+            "sql_sha256": hashlib.sha256(source.sql.encode()).hexdigest(),
+        }
+    return {"source_type": "table", "schema": source.schema_name, "name": source.name}
 
 
 def _preview_cell(value: Any) -> str | None:
@@ -619,8 +643,8 @@ async def list_schemas(
     gate: ConnectionGate = Depends(get_connection_gate),
     factory: ConnectorFactory = Depends(get_connector_factory),
 ) -> ApiResponse[list[str]]:
-    saved = await _saved_connection(db, principal, project_id, connection_id, box, gate)
-    async with _reading(
+    saved = await saved_connection(db, principal, project_id, connection_id, box, gate)
+    async with reading(
         request, db, gate, factory, project_id, principal.user.id, saved
     ) as connector:
         return ok(await connector.list_schemas())
@@ -658,8 +682,8 @@ async def list_tables(
     gate: ConnectionGate = Depends(get_connection_gate),
     factory: ConnectorFactory = Depends(get_connector_factory),
 ) -> ApiResponse[list[TableItem]]:
-    saved = await _saved_connection(db, principal, project_id, connection_id, box, gate)
-    async with _reading(
+    saved = await saved_connection(db, principal, project_id, connection_id, box, gate)
+    async with reading(
         request, db, gate, factory, project_id, principal.user.id, saved
     ) as connector:
         tables = await connector.list_tables(schema, search=search or None, limit=MAX_TABLES)
@@ -699,8 +723,8 @@ async def list_columns(
     gate: ConnectionGate = Depends(get_connection_gate),
     factory: ConnectorFactory = Depends(get_connector_factory),
 ) -> ApiResponse[list[ColumnItem]]:
-    saved = await _saved_connection(db, principal, project_id, connection_id, box, gate)
-    async with _reading(
+    saved = await saved_connection(db, principal, project_id, connection_id, box, gate)
+    async with reading(
         request, db, gate, factory, project_id, principal.user.id, saved
     ) as connector:
         columns = await connector.list_columns(schema, table)
@@ -730,16 +754,8 @@ async def preview_source(
     gate: ConnectionGate = Depends(get_connection_gate),
     factory: ConnectorFactory = Depends(get_connector_factory),
 ) -> ApiResponse[PreviewData]:
-    saved = await _saved_connection(db, principal, project_id, connection_id, box, gate)
+    saved = await saved_connection(db, principal, project_id, connection_id, box, gate)
     source = body.source
-    if isinstance(source, QuerySource):
-        # Not the text: SQL can carry sensitive constants.
-        details = {
-            "source_type": "query",
-            "sql_sha256": hashlib.sha256(source.sql.encode()).hexdigest(),
-        }
-    else:
-        details = {"source_type": "table", "schema": source.schema_name, "name": source.name}
     # Committed before the query runs, so one that fails or never returns is on record too.
     record_audit(
         db,
@@ -749,7 +765,7 @@ async def preview_source(
         resource_id=connection_id,
         project_id=project_id,
         request_id=getattr(request.state, "request_id", None),
-        details=details,
+        details=source_audit_details(source),
     )
 
     limit = request.app.state.settings.connection_preview_max_rows
@@ -757,7 +773,7 @@ async def preview_source(
     size = 0
     truncated = False
     async with (
-        _reading(request, db, gate, factory, project_id, principal.user.id, saved) as connector,
+        reading(request, db, gate, factory, project_id, principal.user.id, saved) as connector,
         # One row more than is shown tells whether the source goes on.
         connector.open_rows(source, max_rows=limit + 1) as stream,
     ):
