@@ -63,6 +63,12 @@ PLATFORM_MYSQL_TEST_URL=mysql://root:scratch@127.0.0.1:3306/connector_test uv ru
 docker stop connector-test-mysql
 ```
 
+The tests of the BigQuery connector run against a stand-in for BigQuery's REST API, through Google's own client library. One test talks to BigQuery itself and is skipped unless `PLATFORM_BIGQUERY_TEST_SERVICE_ACCOUNT` is the path of a service account key file. The account needs the roles BigQuery Job User and BigQuery Data Viewer on its project; the test reads a few rows of a public dataset, which is billed to that project (well inside the free monthly quota). CI never runs it.
+
+```bash
+PLATFORM_BIGQUERY_TEST_SERVICE_ACCOUNT=/path/to/key.json uv run pytest tests/test_bigquery_connector.py
+```
+
 ## How the Platform works
 
 The project is the top-level scope: there is no organization or workspace above it.
