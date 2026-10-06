@@ -55,6 +55,14 @@ uv run pytest
 
 Tests run on SQLite in memory. The tests that need real PostgreSQL behaviour (locks, concurrent requests) are skipped unless `PLATFORM_POSTGRES_TEST_URL` points at a scratch database.
 
+The tests of the MySQL connector that need a real server are skipped unless `PLATFORM_MYSQL_TEST_URL` points at one, as a user who can create databases and users. The Platform itself runs no MySQL: a throwaway container is enough, and it is gone once stopped.
+
+```bash
+docker run --rm -d --name connector-test-mysql -e MYSQL_ROOT_PASSWORD=scratch -e MYSQL_DATABASE=connector_test -p 127.0.0.1:3306:3306 --tmpfs /var/lib/mysql mysql:8
+PLATFORM_MYSQL_TEST_URL=mysql://root:scratch@127.0.0.1:3306/connector_test uv run pytest
+docker stop connector-test-mysql
+```
+
 ## How the Platform works
 
 The project is the top-level scope: there is no organization or workspace above it.
