@@ -16,6 +16,8 @@ from tests.fakes import FakeEmailSender, FakePopperClient
 ORIGIN = "http://localhost:3000"
 CALLBACK_KEY = "test-popper-callback-key"
 PASSWORD = "correct horse battery"
+# A Fernet key for tests only.
+CONNECTION_KEY = "dGVzdC1vbmx5LWNvbm5lY3Rpb24tc2VjcmV0LWtleSE="
 
 
 class Harness:
@@ -48,6 +50,7 @@ async def harness(tmp_path) -> AsyncIterator[Harness]:
         storage_local_root=str(tmp_path / "storage"),
         popper_callback_key=CALLBACK_KEY,
         popper_timeout_seconds=1,
+        connection_secret_key=CONNECTION_KEY,
         database_url="sqlite+aiosqlite:///:memory:",
         cors_allowed_origins=ORIGIN,
         session_signing_secret="test-session-signing-secret-is-long-enough",

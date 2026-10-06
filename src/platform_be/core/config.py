@@ -2,6 +2,7 @@ from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 
+from cryptography.fernet import Fernet
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -77,6 +78,21 @@ class Settings(BaseSettings):
     # password is a known value, so production refuses these settings.
     default_admin_email: str | None = None
     default_admin_password: SecretStr | None = None
+    # Data connections to external databases. Without a key the feature is off: nothing can be
+    # stored or tested, but existing rows can still be listed.
+    connection_secret_key: SecretStr | None = None
+    # Lets a connection point at a loopback or private address. Local development and tests only.
+    connection_allow_private_hosts: bool = False
+    connection_connect_timeout_seconds: float = Field(default=10, ge=1, le=60)
+    connection_query_timeout_seconds: int = Field(default=60, ge=1, le=600)
+    connection_max_concurrent_queries: int = Field(default=4, ge=1, le=32)
+    # How many of those one project, and one user, may hold: a slow server cannot take them all.
+    connection_max_concurrent_per_owner: int = Field(default=2, ge=1, le=32)
+    # Calls to external databases one user may start per auth_session_rate_window_seconds.
+    connection_probe_rate_limit: int = Field(default=30, ge=1, le=1000)
+    # Reads through a saved connection (browsing, previews) one user may start per window.
+    connection_query_rate_limit: int = Field(default=120, ge=1, le=10000)
+    connection_preview_max_rows: int = Field(default=100, ge=1, le=1000)
 
     @field_validator("cors_allowed_origins")
     @classmethod
@@ -106,6 +122,7 @@ class Settings(BaseSettings):
         "app_url",
         "default_admin_email",
         "default_admin_password",
+        "connection_secret_key",
         mode="before",
     )
     @classmethod
@@ -138,6 +155,15 @@ class Settings(BaseSettings):
             raise ValueError("default_admin_email and default_admin_password go together")
         if self.default_admin_email and self.app_env in ("staging", "production"):
             raise ValueError("A default admin account is for local development only")
+        if self.connection_secret_key:
+            try:
+                Fernet(self.connection_secret_key.get_secret_value().encode())
+            except ValueError:
+                raise ValueError(
+                    "connection_secret_key must be a Fernet key (32 url-safe base64 bytes)"
+                ) from None
+        if self.connection_allow_private_hosts and self.app_env in ("staging", "production"):
+            raise ValueError("connection_allow_private_hosts is for local development only")
         if self.cookie_samesite == "none" and not self.cookie_secure:
             raise ValueError("SameSite=None cookies require Secure")
         if self.app_env == "production":
