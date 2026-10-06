@@ -1,4 +1,4 @@
-"""Check that an uploaded dataset is a CSV file Popper can read."""
+"""Check that a dataset is a CSV file Popper can read."""
 
 import csv
 import io
@@ -14,10 +14,28 @@ class InvalidCsv(ValueError):
     """The file is not an acceptable dataset; the message says why."""
 
 
+class DuplicateColumns(InvalidCsv):
+    """Two columns share a name."""
+
+
 @dataclass(frozen=True, slots=True)
 class CsvSummary:
     row_count: int
     column_names: list[str]
+
+
+def check_header(header: list[str]) -> list[str]:
+    """The column names of a header row, or InvalidCsv when they cannot name a dataset's columns."""
+    columns = [name.strip() for name in header]
+    if len(columns) > MAX_COLUMNS:
+        raise InvalidCsv(f"The file has more than {MAX_COLUMNS} columns")
+    if any(len(name) > MAX_COLUMN_NAME_LENGTH for name in columns):
+        raise InvalidCsv(f"Column names must be at most {MAX_COLUMN_NAME_LENGTH} characters long")
+    if any(not name for name in columns):
+        raise InvalidCsv("Every column needs a name in the header row")
+    if len(set(columns)) != len(columns):
+        raise DuplicateColumns("Column names in the header row must be unique")
+    return columns
 
 
 def inspect_csv(handle: IO[bytes]) -> CsvSummary:
@@ -29,17 +47,7 @@ def inspect_csv(handle: IO[bytes]) -> CsvSummary:
         header = next(reader, None)
         if header is None:
             raise InvalidCsv("The file is empty")
-        columns = [name.strip() for name in header]
-        if len(columns) > MAX_COLUMNS:
-            raise InvalidCsv(f"The file has more than {MAX_COLUMNS} columns")
-        if any(len(name) > MAX_COLUMN_NAME_LENGTH for name in columns):
-            raise InvalidCsv(
-                f"Column names must be at most {MAX_COLUMN_NAME_LENGTH} characters long"
-            )
-        if any(not name for name in columns):
-            raise InvalidCsv("Every column needs a name in the header row")
-        if len(set(columns)) != len(columns):
-            raise InvalidCsv("Column names in the header row must be unique")
+        columns = check_header(header)
         rows = 0
         for row in reader:
             if not row:
