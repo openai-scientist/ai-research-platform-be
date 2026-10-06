@@ -305,7 +305,8 @@ The Platform owns accounts, passwords, sessions, and roles; there is no external
 | Send the code again | `POST /api/v1/auth/resend-verification` with `{ "email" }` | Always `200` with the same body as `register`, whether or not the address has an account. |
 | Sign in | `POST /api/v1/auth/login` with `{ "email", "password" }` | `200`. `401 INVALID_CREDENTIALS` for a wrong email or password (the answer does not say which), `403 USER_SUSPENDED` for a suspended account, `403 EMAIL_NOT_VERIFIED` for an account that has not entered its code yet (no email is sent; call `resend-verification`). |
 | Forgot password | `POST /api/v1/auth/forgot-password` with `{ "email" }` | Always `200` with the same body as `register`. An active account is emailed a 6-digit code. |
-| Set a new password | `POST /api/v1/auth/reset-password` with `{ "email", "code", "new_password" }` | `200`; the password is set, every session of the user ends and nobody is signed in. `400 OTP_INVALID`; `400 PASSWORD_UNCHANGED` when the new password is the part of the email before the `@`. |
+| Verify the password reset OTP | `POST /api/v1/auth/verify-reset-password` with `{ "email", "code" }` | `200` with `{ "reset_token", "expires_in_seconds" }`; consumes the OTP without changing the password or sessions. `400 OTP_INVALID`. |
+| Set a new password | `POST /api/v1/auth/reset-password` with `{ "email", "reset_token", "new_password" }` | `200`; the password is set, every session of the user ends and nobody is signed in. `400 RESET_TOKEN_INVALID` for a wrong, expired, used token or unavailable account; `400 PASSWORD_UNCHANGED` when the new password is the part of the email before the `@`. |
 | Change password | `POST /api/v1/auth/change-password` with `{ "current_password", "new_password" }` | `200`; every other session of the user is signed out and the user is emailed a notice. `403 CURRENT_PASSWORD_INCORRECT`. `400 PASSWORD_UNCHANGED` when a user with a temporary password sends it again as the new one. |
 | Edit own profile | `PATCH /api/v1/auth/me` with `{ "display_name" }` | `200`. The email cannot be changed. |
 | Set own picture | `POST /api/v1/auth/me/avatar`, a multipart form with one `file` | `200` with the new `avatar_url`. `415 UNSUPPORTED_IMAGE_TYPE`, `413 REQUEST_BODY_TOO_LARGE`. `DELETE` on the same path removes it. |
@@ -328,11 +329,12 @@ Sign-up codes and reset codes are counted separately and cannot stand in for eac
 - `400 OTP_INVALID` is the single answer for a wrong, expired, used, spent or locked code, an unknown or suspended account, and (on `verify-email`) a wrong password. The API never says which.
 - `verify-email` checks the password before the code, so only someone who knows the password can spend checks, and a mistyped password does not cost a code.
 - Registering again for an address that is not verified yet replaces its password and name together with a new code. Inside the 60 second wait nothing changes and nothing is sent, but the answer is still `201`: the earlier password stays.
-- `reset-password` proves the inbox, so it also verifies an unverified email and ends a temporary password. An account from before the Platform kept passwords sets its first password this way.
+- `verify-reset-password` returns a random, one-use token bound to the account, valid for `OTP_TTL_MINUTES` (10 minutes by default). Only its hash is stored. Issuing a new reset OTP invalidates the earlier token. `reset-password` requires this token; it no longer accepts an OTP directly.
+- Completing `reset-password` proves the inbox, so it also verifies an unverified email and ends a temporary password. An account from before the Platform kept passwords sets its first password this way.
 - After `change-password` and `reset-password` the user is emailed a notice that the password changed.
 - When email is down or the provider's quota is spent, no new account can be verified. There is no bypass.
 
-**Rate limits**, per client address and API process, each over `AUTH_SESSION_RATE_WINDOW_SECONDS` (`429 RATE_LIMITED` with `Retry-After`): `login` and `register` share `AUTH_SESSION_RATE_LIMIT` (10); `verify-email`, `resend-verification`, `forgot-password` and `reset-password` share `AUTH_CODE_RATE_LIMIT` (20).
+**Rate limits**, per client address and API process, each over `AUTH_SESSION_RATE_WINDOW_SECONDS` (`429 RATE_LIMITED` with `Retry-After`): `login` and `register` share `AUTH_SESSION_RATE_LIMIT` (10); `verify-email`, `resend-verification`, `forgot-password`, `verify-reset-password` and `reset-password` share `AUTH_CODE_RATE_LIMIT` (20).
 
 Passwords are 8 to 128 characters. Only an scrypt hash with its own salt is stored (`PASSWORD_SCRYPT_LOG2_N` sets the cost); emails are compared without regard to letter case.
 
@@ -377,7 +379,7 @@ A picture is a PNG, JPEG or WebP image of at most 4 MiB (`AVATAR_MAX_UPLOAD_BYTE
 ### Rules for the frontend
 
 - Send every request with `credentials: "include"` and an `Origin` that exactly matches `CORS_ALLOWED_ORIGINS`.
-- Send the CSRF token in `X-CSRF-Token` on every mutation (`POST`, `PATCH`, `PUT`, `DELETE`) except the six endpoints used before a session exists: `register`, `verify-email`, `resend-verification`, `login`, `forgot-password` and `reset-password`. After a page reload, get it again from `GET /api/v1/auth/csrf-token`.
+- Send the CSRF token in `X-CSRF-Token` on every mutation (`POST`, `PATCH`, `PUT`, `DELETE`) except the seven endpoints used before a session exists: `register`, `verify-email`, `resend-verification`, `login`, `forgot-password`, `verify-reset-password` and `reset-password`. After a page reload, get it again from `GET /api/v1/auth/csrf-token`.
 - Restore the signed-in user after a reload with `GET /api/v1/auth/me`. It returns the user, platform role (`user` or `platform_admin`, never empty), `email_verified`, `must_change_password`, session expiry, and `memberships`: the user's projects with the role in each.
 - On sign-out call `POST /api/v1/auth/logout`.
 - On `401` with `SESSION_EXPIRED` or `USER_SUSPENDED` the session cookie is already cleared; send the user back to sign-in.
@@ -394,7 +396,8 @@ All paths start with `/api/v1`. Full schemas and error cases are in Swagger UI a
 | `POST` | `/auth/verify-email` | Enter the code and the password; verifies the email and sets the session cookie |
 | `POST` | `/auth/resend-verification` | Email a new verification code |
 | `POST` | `/auth/forgot-password` | Email a code to set a new password |
-| `POST` | `/auth/reset-password` | Set a new password with the code; ends every session |
+| `POST` | `/auth/verify-reset-password` | Verify the reset OTP and return a one-use reset token |
+| `POST` | `/auth/reset-password` | Set a new password with the verified reset token; ends every session |
 | `POST` | `/auth/login` | Sign in with email and password; sets the session cookie |
 | `POST` | `/auth/change-password` | Change the password; signs out the user's other sessions |
 | `POST` | `/auth/logout` | End the current session |

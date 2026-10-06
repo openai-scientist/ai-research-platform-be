@@ -100,6 +100,9 @@ class EmailOtp(Base):
     purpose: Mapped[str] = mapped_column(String(32), nullable=False)
     # A keyed digest, never the code. Empty once the code is used or withdrawn.
     code_digest: Mapped[str | None] = mapped_column(String(64))
+    # Granted only after a reset OTP succeeds; consumed when the password is set.
+    reset_token_digest: Mapped[str | None] = mapped_column(String(64))
+    reset_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     # Checks made against the current code.
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

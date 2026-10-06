@@ -1,10 +1,13 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_be.cli.bootstrap_admin import bootstrap_admin
+from platform_be.core.security import token_digest
 from platform_be.models.audit import AuditEvent
-from platform_be.models.identity import EmailOtp, User
+from platform_be.models.identity import EmailOtp, User, UserStatus
 from tests.conftest import PASSWORD, Harness, emailed_code, login, mutation_headers
 from tests.test_email_verification import AUTH, USERS, invalid, post, register, user_row, wrong
 
@@ -14,13 +17,117 @@ NOTICE = "Your AI Research Platform password was changed"
 
 
 async def reset(client, code: str, *, email: str = EMAIL, new_password: str = NEW_PASSWORD):
-    return await post(client, "reset-password", email=email, code=code, new_password=new_password)
+    verified = await post(client, "verify-reset-password", email=email, code=code)
+    if verified.status_code != 200:
+        return verified
+    return await post(
+        client,
+        "reset-password",
+        email=email,
+        reset_token=verified.json()["data"]["reset_token"],
+        new_password=new_password,
+    )
 
 
 async def forgot(harness: Harness, client, email: str = EMAIL) -> str:
     response = await post(client, "forgot-password", email=email)
     assert response.status_code == 200, response.text
     return emailed_code(harness, email)
+
+
+@pytest.mark.asyncio
+async def test_reset_requires_a_verified_one_use_token(harness: Harness) -> None:
+    async with harness.client() as owner, harness.client() as client:
+        await login(harness, owner, uid="owner", email=EMAIL)
+        await login(harness, client, uid="other", email="other@example.com")
+        original = await user_row(harness, EMAIL)
+        code = await forgot(harness, client)
+        # The previous API contract cannot skip the new verification step.
+        bypass = await post(
+            client, "reset-password", email=EMAIL, code=code, new_password=NEW_PASSWORD
+        )
+        assert bypass.status_code == 422
+        verified = await post(client, "verify-reset-password", email=EMAIL.upper(), code=code)
+        assert verified.status_code == 200, verified.text
+        assert "set-cookie" not in verified.headers
+        grant = verified.json()["data"]
+        token = grant["reset_token"]
+        assert grant["expires_in_seconds"] == 600
+        assert (await user_row(harness, EMAIL)).password_hash == original.password_hash
+        assert (await owner.get(f"{AUTH}/me")).status_code == 200
+        assert harness.emails.sent == []
+        assert invalid(await post(client, "verify-reset-password", email=EMAIL, code=code))
+        async with harness.factory() as db:
+            row = await db.scalar(
+                select(EmailOtp).where(
+                    EmailOtp.user_id == original.id, EmailOtp.purpose == "reset_password"
+                )
+            )
+        assert row.code_digest is None
+        assert row.reset_token_digest == token_digest(token)
+        for email, candidate in (
+            (EMAIL, "x" * 64),
+            (EMAIL, code.ljust(64, "0")),
+            ("other@example.com", token),
+            ("missing@example.com", token),
+        ):
+            denied = await post(
+                client,
+                "reset-password",
+                email=email,
+                reset_token=candidate,
+                new_password=NEW_PASSWORD,
+            )
+            assert denied.status_code == 400
+            assert denied.json()["error"]["code"] == "RESET_TOKEN_INVALID"
+        # Validation failures do not consume the grant.
+        bad_password = await post(
+            client, "reset-password", email=EMAIL, reset_token=token, new_password="short"
+        )
+        assert bad_password.status_code == 422
+        for expected in (200, 400):
+            done = await post(
+                client,
+                "reset-password",
+                email=EMAIL.upper(),
+                reset_token=token,
+                new_password=NEW_PASSWORD,
+            )
+            assert done.status_code == expected, done.text
+            if expected == 400:
+                assert done.json()["error"]["code"] == "RESET_TOKEN_INVALID"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["expired", "resend", "suspended"])
+async def test_reset_grants_expire_and_can_be_invalidated(harness: Harness, reason: str) -> None:
+    async with harness.client() as client:
+        await login(harness, client, uid="owner", email=EMAIL)
+        code = await forgot(harness, client)
+        grant = await post(client, "verify-reset-password", email=EMAIL, code=code)
+        token = grant.json()["data"]["reset_token"]
+        if reason == "resend":
+            harness.settings.otp_resend_cooldown_seconds = 0
+            new_code = await forgot(harness, client)
+        else:
+            async with harness.factory() as db:
+                if reason == "expired":
+                    await db.execute(
+                        update(EmailOtp).values(
+                            reset_token_expires_at=datetime.now(UTC) - timedelta(seconds=1)
+                        )
+                    )
+                else:
+                    await db.execute(update(User).values(status=UserStatus.SUSPENDED))
+                await db.commit()
+        denied = await post(
+            client, "reset-password", email=EMAIL, reset_token=token, new_password=NEW_PASSWORD
+        )
+        assert denied.status_code == 400
+        assert denied.json()["error"]["code"] == "RESET_TOKEN_INVALID"
+        assert harness.emails.sent == []
+        if reason == "resend":
+            assert (await reset(client, new_code)).status_code == 200
 
 
 @pytest.mark.asyncio
@@ -123,10 +230,16 @@ async def test_wrong_reset_codes_are_counted_and_lock_the_account(harness: Harne
             await db.execute(update(EmailOtp).values(expires_at=row.sent_at))
             await db.commit()
         assert invalid(await reset(client, code))
-        too_guessable = await reset(client, code, new_password="owner")
+        too_guessable = await post(
+            client, "reset-password", email=EMAIL, reset_token="x" * 64, new_password="owner"
+        )
         assert too_guessable.status_code == 422
-        refused = await reset(
-            client, code, email="Longer.Name@example.com", new_password="longer.name"
+        refused = await post(
+            client,
+            "reset-password",
+            email="Longer.Name@example.com",
+            reset_token="x" * 64,
+            new_password="longer.name",
         )
         assert refused.status_code == 400
         assert refused.json()["error"]["code"] == "PASSWORD_UNCHANGED"
@@ -194,6 +307,8 @@ async def test_the_notice_goes_only_after_the_password_is_stored(
         session = await login(harness, client, uid="owner", email=EMAIL)
         code = await forgot(harness, client)
 
+        verified = await post(client, "verify-reset-password", email=EMAIL, code=code)
+        token = verified.json()["data"]["reset_token"]
         order: list[str] = []
         commit = AsyncSession.commit
 
@@ -224,5 +339,8 @@ async def test_the_notice_goes_only_after_the_password_is_stored(
         assert changed.status_code == 200, changed.text
         assert order[:2] == ["commit", NOTICE] and order.count(NOTICE) == 1
         del order[:]
-        assert (await reset(client, code)).status_code == 200
+        done = await post(
+            client, "reset-password", email=EMAIL, reset_token=token, new_password=NEW_PASSWORD
+        )
+        assert done.status_code == 200, done.text
         assert order[:2] == ["commit", NOTICE] and order.count(NOTICE) == 1

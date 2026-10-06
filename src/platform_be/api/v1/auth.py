@@ -44,7 +44,14 @@ from platform_be.services.avatars import (
 )
 from platform_be.services.email_sender import EmailSender, get_email_sender
 from platform_be.services.file_store import FileStore, get_file_store
-from platform_be.services.one_time_codes import OtpPurpose, check_code, clear_code, issue_code
+from platform_be.services.one_time_codes import (
+    OtpPurpose,
+    check_code,
+    clear_code,
+    consume_reset_token,
+    issue_code,
+    verify_reset_code,
+)
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 
@@ -129,10 +136,20 @@ class VerifyEmailRequest(BaseModel):
     )
 
 
-class ResetPasswordRequest(BaseModel):
+class VerifyResetPasswordRequest(BaseModel):
     email: EmailStr
     code: str = Code
+
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    reset_token: str = Field(min_length=64, max_length=64)
     new_password: str = Password
+
+
+class PasswordResetGrant(BaseModel):
+    reset_token: str = Field(description="One-use token for reset-password, bound to this email.")
+    expires_in_seconds: int
 
 
 class VerificationPending(BaseModel):
@@ -507,7 +524,7 @@ async def resend_verification(
     summary="Email a code to set a new password",
     description=(
         "Always answers the same, whether or not the address has an account. An active "
-        "account gets a 6-digit code for `reset-password`, with the same limits as a "
+        "account gets a 6-digit code for `verify-reset-password`, with the same limits as a "
         "verification code."
     ),
     responses={key: CODE_ERRORS[key] for key in (403, 413, 429)},
@@ -534,12 +551,48 @@ async def forgot_password(
 
 
 @router.post(
+    "/verify-reset-password",
+    response_model=ApiResponse[PasswordResetGrant],
+    summary="Verify the reset OTP and obtain a one-use reset token",
+    description=(
+        "Consumes the emailed code and returns a reset_token for reset-password. "
+        "The token expires after OTP_TTL_MINUTES and cannot sign in or change the "
+        "password by itself. Passwords, email verification and sessions stay as they are."
+    ),
+    responses=CODE_ERRORS,
+)
+async def verify_reset_password(
+    body: VerifyResetPasswordRequest,
+    request: Request,
+    _: None = Depends(require_origin),
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[PasswordResetGrant]:
+    settings: Settings = request.app.state.settings
+    user = await _find_user(db, body.email)
+    if user is None:
+        raise _invalid_code()
+    user = await lock_user(db, user.id)
+    if user.status == UserStatus.SUSPENDED:
+        raise _invalid_code()
+    token = await verify_reset_code(db, settings, user, body.code)
+    if token is None:
+        await _fail_after_commit(db, _invalid_code())
+    await db.commit()
+    return ok(
+        PasswordResetGrant(reset_token=token, expires_in_seconds=settings.otp_ttl_minutes * 60),
+        "Code verified; set a new password with the reset token",
+    )
+
+
+@router.post(
     "/reset-password",
     response_model=ApiResponse[None],
-    summary="Set a new password with the emailed code",
+    summary="Set a new password after reset OTP verification",
     description=(
         "Sets the password, signs the user out everywhere and does not sign in: the user "
-        "then signs in with `login`. The code proves the inbox, so it also verifies an "
+        "then signs in with `login`. Requires the one-use reset_token returned by "
+        "`verify-reset-password`. A newly issued reset code invalidates earlier tokens. "
+        "The verified OTP proves the inbox, so it also verifies an "
         "email that was not verified yet and ends a temporary password."
     ),
     responses={
@@ -547,7 +600,8 @@ async def forgot_password(
         400: {
             "model": ErrorResponse,
             "description": (
-                "`OTP_INVALID` as on `verify-email`, or `PASSWORD_UNCHANGED` when the new "
+                "`RESET_TOKEN_INVALID` for a wrong, expired, used token or unavailable account; "
+                "or `PASSWORD_UNCHANGED` when the new "
                 "password is the part of the email before the @"
             ),
         },
@@ -569,13 +623,16 @@ async def reset_password(
         hash_password, body.new_password, settings.password_scrypt_log2_n
     )
     user = await _find_user(db, body.email)
+    invalid_token = APIError(
+        400, "RESET_TOKEN_INVALID", "The reset token is invalid or has expired"
+    )
     if user is None:
-        raise _invalid_code()
+        raise invalid_token
     user = await lock_user(db, user.id)
     if user.status == UserStatus.SUSPENDED:
-        raise _invalid_code()
-    if not await check_code(db, settings, user, OtpPurpose.RESET_PASSWORD, body.code):
-        await _fail_after_commit(db, _invalid_code())
+        raise invalid_token
+    if not await consume_reset_token(db, user, body.reset_token):
+        raise invalid_token
     now = datetime.now(UTC)
     user.password_hash = password_hash
     user.must_change_password = False

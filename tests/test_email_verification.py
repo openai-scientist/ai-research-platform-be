@@ -242,7 +242,13 @@ async def test_resend_answers_the_same_for_every_address(harness: Harness) -> No
 @pytest.mark.asyncio
 async def test_code_endpoints_need_an_allowed_origin(harness: Harness) -> None:
     async with harness.client() as client:
-        for name in ("verify-email", "resend-verification", "forgot-password", "reset-password"):
+        for name in (
+            "verify-email",
+            "resend-verification",
+            "forgot-password",
+            "verify-reset-password",
+            "reset-password",
+        ):
             for headers in ({}, {"Origin": "https://evil.example"}):
                 refused = await client.post(
                     f"{AUTH}/{name}",
@@ -264,7 +270,13 @@ async def test_code_endpoints_share_a_limit_of_their_own(harness: Harness) -> No
     async with harness.client() as client:
         assert (await post(client, "resend-verification", email=EMAIL)).status_code == 200
         assert (await post(client, "forgot-password", email=EMAIL)).status_code == 200
-        for name in ("verify-email", "resend-verification", "forgot-password", "reset-password"):
+        for name in (
+            "verify-email",
+            "resend-verification",
+            "forgot-password",
+            "verify-reset-password",
+            "reset-password",
+        ):
             limited = await post(client, name, email=EMAIL)
             assert limited.status_code == 429, name
             assert int(limited.headers["retry-after"]) >= 1

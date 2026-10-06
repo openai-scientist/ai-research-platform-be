@@ -544,8 +544,16 @@ async def test_a_reset_outlasts_a_sign_in_or_a_change_racing_it(
         await post(client, "forgot-password", email=email)
         return emailed_code(harness, email)
 
-    def reset(client, email: str, code: str):
-        return post(client, "reset-password", email=email, code=code, new_password=new)
+    async def reset(client, email: str, code: str):
+        verified = await post(client, "verify-reset-password", email=email, code=code)
+        assert verified.status_code == 200, verified.text
+        return await post(
+            client,
+            "reset-password",
+            email=email,
+            reset_token=verified.json()["data"]["reset_token"],
+            new_password=new,
+        )
 
     async with harness.client() as owner, harness.client() as other, harness.client() as thief:
         for attempt in range(6):

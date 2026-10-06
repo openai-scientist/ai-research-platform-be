@@ -33,6 +33,7 @@ class RequestProtectionMiddleware:
                         "verify-email",
                         "resend-verification",
                         "forgot-password",
+                        "verify-reset-password",
                         "reset-password",
                     )
                 ),

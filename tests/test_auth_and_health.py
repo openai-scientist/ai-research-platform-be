@@ -34,6 +34,7 @@ async def test_health_probes_and_openapi(harness: Harness) -> None:
         "/api/v1/auth/resend-verification",
         "/api/v1/auth/forgot-password",
         "/api/v1/auth/reset-password",
+        "/api/v1/auth/verify-reset-password",
         "/api/v1/auth/change-password",
         "/api/v1/auth/logout",
         "/api/v1/auth/logout-all",
@@ -47,6 +48,7 @@ async def test_health_probes_and_openapi(harness: Harness) -> None:
     assert {"201", "403", "409", "413", "422", "429"}.issubset(register_responses)
     for name, expected in (
         ("verify-email", {"200", "400", "403", "413", "422", "429"}),
+        ("verify-reset-password", {"200", "400", "403", "413", "422", "429"}),
         ("reset-password", {"200", "400", "403", "413", "422", "429"}),
         ("resend-verification", {"200", "403", "413", "422", "429"}),
         ("forgot-password", {"200", "403", "413", "422", "429"}),

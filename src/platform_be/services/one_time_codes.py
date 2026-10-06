@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_be.auth.sessions import as_utc
 from platform_be.core.config import Settings
-from platform_be.core.security import new_otp_code, otp_digest
+from platform_be.core.security import new_otp_code, new_session_secret, otp_digest, token_digest
 from platform_be.models.identity import EmailOtp, User
 
 SEND_WINDOW = timedelta(hours=1)
@@ -78,6 +78,8 @@ async def issue_code(
             return None
     code = new_otp_code()
     row.code_digest = _digest(settings, user, purpose, code)
+    row.reset_token_digest = None
+    row.reset_token_expires_at = None
     row.expires_at = now + timedelta(minutes=settings.otp_ttl_minutes)
     row.attempts = 0
     row.sent_at = now
@@ -126,6 +128,37 @@ async def clear_code(db: AsyncSession, user: User, purpose: OtpPurpose) -> None:
     await db.execute(
         update(EmailOtp)
         .where(EmailOtp.user_id == user.id, EmailOtp.purpose == purpose)
-        .values(code_digest=None)
+        .values(code_digest=None, reset_token_digest=None, reset_token_expires_at=None)
         .execution_options(synchronize_session=False)
     )
+
+
+async def verify_reset_code(
+    db: AsyncSession, settings: Settings, user: User, code: str
+) -> str | None:
+    """Consume the OTP and grant a short-lived, one-use password reset token."""
+    if not await check_code(db, settings, user, OtpPurpose.RESET_PASSWORD, code):
+        return None
+    row = await _locked_row(db, user, OtpPurpose.RESET_PASSWORD)
+    token = new_session_secret()
+    row.reset_token_digest = token_digest(token)
+    row.reset_token_expires_at = datetime.now(UTC) + timedelta(minutes=settings.otp_ttl_minutes)
+    await db.flush()
+    return token
+
+
+async def consume_reset_token(db: AsyncSession, user: User, token: str) -> bool:
+    """Consume a verified reset grant while the caller holds the user lock."""
+    row = await _locked_row(db, user, OtpPurpose.RESET_PASSWORD)
+    if (
+        row is None
+        or row.reset_token_digest is None
+        or row.reset_token_expires_at is None
+        or as_utc(row.reset_token_expires_at) <= datetime.now(UTC)
+        or not hmac.compare_digest(row.reset_token_digest, token_digest(token))
+    ):
+        return False
+    row.reset_token_digest = None
+    row.reset_token_expires_at = None
+    await db.flush()
+    return True
