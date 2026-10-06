@@ -329,6 +329,11 @@ async def test_what_went_wrong_is_told_apart_by_code_and_reason(harness: Harness
         rejected = await preview(client, session, url, {"type": "query", "sql": "SELECT nope"})
         assert failure(rejected) == (422, "SOURCE_INVALID", "query_failed")
         assert rejected.json()["message"] == said
+
+        # So is a query BigQuery would bill too much for.
+        harness.connectors.fail_with = ConnectorError("scan_limit_exceeded")
+        too_much = await preview(client, session, url, {"type": "query", "sql": "SELECT *"})
+        assert failure(too_much) == (422, "SOURCE_INVALID", "scan_limit_exceeded")
         harness.connectors.fail_with = None
 
         # A failure part-way through the rows fails the preview: no partial result is shown.

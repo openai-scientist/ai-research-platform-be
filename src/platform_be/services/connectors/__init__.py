@@ -6,6 +6,7 @@ from fastapi import Request
 
 from platform_be.core.config import Settings
 from platform_be.services.connectors.base import Connector, ConnectorError
+from platform_be.services.connectors.bigquery import BigQueryConnector
 from platform_be.services.connectors.mysql import MysqlConnector
 from platform_be.services.connectors.network_guard import (
     Resolver,
@@ -41,6 +42,16 @@ class _DefaultConnectorFactory:
     async def __call__(
         self, kind: str, config: dict[str, Any], secret: dict[str, Any]
     ) -> Connector:
+        if kind == "bigquery":
+            # No host to check: the connector only ever talks to Google's own endpoints.
+            return BigQueryConnector(
+                config,
+                secret,
+                executor=self._executor,
+                connect_timeout=self._settings.connection_connect_timeout_seconds,
+                query_timeout=self._settings.connection_query_timeout_seconds,
+                max_bytes_billed=self._settings.connection_bigquery_max_bytes_billed,
+            )
         try:
             async with asyncio.timeout(self._settings.connection_connect_timeout_seconds):
                 host = await resolve_public_host(

@@ -607,3 +607,164 @@ async def test_the_real_factory_guards_and_builds_a_mysql_connection(harness: Ha
     assert harness.app.state.connector_executor._max_workers == (
         harness.settings.connection_max_concurrent_queries
     )
+
+
+PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq-secret\n-----END PRIVATE KEY-----\n"
+
+
+def key_file(**changes: object) -> str:
+    data = {
+        "type": "service_account",
+        "project_id": "acme-data",
+        "private_key_id": "abc123",
+        "private_key": PRIVATE_KEY,
+        "client_email": "reader@acme-data.iam.gserviceaccount.com",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        **changes,
+    }
+    return json.dumps({key: value for key, value in data.items() if value is not None})
+
+
+def bigquery_body(name: str = "Warehouse", config: dict | None = None, **changes: object) -> dict:
+    body = {
+        "name": name,
+        "kind": "bigquery",
+        "secret": {"service_account_json": key_file(**changes)},
+    }
+    return body if config is None else {**body, "config": config}
+
+
+@pytest.mark.asyncio
+async def test_a_bigquery_connection_keeps_its_key_file_to_itself(harness: Harness) -> None:
+    async with harness.client() as client:
+        session = await login(harness, client, uid="owner", email="owner@example.com")
+        project = await create_project(client, session)
+        base = f"{PROJECTS}/{project['id']}/connections"
+        headers = mutation_headers(session["csrf_token"])
+
+        response = await client.post(base, json=bigquery_body(), headers=headers)
+        assert response.status_code == 201, response.text
+        created = response.json()["data"]
+        assert created["kind"] == "bigquery"
+        # The project is the one of the service account unless another is named.
+        assert created["config"] == {"project_id": "acme-data", "location": None}
+        built = harness.connectors.built[-1]
+        assert built["kind"] == "bigquery"
+        assert built["config"] == created["config"]
+        assert json.loads(built["secret"]["service_account_json"])["private_key"] == PRIVATE_KEY
+        url = f"{base}/{created['id']}"
+
+        other = bigquery_body("Billing", {"project_id": "acme-billing", "location": "EU"})
+        billed = await client.post(base, json=other, headers=headers)
+        assert billed.status_code == 201, billed.text
+        assert billed.json()["data"]["config"] == {"project_id": "acme-billing", "location": "EU"}
+
+        harness.connectors.fail_with = ConnectorError("auth_failed")
+        tested = await client.post(f"{url}/test", headers=headers)
+        assert tested.json()["data"]["last_error_code"] == "auth_failed"
+        refused = await client.post(base, json=bigquery_body("Third"), headers=headers)
+        assert refused.status_code == 422
+        assert refused.json()["error"]["reason"] == "auth_failed"
+        harness.connectors.fail_with = None
+
+        # Only the name can change here too.
+        for patch in (
+            {"name": "Other", "config": {"project_id": "someone-elses"}},
+            {"name": "Other", "secret": {"service_account_json": key_file()}},
+        ):
+            assert (await client.patch(url, json=patch, headers=headers)).status_code == 422
+        renamed = await client.patch(url, json={"name": "Main"}, headers=headers)
+        assert renamed.json()["data"]["config"] == created["config"]
+
+        listed = await client.get(base)
+        answers = [response, billed, tested, refused, renamed, listed, await client.get(url)]
+        for answer in answers:
+            assert "PRIVATE KEY" not in answer.text
+            assert "MIIEvQIBADANBgkq" not in answer.text
+            assert "service_account_json" not in answer.text
+
+    async with harness.factory() as db:
+        row = await db.scalar(select(DataConnection).where(DataConnection.name == "Main"))
+        assert "MIIEvQIBADANBgkq" not in row.secret_ciphertext
+        stored = SecretBox(CONNECTION_KEY).open(row.secret_ciphertext)
+        assert json.loads(stored["service_account_json"])["private_key"] == PRIVATE_KEY
+        events = list(await db.scalars(select(AuditEvent)))
+    assert "MIIEvQIBADANBgkq" not in json.dumps([event.details for event in events])
+    details = {
+        event.action: event.details for event in events if str(event.resource_id) == str(row.id)
+    }
+    assert details["connection.created"] == {
+        "name": "Warehouse",
+        "kind": "bigquery",
+        "project_id": "acme-data",
+    }
+    assert details["connection.test_failed"] == {
+        "kind": "bigquery",
+        "project_id": "acme-data",
+        "reason": "auth_failed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_bigquery_body_is_checked_before_anything_is_tried(harness: Harness) -> None:
+    async with harness.client() as client:
+        session = await login(harness, client, uid="owner", email="owner@example.com")
+        project = await create_project(client, session)
+        base = f"{PROJECTS}/{project['id']}/connections"
+        headers = mutation_headers(session["csrf_token"])
+
+        key = "body.bigquery.secret.service_account_json"
+        bad_bodies = [
+            ({"name": "Bad", "kind": "bigquery"}, "body.bigquery.secret"),
+            ({"name": "Bad", "kind": "bigquery", "secret": {}}, key),
+            ({"name": "Bad", "kind": "bigquery", "secret": {"service_account_json": "{"}}, key),
+            (bigquery_body("Bad", type="authorized_user"), key),
+            (bigquery_body("Bad", private_key=None), key),
+            (bigquery_body("Bad", client_email=None), key),
+            (bigquery_body("Bad", project_id=None), key),
+            (bigquery_body("Bad", universe_domain="example.com"), key),
+            (bigquery_body("Bad", padding="x" * 16384), key),
+            (bigquery_body("Bad", {"project_id": "Not A Project"}), "config.project_id"),
+            (bigquery_body("Bad", {"project_id": "acme`data"}), "config.project_id"),
+            (bigquery_body("Bad", {"location": "EU; DROP"}), "config.location"),
+            (bigquery_body("Bad", {"api_endpoint": "http://10.0.0.5"}), "config.api_endpoint"),
+            (bigquery_body("Bad", {"host": "db.example.com"}), "config.host"),
+            (
+                {**bigquery_body("Bad"), "token_uri": "http://169.254.169.254/token"},
+                "body.bigquery.token_uri",
+            ),
+        ]
+        for body, field in bad_bodies:
+            refused = await client.post(base, json=body, headers=headers)
+            assert refused.status_code == 422, body
+            assert refused.json()["error"]["code"] == "VALIDATION_ERROR"
+            # Refused for what is wrong with it, and for nothing else.
+            fields = [issue["field"] for issue in refused.json()["error"]["details"]]
+            assert len(fields) == 1 and fields[0].endswith(field), (body, fields)
+            # Whatever was wrong with the file, none of it is sent back.
+            assert "PRIVATE KEY" not in refused.text
+            assert "MIIEvQIBADANBgkq" not in refused.text
+        assert harness.connectors.tests_started == 0
+        assert (await client.get(base)).json()["data"] == []
+
+        # A token address in the file is not an error: it is simply never used.
+        elsewhere = bigquery_body("Fine", token_uri="http://169.254.169.254/token")
+        accepted = await client.post(base, json=elsewhere, headers=headers)
+        assert accepted.status_code == 201, accepted.text
+
+
+@pytest.mark.asyncio
+async def test_the_real_factory_builds_a_bigquery_connection_without_a_host(
+    harness: Harness,
+) -> None:
+    async def resolver(host: str, port: int) -> list[str]:
+        raise AssertionError("BigQuery has no host to look up")
+
+    factory = build_connector_factory(harness.settings, resolver)
+    connector = await factory(
+        "bigquery", {"project_id": "acme-data", "location": None}, {"service_account_json": "{}"}
+    )
+
+    assert type(connector).__name__ == "BigQueryConnector"
+    assert connector._max_bytes_billed == harness.settings.connection_bigquery_max_bytes_billed
+    assert harness.settings.connection_bigquery_max_bytes_billed == 1024**3

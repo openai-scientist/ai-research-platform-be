@@ -9,7 +9,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Query, Request
-from pydantic import BaseModel, Field, StringConstraints, field_validator
+from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,6 +32,12 @@ from platform_be.services.connectors import (
     get_connector_factory,
 )
 from platform_be.services.connectors.base import Identifier, QuerySource, Source, TableSource
+from platform_be.services.connectors.bigquery import (
+    LOCATION_PATTERN,
+    PROJECT_ID_PATTERN,
+    SERVICE_ACCOUNT_MAX_CHARS,
+    parse_service_account,
+)
 from platform_be.services.connectors.gate import ConnectionGate, get_connection_gate
 from platform_be.services.connectors.network_guard import is_host
 from platform_be.services.connectors.values import approximate_size, to_text
@@ -127,8 +133,51 @@ class CreateMysqlConnection(BaseModel, extra="forbid"):
     secret: PasswordSecret
 
 
+class BigQueryConfig(BaseModel, extra="forbid"):
+    project_id: Annotated[str, StringConstraints(pattern=PROJECT_ID_PATTERN)] | None = Field(
+        default=None,
+        description=(
+            "The project whose datasets are browsed and which is billed for queries. "
+            "Left out, it is the project of the service account."
+        ),
+    )
+    location: Annotated[str, StringConstraints(pattern=LOCATION_PATTERN)] | None = Field(
+        default=None,
+        description="Where queries run, such as `US` or `asia-southeast1`. Usually not needed.",
+    )
+
+
+class ServiceAccountSecret(BaseModel, extra="forbid"):
+    service_account_json: Annotated[
+        str, StringConstraints(min_length=1, max_length=SERVICE_ACCOUNT_MAX_CHARS)
+    ] = Field(description="The content of the JSON key file of a Google service account.")
+
+    @field_validator("service_account_json")
+    @classmethod
+    def validate_key_file(cls, value: str) -> str:
+        parse_service_account(value)
+        return value
+
+
+class CreateBigQueryConnection(BaseModel, extra="forbid"):
+    """BigQuery, as a service account. A dataset is what the other kinds call a schema."""
+
+    name: ConnectionName
+    kind: Literal["bigquery"]
+    config: BigQueryConfig = Field(default_factory=BigQueryConfig)
+    secret: ServiceAccountSecret
+
+    @model_validator(mode="after")
+    def default_project(self) -> "CreateBigQueryConnection":
+        if self.config.project_id is None:
+            account = parse_service_account(self.secret.service_account_json)
+            self.config.project_id = account["project_id"]
+        return self
+
+
 CreateConnection = Annotated[
-    CreatePostgresConnection | CreateMysqlConnection, Field(discriminator="kind")
+    CreatePostgresConnection | CreateMysqlConnection | CreateBigQueryConnection,
+    Field(discriminator="kind"),
 ]
 
 
@@ -168,7 +217,9 @@ class TableItem(BaseModel):
     schema_name: str = Field(serialization_alias="schema")
     name: str
     type: Literal["table", "view"]
-    column_count: int
+    column_count: int | None = Field(
+        description="Null for BigQuery, which lists tables without their columns."
+    )
 
 
 class ColumnItem(BaseModel):
@@ -296,7 +347,12 @@ async def reading(
 
 
 def _read_failed(error: ConnectorError) -> APIError:
-    about_source = error.reason in ("source_not_found", "query_failed", "query_timeout")
+    about_source = error.reason in (
+        "source_not_found",
+        "query_failed",
+        "query_timeout",
+        "scan_limit_exceeded",
+    )
     code = "SOURCE_INVALID" if about_source else "CONNECTION_FAILED"
     return APIError(422, code, error.message, reason=error.reason)
 
@@ -347,6 +403,13 @@ async def _probe(
     return None
 
 
+def _audit_target(config: dict[str, Any]) -> dict[str, Any]:
+    """Where a connection points, for an audit event: a server, or a BigQuery project."""
+    if "host" in config:
+        return {"host": config["host"], "port": config["port"]}
+    return {"project_id": config["project_id"]}
+
+
 def _audit_failed_test(
     db: AsyncSession,
     request: Request,
@@ -365,12 +428,7 @@ def _audit_failed_test(
         resource_id=connection_id,
         project_id=project_id,
         request_id=getattr(request.state, "request_id", None),
-        details={
-            "kind": kind,
-            "host": config["host"],
-            "port": config["port"],
-            "reason": error.reason,
-        },
+        details={"kind": kind, **_audit_target(config), "reason": error.reason},
     )
 
 
@@ -417,7 +475,8 @@ async def list_connections(
         "Connects once to check the details; nothing is saved when that fails (422 "
         "`CONNECTION_FAILED`, with `error.reason`). Project Manager or Researcher only. "
         "Use a read-only database user: every member who can contribute can run queries "
-        "with it."
+        "with it. For `bigquery`, a service account with the roles BigQuery Job User and "
+        "BigQuery Data Viewer; queries are billed to its project."
     ),
     responses={
         **PROBE_ERRORS,
@@ -481,7 +540,11 @@ async def create_connection(
         resource_id=connection_id,
         project_id=project_id,
         request_id=request_id,
-        details={"name": body.name, "kind": body.kind, "host": config["host"]},
+        details={
+            "name": body.name,
+            "kind": body.kind,
+            **{key: value for key, value in _audit_target(config).items() if key != "port"},
+        },
     )
     await db.flush()
     return ok(_item(row), "Connection created")
@@ -756,7 +819,9 @@ async def list_columns(
         "Runs live inside a read-only transaction and returns the first rows; nothing is "
         "stored. One statement per call. When the database rejects a query, its own message "
         "is returned (422 `SOURCE_INVALID`, reason `query_failed`). Every preview is audited, "
-        "with a hash of the SQL rather than its text."
+        "with a hash of the SQL rather than its text. On BigQuery a table is read without a "
+        "query, at no cost; a query is checked first, and one that would scan more than the "
+        "server allows is refused (reason `scan_limit_exceeded`)."
     ),
     responses=READ_ERRORS,
 )

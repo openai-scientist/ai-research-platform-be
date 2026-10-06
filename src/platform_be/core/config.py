@@ -95,6 +95,9 @@ class Settings(BaseSettings):
     # Reads through a saved connection (browsing, previews) one user may start per window.
     connection_query_rate_limit: int = Field(default=120, ge=1, le=10000)
     connection_preview_max_rows: int = Field(default=100, ge=1, le=1000)
+    # The most one BigQuery query may scan, and so be billed for, in bytes. BigQuery bills at
+    # least 10 MiB for each table a query reads, so a lower limit would refuse every query.
+    connection_bigquery_max_bytes_billed: int = Field(default=1024**3, ge=10 * 1024**2)
 
     @field_validator("cors_allowed_origins")
     @classmethod
