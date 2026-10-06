@@ -18,6 +18,7 @@ REASON_MESSAGES = {
     "source_not_found": "The table does not exist or this database user cannot read it",
     "query_failed": "The database rejected the query",
     "query_timeout": "The query did not finish in time",
+    "scan_limit_exceeded": "The query would scan more data than this server allows",
 }
 
 # A NUL byte is not valid in a PostgreSQL parameter and would make the driver raise.
@@ -60,7 +61,8 @@ class TableRef:
     schema: str
     name: str
     type: Literal["table", "view"]
-    column_count: int
+    # None when the source lists its tables without saying.
+    column_count: int | None
 
 
 @dataclass(frozen=True)
