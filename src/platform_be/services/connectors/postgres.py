@@ -17,6 +17,7 @@ from platform_be.services.connectors.base import (
     TableSource,
 )
 from platform_be.services.connectors.network_guard import ResolvedHost
+from platform_be.services.connectors.tls import build_ssl_context
 from platform_be.services.connectors.values import approximate_size
 
 logger = logging.getLogger("platform_be.connectors")
@@ -63,42 +64,6 @@ _DATABASE_MESSAGE_LIMIT = 500
 # The driver decodes a batch of rows whole, so the wider the rows, the fewer are asked for.
 _BATCH_ROWS = 100
 _BATCH_SIZE = 4 * 1024 * 1024
-
-
-class _PinnedHostnameContext(ssl.SSLContext):
-    """Verifies the certificate against the original hostname while the socket dials an IP.
-
-    asyncpg uses its `host` argument for both the TCP address and the TLS server name. The
-    connection has to go to the IP the network guard checked, so the name is swapped in here.
-    """
-
-    server_name: str | None = None
-
-    def wrap_bio(self, incoming, outgoing, server_side=False, server_hostname=None, session=None):
-        return super().wrap_bio(
-            incoming,
-            outgoing,
-            server_side=server_side,
-            server_hostname=self.server_name or server_hostname,
-            session=session,
-        )
-
-
-def build_ssl_context(mode: str, hostname: str) -> ssl.SSLContext | bool:
-    """`disable` is plain TCP, `require` encrypts without checking the certificate, and
-    `verify-full` also checks it against the system CAs and the host name."""
-    if mode == "disable":
-        return False
-    context = _PinnedHostnameContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    # Sent as SNI in both modes: some hosted databases route on it.
-    context.server_name = hostname
-    if mode == "verify-full":
-        context.load_default_certs()
-    else:
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-    return context
 
 
 def map_error(exc: BaseException) -> ConnectorError:
