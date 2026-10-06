@@ -21,6 +21,9 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     restart: unless-stopped
+    # A read from an external database can return a value of up to 1 GB. With a limit, only
+    # this container is stopped and restarted; without one the whole host runs out of memory.
+    mem_limit: ${API_MEMORY_LIMIT:-1g}
     stop_grace_period: 40s
     environment:
       APP_ENV: production
