@@ -142,6 +142,7 @@ def create_app(
             exc.message,
             request_id_of(request),
             headers={"Retry-After": str(exc.retry_after)} if exc.retry_after else None,
+            reason=exc.reason,
         )
         if exc.clear_session_cookie:
             clear_session_cookie(response, settings)

@@ -10,6 +10,8 @@ class APIError(Exception):
     clear_session_cookie: bool = False
     # Seconds the caller should wait; sent as the Retry-After header.
     retry_after: int | None = None
+    # Stable machine-readable cause, sent as error.reason when a client can act on it.
+    reason: str | None = None
 
     def __str__(self) -> str:
         return self.message
