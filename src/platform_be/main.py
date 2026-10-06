@@ -20,7 +20,7 @@ from platform_be.core.logging import configure_logging
 from platform_be.core.middleware import RequestProtectionMiddleware
 from platform_be.core.responses import error_response, request_id_context
 from platform_be.db.session import get_db
-from platform_be.services.connectors import build_connector_factory
+from platform_be.services.connectors import build_connector_executor, build_connector_factory
 from platform_be.services.connectors.gate import ConnectionGate
 from platform_be.services.default_admin import ensure_default_admin
 from platform_be.services.email_sender import build_email_sender
@@ -51,6 +51,7 @@ def create_app(
     )
     notification_hub = NotificationHub(app_engine)
     invite_candidates_hub = InviteCandidatesHub(app_engine)
+    connector_executor = build_connector_executor(settings)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -64,6 +65,8 @@ def create_app(
                 try:
                     await invite_candidates_hub.close()
                 finally:
+                    # Not waited for: a thread may be held by a server that never answers.
+                    connector_executor.shutdown(wait=False, cancel_futures=True)
                     if owned_engine:
                         await app_engine.dispose()
 
@@ -91,7 +94,8 @@ def create_app(
         if settings.connection_secret_key
         else None
     )
-    app.state.connector_factory = build_connector_factory(settings)
+    app.state.connector_executor = connector_executor
+    app.state.connector_factory = build_connector_factory(settings, executor=connector_executor)
     app.state.connection_gate = ConnectionGate(
         max_concurrent=settings.connection_max_concurrent_queries,
         max_per_project=settings.connection_max_concurrent_per_owner,
