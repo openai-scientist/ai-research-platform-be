@@ -208,23 +208,26 @@ async def test_only_the_name_can_change_and_bodies_are_strict(harness: Harness) 
 
         attempts_before = harness.connectors.tests_started
         bad_bodies = [
-            {**connection_body(name="B"), "kind": "oracle"},
-            {**connection_body(name="B"), "dsn": "postgresql://u:p@h/d"},
-            connection_body(name="B", port=0),
-            connection_body(name="B", port=70000),
-            connection_body(name="B", ssl="prefer"),
-            connection_body(name="B", host=""),
-            connection_body(name="B", host="/var/run/postgresql"),
-            connection_body(name="B", host="db.example.com:5432"),
-            connection_body(name="B\x00", host="db.example.com"),
-            connection_body(name="B", database="a\x00b"),
-            connection_body(name="B", sslrootcert="/etc/passwd"),
-            {**connection_body(name="B"), "secret": {"password": SECRET, "token": "x"}},
+            {**connection_body(name="Bad"), "kind": "oracle"},
+            {**connection_body(name="Bad"), "dsn": "postgresql://u:p@h/d"},
+            connection_body(name="Bad", port=0),
+            connection_body(name="Bad", port=70000),
+            connection_body(name="Bad", ssl="prefer"),
+            connection_body(name="Bad", host=""),
+            connection_body(name="Bad", host="/var/run/postgresql"),
+            connection_body(name="Bad", host="db.example.com:5432"),
+            connection_body(name="Bad\x00", host="db.example.com"),
+            connection_body(name="Bad", database="a\x00b"),
+            connection_body(name="Bad", sslrootcert="/etc/passwd"),
+            {**connection_body(name="Bad"), "secret": {"password": SECRET, "token": "x"}},
         ]
         for body in bad_bodies:
             refused = await client.post(base, json=body, headers=headers)
             assert refused.status_code == 422, body
             assert refused.json()["error"]["code"] == "VALIDATION_ERROR"
+            # Refused for what is wrong with it, not for its name.
+            fields = [issue["field"] for issue in refused.json()["error"]["details"]]
+            assert "\x00" in body["name"] or not any(f.endswith(".name") for f in fields), body
         assert harness.connectors.tests_started == attempts_before
 
 
@@ -568,19 +571,21 @@ async def test_a_mysql_connection_is_created_with_its_own_defaults(harness: Harn
         assert harness.connectors.built[-1]["secret"] == {"password": ""}
 
         attempts_before = harness.connectors.tests_started
-        without_database = {**body, "name": "B", "config": {"host": "h.example.com"}}
+        without_database = {**body, "name": "Bad", "config": {"host": "h.example.com"}}
         bad_bodies = [
             without_database,
-            {**body, "name": "B", "config": {**body["config"], "database": ""}},
-            {**body, "name": "B", "config": {**body["config"], "ssl": "prefer"}},
-            {**body, "name": "B", "config": {**body["config"], "local_infile": True}},
-            {**body, "name": "B", "config": {**body["config"], "host": "h.example.com:3306"}},
+            {**body, "name": "Bad", "config": {**body["config"], "database": ""}},
+            {**body, "name": "Bad", "config": {**body["config"], "ssl": "prefer"}},
+            {**body, "name": "Bad", "config": {**body["config"], "local_infile": True}},
+            {**body, "name": "Bad", "config": {**body["config"], "host": "h.example.com:3306"}},
             {key: value for key, value in body.items() if key != "kind"},
         ]
         for bad in bad_bodies:
             refused = await client.post(base, json=bad, headers=headers)
             assert refused.status_code == 422, bad
             assert refused.json()["error"]["code"] == "VALIDATION_ERROR"
+            fields = [issue["field"] for issue in refused.json()["error"]["details"]]
+            assert not any(field.endswith(".name") for field in fields), bad
             assert SECRET not in refused.text
         assert harness.connectors.tests_started == attempts_before
 
