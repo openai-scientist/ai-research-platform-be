@@ -1,8 +1,11 @@
+import asyncio
 import re
 from collections.abc import AsyncIterator
 from typing import Any
 
+import pytest
 import pytest_asyncio
+import uvloop
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -18,6 +21,14 @@ CALLBACK_KEY = "test-popper-callback-key"
 PASSWORD = "correct horse battery"
 # A Fernet key for tests only.
 CONNECTION_KEY = "dGVzdC1vbmx5LWNvbm5lY3Rpb24tc2VjcmV0LWtleSE="
+
+
+# Production runs on uvloop and the rest of the suite on asyncio. TLS, timeouts and the
+# hand-over between a thread and the loop depend on the loop, so a test that asks for this is
+# a coroutine run once on each.
+@pytest.fixture(params=[asyncio.run, uvloop.run], ids=["asyncio", "uvloop"])
+def run(request):
+    return request.param
 
 
 class Harness:

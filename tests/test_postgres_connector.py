@@ -11,7 +11,6 @@ from uuid import uuid4
 
 import asyncpg
 import pytest
-import uvloop
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -30,13 +29,6 @@ from platform_be.services.connectors.postgres import PostgresConnector
 from platform_be.services.connectors.values import to_text
 
 Handler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
-
-
-# Production runs on uvloop and the rest of the suite on asyncio. TLS and timeouts depend on
-# the loop, so each test here is a coroutine run once on each.
-@pytest.fixture(params=[asyncio.run, uvloop.run], ids=["asyncio", "uvloop"])
-def run(request):
-    return request.param
 
 
 def parameter_status(name: bytes, value: bytes) -> bytes:
