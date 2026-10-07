@@ -24,7 +24,7 @@ The research itself is done by **Popper**, a separate service. The Platform send
 
 - **Accounts and sessions**: email and password sign-up with an emailed 6-digit code, sign-in with Google, cookie sessions with CSRF protection, password reset, profile pictures, accounts created by an admin.
 - **Projects and members**: five fixed roles, invitations by email that expire after 24 hours, archive and restore, no hard delete.
-- **Research inputs**: versioned CSV datasets (uploaded, or imported through a data connection to PostgreSQL, MySQL or BigQuery), project files, a versioned research context.
+- **Research inputs**: versioned CSV datasets (uploaded, or imported through a data connection to PostgreSQL, MySQL, BigQuery, a Google spreadsheet or a Google Drive folder), project files, a versioned research context.
 - **Runs**: one run at a time per project, sent to Popper with a spending cap; frame review; result files.
 - **Collaboration**: comments on runs and result files, notifications over SSE, an audit log of every change.
 
@@ -127,6 +127,7 @@ Tests run on SQLite in memory. Some need a real service and are skipped unless a
 | `PLATFORM_MYSQL_TEST_URL` | Tests of the MySQL connector against a real server |
 | `PLATFORM_BIGQUERY_TEST_SERVICE_ACCOUNT` | The one test that talks to BigQuery itself |
 | `PLATFORM_LIVE_CONNECTOR_TESTS=1` | The whole flow through public databases on the internet |
+| `PLATFORM_LIVE_GOOGLE_REFRESH_TOKEN` and the four beside it | With the line above: the whole flow through Google's own Drive and Sheets APIs |
 
 **MySQL.** The URL must be of a user who can create databases and users. The Platform itself runs no MySQL: a throwaway container is enough, and it is gone once stopped.
 
@@ -146,6 +147,21 @@ PLATFORM_BIGQUERY_TEST_SERVICE_ACCOUNT=/path/to/key.json uv run pytest tests/tes
 
 ```bash
 PLATFORM_LIVE_CONNECTOR_TESTS=1 PLATFORM_LIVE_RNACENTRAL_PASSWORD=... uv run pytest tests/test_live_connectors.py -s
+```
+
+**Google.** The same file reads a real spreadsheet and a real Drive folder as a real Google account. Nothing is written at Google. It needs five variables, and is skipped without them:
+
+| Variable | Value |
+|---|---|
+| `PLATFORM_LIVE_GOOGLE_CLIENT_ID`, `PLATFORM_LIVE_GOOGLE_CLIENT_SECRET` | The OAuth client the refresh token was issued to |
+| `PLATFORM_LIVE_GOOGLE_REFRESH_TOKEN` | A refresh token of a Google account, with the `drive.readonly` scope |
+| `PLATFORM_LIVE_GOOGLE_SPREADSHEET` | Address or ID of a spreadsheet that account can open, with a header row and at least one row in the tab whose name sorts first |
+| `PLATFORM_LIVE_GOOGLE_FOLDER` | Address or ID of a folder of that account that holds at least one CSV, Google Sheets or `.xlsx` file, each with a header row and at least one row in the tab whose name sorts first |
+
+One way to get the refresh token: add `https://developers.google.com/oauthplayground` to the client's redirect URIs, open the [OAuth 2.0 Playground](https://developers.google.com/oauthplayground), tick **Use your own OAuth credentials** in its settings, authorize `https://www.googleapis.com/auth/drive.readonly` and exchange the code. Remove the redirect URI afterwards. The token is a credential for that account's whole Drive: keep it out of files that are committed and out of shell history.
+
+```bash
+PLATFORM_LIVE_CONNECTOR_TESTS=1 uv run pytest tests/test_live_connectors.py -k google -s
 ```
 
 ### Migrations
@@ -275,7 +291,7 @@ The Platform records the row count, column names, size, and SHA-256. A file that
 
 ### Data connections
 
-The second way to bring data in: a project saves a connection to an external database, browses its tables, previews rows live, and imports one table or one `SELECT` statement as a dataset version. Kinds: `postgres` (Supabase included), `mysql` (MariaDB included) and `bigquery`.
+The second way to bring data in: a project saves a connection to an external database, browses its tables, previews rows live, and imports one table or one `SELECT` statement as a dataset version. Kinds: `postgres` (Supabase included), `mysql` (MariaDB included) and `bigquery`, and two that read files with a user's Google account, `google_sheets` and `google_drive` ([below](#google-sheets-and-google-drive)).
 
 - **A run never queries the external database.** An import writes a CSV file checked the way an upload is, and the version records where it came from (`source_type`, `source`). Importing the same source again adds a version with what the source holds now.
 - **Creating a connection tests it.** Nothing is saved when the test fails; the answer is 422 `CONNECTION_FAILED` and `error.reason` says why (`auth_failed`, `tls_unavailable`, `host_not_allowed`, ...).
@@ -286,6 +302,90 @@ The second way to bring data in: a project saves a connection to an external dat
 - Previews and imports are audited with a hash of the SQL, not its text.
 
 An import runs inside the request, for up to `CONNECTION_IMPORT_TIMEOUT_SECONDS` (300). A client whose request is cut off on the way should list the datasets before trying again: the import may have finished.
+
+#### Google Sheets and Google Drive
+
+Two kinds have no password to paste: a user lets the Platform read their Google Drive, and the connection keeps that access. Off until the settings in [Configuration](#data-connections-1) are complete; [Google Cloud setup](#google-cloud-setup-for-connections) is below. While they are off, `start` and the callback answer `404`, creating and reauthorizing answer 503 `CONNECTIONS_NOT_CONFIGURED`, and a connection saved earlier answers 422 `CONNECTION_FAILED`, reason `unreachable`, on every read and test.
+
+| Kind | Points at | `schema` | `table` |
+|---|---|---|---|
+| `google_sheets` | One spreadsheet (`config.spreadsheet`: its address or ID) | The spreadsheet, by its title | Each tab |
+| `google_drive` | One folder (`config.folder`: its address or ID) | Each CSV file (one Drive holds as `text/csv`), Google spreadsheet and Excel workbook (`.xlsx`) directly in the folder, by file name | Each tab; a CSV file has one table, named like the file |
+
+Browsing, previewing and importing use the same endpoints as every other kind, with a `table` source. A `query` source answers 422 `SOURCE_INVALID`, reason `unsupported_source`.
+
+**Giving access.** Creating a connection takes three steps:
+
+| Step | Request | Result |
+|---|---|---|
+| Start | The browser navigates to `GET /api/v1/projects/{id}/connections/google/start` (a link, not a `fetch`). Needs a session and the Project Manager or Researcher role. | `302` to Google's consent page, which asks to see the account's Drive files. A refusal is a JSON error, not a redirect (401, 403, 404, or 409 for an archived project): offer the link only to those who may use it. |
+| Return | Google sends the browser to `GET /api/v1/connections/google/callback` | `302` to `{APP_URL}/projects/{id}/connections?google_grant=ID`, or `?error=CODE` with nothing stored. When the browser carries nothing that names the project (another browser, or the 10 minutes are over), the redirect is `{APP_URL}/projects?error=GOOGLE_ACCESS_FAILED`. |
+| Create | `POST /api/v1/projects/{id}/connections` with `kind`, `name`, `config` and `grant_id: ID` in place of `secret` | The connection, tested like any other. `config` now holds `spreadsheet_id` and `title`, or `folder_id` and `folder_name`, with `account_email` and `google_subject`. |
+
+A grant works once, within 10 minutes of `start` (the time at Google's page counts), for the user who started and in that project. A connection that fails its test (422 `CONNECTION_FAILED`) leaves the grant usable, so another address can be tried without going back to Google. So does an address that is not a spreadsheet's or a folder's, such as a published `/d/e/...` link: that is refused with 422 `VALIDATION_ERROR` before Google is asked.
+
+| Code | Where | Meaning |
+|---|---|---|
+| `GOOGLE_ACCESS_FAILED` | `?error=` | Cancelled at Google, expired, or not the browser that started. Start again. |
+| `GOOGLE_ACCESS_NOT_GRANTED` | `?error=` | The user continued without ticking the Drive permission. Start again and tick it. |
+| `GOOGLE_GRANT_INVALID` | 422 | The grant is expired, already used, or not this user's and project's. Start again. |
+| `GOOGLE_ACCOUNT_MISMATCH` | 422 | `reauthorize` with another Google account than the connection's. |
+| `CONNECTION_NOT_GOOGLE` | 422 | `reauthorize` on a connection of another kind. |
+
+Reasons these kinds add to `error.reason`:
+
+| `reason` | With | Meaning |
+|---|---|---|
+| `access_revoked` | `CONNECTION_FAILED` | Google no longer accepts the stored access: it expired or the user removed it. Reauthorize. |
+| `permission_denied` | `CONNECTION_FAILED` | The Google account cannot open the spreadsheet or folder, or it does not exist. Also an Excel file opened in Google Sheets: its address looks like a spreadsheet's, but it is read only through a `google_drive` connection or after **File > Save as Google Sheets**. `message` says which. |
+| `rate_limited` | `CONNECTION_FAILED` | Google is limiting requests for the account (HTTP 429). Try again shortly. A limit Google reports as 403 reads as `permission_denied`. |
+| `source_not_found` | `SOURCE_INVALID` | No such file in the folder, or no such tab. |
+| `source_malformed` | `SOURCE_INVALID` | The header row breaks the rules below, two files in the folder share the name, or the file is not what its type says. `message` says which. |
+| `source_too_large` | `SOURCE_INVALID` | A CSV or Excel file is larger than a dataset may be. |
+| `unsupported_source` | `SOURCE_INVALID` | A `query` source. |
+
+**Reauthorizing.** When a read or a test says `access_revoked`, send the user through `start` again and pass the new grant to `POST /projects/{id}/connections/{connection_id}/reauthorize` (`{"grant_id": ID}`). The connection keeps its ID, so dataset versions imported through it still name it. Only the Google account the connection was created with is accepted, and the spreadsheet or folder must open with it; when either fails, the stored access stays as it was.
+
+**How cells become a table.** One rule for a tab, a CSV file and an Excel sheet:
+
+- The first row names the columns. Two columns with the same name are refused.
+- A row shorter than the header is padded with empty values. Empty rows at the end are dropped; empty rows between rows of data are kept.
+- A column without a name is skipped while it is empty. A value under an empty header, or to the right of the last header, is refused (`source_malformed`), never dropped.
+- Google Sheets: numbers are read as stored (no thousands separators), dates and times as the text the cell shows.
+- Excel: a date or a time is read as ISO 8601 (`2026-09-14T00:00:00`), whatever format the cell shows. A formula gives the value saved with it, and nothing when the file was written by a program that never computed it.
+- CSV: UTF-8, with or without a byte-order mark; values are taken as they are written.
+
+The result is then checked like any dataset file, so a tab with a header and no rows is refused there (422 `INVALID_DATASET`).
+
+**Who can read what.**
+
+- A connection reads with the Google account of the user who created it (`config.account_email`). Every member who may contribute to the project reads that one spreadsheet, or the files directly in that one folder, through it, whether or not their own Google account could open them. Reviewers see that the connection exists and nothing behind it.
+- Nothing else of that account is reachable through the connection: what it points at cannot change, and a file outside the folder is never found, whatever name is asked for.
+- The refresh token is encrypted with `CONNECTION_SECRET_KEY` like any other credential, and is never returned, logged or audited. Audit events name the spreadsheet or folder ID, not the Google account.
+- Deleting a connection deletes its stored access and does not tell Google. To take the access back at Google, the account's owner opens [myaccount.google.com/connections](https://myaccount.google.com/connections), picks the app and removes its access. That ends every connection made with that account, in every project: each then answers `access_revoked` until it is reauthorized.
+
+**Not supported.**
+
+- Folders inside the folder: only files directly in it are listed, at most 1000.
+- `.xls`, Google Docs, PDF and every other type: they are not listed.
+- Shared drives: requests are sent in the form Drive needs for them, but this was not tested against one, so it is not promised.
+- Choosing files with Google Picker, syncing on a schedule, and a token per member.
+
+<a id="google-cloud-setup-for-connections"></a>
+**Google Cloud setup.** In the project that holds the OAuth client of [sign-in with Google](#sign-in-with-google) (the same client is used; sign-in itself does not have to be on):
+
+1. **APIs & Services > Library**: enable **Google Drive API** and **Google Sheets API**.
+2. **Google Auth Platform > Clients**, the web client: under **Authorised redirect URIs** add `http://localhost:8080/api/v1/connections/google/callback` and the production one, `https://<api-host>/api/v1/connections/google/callback`. `GOOGLE_OAUTH_CONNECTIONS_REDIRECT_URI` must match one of them character for character.
+3. **Google Auth Platform > Data Access > Add or remove scopes**: add `https://www.googleapis.com/auth/drive.readonly`. It is listed under restricted scopes.
+4. Set `GOOGLE_OAUTH_CONNECTIONS_REDIRECT_URI`, with `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `APP_URL` and `CONNECTION_SECRET_KEY`, and restart the API. Its log says `google drive access: on`.
+
+`drive.readonly` is a restricted scope, and what users meet depends on the app's publishing status (**Google Auth Platform > Audience**):
+
+| Status | Who can give access | What to expect |
+|---|---|---|
+| Testing | Only the accounts listed as test users, 100 at most | Access expires 7 days after it was given: the connection answers `access_revoked` and has to be reauthorized every week. |
+| In production, not verified | Any Google account, 100 in total over the life of the project | No 7-day expiry. Google shows an "unverified app" warning that the user has to click through. |
+| In production, verified | Any Google account | No warning. Verifying a restricted scope takes a security assessment by Google, which this project has not done. |
 
 ### Project files
 
@@ -602,11 +702,14 @@ The `q` parameter matches a substring, case-insensitively, and needs at least 3 
 | `GET` | `/projects/{id}/datasets/{dataset_id}/versions/{version_id}/download` | Download a version's file |
 | `POST` | `/projects/{id}/datasets/from-connection` | Import a table or a `SELECT` through a data connection as a new dataset |
 | `POST` | `/projects/{id}/datasets/{dataset_id}/versions/from-connection` | Import it again as the next version |
-| `GET` `POST` | `/projects/{id}/connections` | List data connections (`q`); test and save a new one (`kind`: `postgres`, `mysql`, `bigquery`) |
+| `GET` `POST` | `/projects/{id}/connections` | List data connections (`q`); test and save a new one (`kind`: `postgres`, `mysql`, `bigquery`, `google_sheets`, `google_drive`) |
+| `GET` | `/projects/{id}/connections/google/start` | Browser navigation: to Google, to give read access to Drive |
+| `GET` | `/connections/google/callback` | Where Google sends the browser back; redirects to the frontend with `google_grant` or `error` |
+| `POST` | `/projects/{id}/connections/{connection_id}/reauthorize` | Give a Google connection a fresh access to the same Google account |
 | `GET` `PATCH` `DELETE` | `/projects/{id}/connections/{connection_id}` | Read; rename; delete with its stored credentials |
 | `POST` | `/projects/{id}/connections/{connection_id}/test` | Test again; the outcome is in `last_tested_at` and `last_error_code` |
-| `GET` | `/projects/{id}/connections/{connection_id}/schemas` | Schemas the database user can read (BigQuery: datasets) |
-| `GET` | `/projects/{id}/connections/{connection_id}/tables` | Tables and views of one `schema`, at most 500 (`search`) |
+| `GET` | `/projects/{id}/connections/{connection_id}/schemas` | Schemas the database user can read (BigQuery: datasets; Google: the spreadsheet, or the files of the folder) |
+| `GET` | `/projects/{id}/connections/{connection_id}/tables` | Tables and views of one `schema`, at most 500 (`search`); Google: the tabs of one file |
 | `GET` | `/projects/{id}/connections/{connection_id}/columns` | Column names and types of one `table` |
 | `POST` | `/projects/{id}/connections/{connection_id}/preview` | First rows of a table or a `SELECT`, as text |
 
@@ -695,7 +798,7 @@ Ignore the 15-second keep-alive comment: it rechecks the session but does not ex
 
 ### Handoff documents
 
-Step-by-step integration notes with real responses are kept in `docs/` (local, not tracked in Git): `frontend-api-handoff.md`, `notifications-handoff.md` and `data-connections-handoff.md`.
+Step-by-step integration notes with real responses are kept in `docs/` (local, not tracked in Git): `frontend-api-handoff.md`, `notifications-handoff.md` and `frontend-api-handoff-3-data-connections.md`.
 
 ## Configuration
 
@@ -748,6 +851,7 @@ The two Popper keys are different secrets of at least 32 characters in productio
 | Variable | Purpose |
 |---|---|
 | `CONNECTION_SECRET_KEY` | Fernet key that encrypts the credentials of data connections. Empty: the feature is off. |
+| `GOOGLE_OAUTH_CONNECTIONS_REDIRECT_URI` | This API's `/api/v1/connections/google/callback`, exactly as listed on the Google OAuth client (`http://localhost:8080/api/v1/connections/google/callback` locally). Empty: the `google_sheets` and `google_drive` kinds are off, as they are without `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `APP_URL` or `CONNECTION_SECRET_KEY`; the other kinds are not affected. |
 | `CONNECTION_ALLOW_PRIVATE_HOSTS` | Lets a connection point at a loopback or private address (default `false`). Local development only: staging and production refuse to start with it, and the production Compose file does not pass it. |
 | `CONNECTION_CONNECT_TIMEOUT_SECONDS`, `CONNECTION_QUERY_TIMEOUT_SECONDS`, `CONNECTION_IMPORT_TIMEOUT_SECONDS` | Longest a connection attempt, a browse or preview, and a whole import may take (10, 60, 300). |
 | `CONNECTION_MAX_CONCURRENT_QUERIES`, `CONNECTION_MAX_CONCURRENT_PER_OWNER` | Calls to external databases running at once in one API process, and how many of them one project or one user may hold (4, 2). A call over the limit answers 429 `CONNECTION_BUSY` at once. |
@@ -825,7 +929,7 @@ Switching the store does not move files. Rows written under one store point at k
 
 - Request bodies are limited to 1 MiB (`REQUEST_MAX_BODY_BYTES`); dataset uploads, project files, result files and profile pictures have their own limits, in [Configuration](#storage-and-upload-limits).
 - The sign-in and code [rate limits](#passwords-sessions-and-rate-limits) are counted per client IP and per API process.
-- The two Google routes have no rate limit yet: each call to the callback with a valid state makes the API ask Google once. Add a limit at the ingress before public deployment.
+- The Google callbacks (`/auth/google/callback`, `/connections/google/callback`) and `/auth/google/start` have no rate limit yet: each call to a callback with a valid state makes the API ask Google once. Add a limit at the ingress before public deployment.
 - Production Compose does not configure Uvicorn's trusted proxy addresses, so behind a proxy all requests may share one IP and one login quota. Before public deployment, make Uvicorn trust only the real proxy addresses and add a shared rate limit at the ingress. Do not use caller-supplied forwarding headers as client identity.
 - Sign-up depends on email: `RESEND_API_KEY` is required in `staging` and `production`, and while the provider is down or over quota no account can be verified, admin-created ones included.
 
