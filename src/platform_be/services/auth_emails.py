@@ -1,4 +1,4 @@
-"""The emails about signing in: one-time codes and the notice of a changed password.
+"""The emails about signing in: one-time codes and the notices of a changed sign-in.
 
 Each function returns ``(subject, text, html)``. Anyone can make the Platform send these
 to any address, so they carry no text a user typed: the greeting is the address itself.
@@ -77,3 +77,30 @@ def password_changed(email: str, changed_at: datetime) -> tuple[str, str, str]:
         )
     )
     return f"Your {PRODUCT} password was changed", text, html
+
+
+def google_linked(email: str, linked_at: datetime, password_cleared: bool) -> tuple[str, str, str]:
+    text, html = _render(
+        _Message(
+            greeting_name=email,
+            intro=f"A Google account can now sign in to your {PRODUCT} account.",
+            details=[("Account", email), ("Linked at", local_time(linked_at))],
+            steps=[
+                "If you signed in with Google yourself, you do not need to do anything.",
+                "If you did not, tell an administrator.",
+            ],
+            notes=(
+                [
+                    "The password this account had no longer works. To sign in with a "
+                    'password as well, choose "Forgot password" on the sign-in page.'
+                ]
+                if password_cleared
+                else []
+            ),
+            reason=(
+                f"You received this email because someone signed in to {email} with Google "
+                "for the first time."
+            ),
+        )
+    )
+    return f"Google sign-in was added to your {PRODUCT} account", text, html

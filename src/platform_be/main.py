@@ -25,6 +25,7 @@ from platform_be.services.connectors.gate import ConnectionGate
 from platform_be.services.default_admin import ensure_default_admin
 from platform_be.services.email_sender import build_email_sender
 from platform_be.services.file_store import build_file_store
+from platform_be.services.google_oauth import build_google_oauth
 from platform_be.services.invite_candidates_stream import InviteCandidatesHub
 from platform_be.services.notification_stream import NotificationHub
 from platform_be.services.popper_client import build_popper_client
@@ -87,6 +88,7 @@ def create_app(
     app.state.file_store = build_file_store(settings)
     app.state.popper_client = build_popper_client(settings)
     app.state.email_sender = build_email_sender(settings)
+    app.state.google_oauth = build_google_oauth(settings)
     app.state.notification_hub = notification_hub
     app.state.invite_candidates_hub = invite_candidates_hub
     app.state.secret_box = (

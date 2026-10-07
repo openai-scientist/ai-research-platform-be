@@ -273,7 +273,7 @@ def _session_details(session: AuthSession) -> SessionDetails:
     )
 
 
-async def _start_session(
+async def start_session(
     db: AsyncSession, response: Response, settings: Settings, user: User
 ) -> SessionResult:
     raw_secret = new_session_secret()
@@ -483,7 +483,7 @@ async def verify_email(
         resource_id=user.id,
         request_id=getattr(request.state, "request_id", None),
     )
-    return ok(await _start_session(db, response, settings, user), "Email verified")
+    return ok(await start_session(db, response, settings, user), "Email verified")
 
 
 @router.post(
@@ -698,7 +698,7 @@ async def login(
         raise APIError(403, "USER_SUSPENDED", "This account is suspended")
     if user.email_verified_at is None:
         raise APIError(403, "EMAIL_NOT_VERIFIED", "Verify this email with a code first")
-    return ok(await _start_session(db, response, settings, user), "Signed in")
+    return ok(await start_session(db, response, settings, user), "Signed in")
 
 
 @router.post(
