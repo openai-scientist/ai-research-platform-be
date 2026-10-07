@@ -14,6 +14,7 @@ from platform_be.services.connectors.base import (
     TableRef,
     TableSource,
 )
+from platform_be.services.google_oauth import GoogleIdentity, GoogleOAuthError
 from platform_be.services.popper_client import PopperNotFound, PopperRunState
 
 
@@ -29,6 +30,24 @@ class FakeEmailSender:
         if self.accept:
             self.sent.append({"to": to, "subject": subject, "text": text, "html": html})
         return self.accept
+
+
+class FakeGoogleOAuth:
+    """Stands in for Google: every code is exchanged for the identity set here."""
+
+    def __init__(self) -> None:
+        # Who signs in next. Empty: the exchange fails, like a made-up code.
+        self.identity: GoogleIdentity | None = None
+        self.codes: list[str] = []
+
+    def authorization_url(self, state: str) -> str:
+        return f"https://accounts.google.com/o/oauth2/v2/auth?state={state}"
+
+    async def exchange(self, code: str) -> GoogleIdentity:
+        self.codes.append(code)
+        if self.identity is None:
+            raise GoogleOAuthError
+        return self.identity
 
 
 class FakePopperClient:

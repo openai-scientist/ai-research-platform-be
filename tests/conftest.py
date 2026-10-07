@@ -1,6 +1,7 @@
 import asyncio
 import re
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
@@ -14,11 +15,18 @@ from sqlalchemy.pool import StaticPool
 from platform_be.core.config import Settings
 from platform_be.db.base import Base
 from platform_be.main import create_app
-from tests.fakes import FakeConnectorFactory, FakeEmailSender, FakePopperClient
+from tests.fakes import (
+    FakeConnectorFactory,
+    FakeEmailSender,
+    FakeGoogleOAuth,
+    FakePopperClient,
+)
 
 ORIGIN = "http://localhost:3000"
 CALLBACK_KEY = "test-popper-callback-key"
 PASSWORD = "correct horse battery"
+APP_URL = "http://localhost:3000"
+GOOGLE_CLIENT_ID = "test-client.apps.googleusercontent.com"
 # A Fernet key for tests only.
 CONNECTION_KEY = "dGVzdC1vbmx5LWNvbm5lY3Rpb24tc2VjcmV0LWtleSE="
 
@@ -45,6 +53,10 @@ class Harness:
         app.state.popper_client = self.popper
         self.emails = FakeEmailSender()
         app.state.email_sender = self.emails
+        self.google = FakeGoogleOAuth()
+        # Only where the settings turn the feature on; elsewhere it stays off.
+        if app.state.google_oauth is not None:
+            app.state.google_oauth = self.google
         self.connectors = FakeConnectorFactory()
         app.state.connector_factory = self.connectors
         self.transport = ASGITransport(app=app, raise_app_exceptions=False)
@@ -53,8 +65,8 @@ class Harness:
         return AsyncClient(transport=self.transport, base_url=ORIGIN)
 
 
-@pytest_asyncio.fixture
-async def harness(tmp_path) -> AsyncIterator[Harness]:
+@asynccontextmanager
+async def open_harness(tmp_path, **overrides: Any) -> AsyncIterator[Harness]:
     settings = Settings(
         # Never read the developer's settings file: it may point at real services.
         _env_file=None,
@@ -71,6 +83,7 @@ async def harness(tmp_path) -> AsyncIterator[Harness]:
         # Every test signs several users in from one address; the throttle tests lower these.
         auth_session_rate_limit=1000,
         auth_code_rate_limit=1000,
+        **overrides,
     )
     engine = create_async_engine(
         settings.database_url,
@@ -94,6 +107,25 @@ async def harness(tmp_path) -> AsyncIterator[Harness]:
         await app.state.notification_hub.close()
         await app.state.invite_candidates_hub.close()
         await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def harness(tmp_path) -> AsyncIterator[Harness]:
+    async with open_harness(tmp_path) as harness:
+        yield harness
+
+
+@pytest_asyncio.fixture
+async def google_harness(tmp_path) -> AsyncIterator[Harness]:
+    """A harness with sign-in with Google turned on; Google itself is `harness.google`."""
+    async with open_harness(
+        tmp_path,
+        app_url=APP_URL,
+        google_oauth_client_id=GOOGLE_CLIENT_ID,
+        google_oauth_client_secret="test-google-client-secret",
+        google_oauth_redirect_uri="http://localhost:8080/api/v1/auth/google/callback",
+    ) as harness:
+        yield harness
 
 
 def emailed_code(harness: Harness, email: str, *, keep: bool = False) -> str:

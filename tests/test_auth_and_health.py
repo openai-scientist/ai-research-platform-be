@@ -30,6 +30,8 @@ async def test_health_probes_and_openapi(harness: Harness) -> None:
     assert auth_paths == {
         "/api/v1/auth/register",
         "/api/v1/auth/login",
+        "/api/v1/auth/google/start",
+        "/api/v1/auth/google/callback",
         "/api/v1/auth/verify-email",
         "/api/v1/auth/resend-verification",
         "/api/v1/auth/forgot-password",
