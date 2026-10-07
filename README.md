@@ -22,7 +22,7 @@ The research itself is done by **Popper**, a separate service. The Platform send
 
 ## Features
 
-- **Accounts and sessions**: email and password sign-up with an emailed 6-digit code, cookie sessions with CSRF protection, password reset, profile pictures, accounts created by an admin.
+- **Accounts and sessions**: email and password sign-up with an emailed 6-digit code, sign-in with Google, cookie sessions with CSRF protection, password reset, profile pictures, accounts created by an admin.
 - **Projects and members**: five fixed roles, invitations by email that expire after 24 hours, archive and restore, no hard delete.
 - **Research inputs**: versioned CSV datasets (uploaded, or imported through a data connection to PostgreSQL, MySQL or BigQuery), project files, a versioned research context.
 - **Runs**: one run at a time per project, sent to Popper with a spending cap; frame review; result files.
@@ -374,7 +374,7 @@ A notification carries no text; the frontend words it from `kind`. Only invitati
 
 ## Accounts and authentication
 
-The Platform owns accounts, passwords, sessions, and roles; there is no external identity provider. The login name is the email address; there is no separate username.
+The Platform owns accounts, passwords, sessions, and roles. The login name is the email address; there is no separate username. A user signs in with a password, with [Google](#sign-in-with-google), or with either.
 
 ### Sign-up and sign-in
 
@@ -392,6 +392,43 @@ The Platform owns accounts, passwords, sessions, and roles; there is no external
 | Set own picture | `POST /api/v1/auth/me/avatar`, a multipart form with one `file` | `200` with the new `avatar_url`. `415 UNSUPPORTED_IMAGE_TYPE`, `413 REQUEST_BODY_TOO_LARGE`. `DELETE` on the same path removes it. |
 
 `login` and `verify-email` set the HttpOnly session cookie and return the user, session expiry, and CSRF token. None of the seven endpoints above the change-password row takes a CSRF token; all need an allowed `Origin`.
+
+### Sign-in with Google
+
+Off until `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_URI` and `APP_URL` are all set; until then both routes answer `404`.
+
+| Step | Request | Result |
+|---|---|---|
+| Start | The browser navigates to `GET /api/v1/auth/google/start` (a link, not a `fetch`) | `302` to Google's sign-in page. |
+| Return | Google sends the browser to `GET /api/v1/auth/google/callback` | `302` to `{APP_URL}/` with the session cookie set, or `302` to `{APP_URL}/auth/login?error=CODE` with nothing changed. |
+
+| `CODE` | Meaning |
+|---|---|
+| `GOOGLE_SIGN_IN_FAILED` | The sign-in was cancelled, expired or could not be confirmed with Google, or the address belongs to an account that is linked to another Google account. Start again. |
+| `GOOGLE_EMAIL_NOT_VERIFIED` | The address is not one Google manages. Only a verified `@gmail.com` address or a Google Workspace account is accepted; any other address signs in with a password. |
+| `USER_SUSPENDED` | The account is suspended. |
+
+What a sign-in does depends on the address Google reports:
+
+| Case | Result |
+|---|---|
+| No account has the address | A new account, already verified, without a password. The name comes from Google. |
+| A verified account has it | The Google account is linked to it. The password keeps working: there are now two ways in. |
+| An account that never verified its email, or still has a temporary password, has it | Linked, and the email counts as verified. The password is removed and every session of the account ends: whoever set that password never proved the inbox. |
+| The Google account signed in before | Signed in as the same user, found by Google's account ID. The email the Platform stored stays, even if the address at Google changed. |
+| The account is linked to another Google account | Refused, `GOOGLE_SIGN_IN_FAILED`. |
+
+- A link is made once and emails the account's owner. An owner who did not make it tells an administrator.
+- `change-password` and `reset-password` never touch the link.
+- A user without a password gets `401 INVALID_CREDENTIALS` on `login` like any wrong password, and sets one with `forgot-password`.
+- A link cannot be removed yet.
+
+**Google Cloud setup.** In the [Google Cloud console](https://console.cloud.google.com/), in one project:
+
+1. **APIs & Services > OAuth consent screen**: user type External, with the scopes `openid`, `email` and `profile`. Publish the app; while it is in testing only the listed test users can sign in.
+2. **APIs & Services > Credentials > Create credentials > OAuth client ID**, type Web application.
+3. Under **Authorised redirect URIs** add `http://localhost:8080/api/v1/auth/google/callback` and the production one, `https://<api-host>/api/v1/auth/google/callback`. `GOOGLE_OAUTH_REDIRECT_URI` must match one of them character for character.
+4. Copy the client ID and the client secret into the settings.
 
 ### One-time codes
 
@@ -465,7 +502,7 @@ A picture is a PNG, JPEG or WebP image of at most 4 MiB (`AVATAR_MAX_UPLOAD_BYTE
 
 ### What the Platform does not do
 
-A code at every sign-in (two-factor), changing the email of an account, and alerts for a new device. Accounts that existed before email verification was added count as verified.
+A code at every sign-in (two-factor), changing the email of an account, removing a Google link, and alerts for a new device. Accounts that existed before email verification was added count as verified.
 
 ## API reference
 
@@ -514,6 +551,8 @@ The `q` parameter matches a substring, case-insensitively, and needs at least 3 
 | `POST` | `/auth/verify-reset-password` | Verify the reset OTP and return a one-use reset token |
 | `POST` | `/auth/reset-password` | Set a new password with the verified reset token; ends every session |
 | `POST` | `/auth/login` | Sign in with email and password; sets the session cookie |
+| `GET` | `/auth/google/start` | Redirect the browser to Google to sign in |
+| `GET` | `/auth/google/callback` | Where Google sends the browser back; sets the session cookie and redirects to the frontend |
 | `POST` | `/auth/change-password` | Change the password; signs out the user's other sessions |
 | `POST` | `/auth/logout` | End the current session |
 | `POST` | `/auth/logout-all` | End every session of the signed-in user, on all devices |
@@ -620,6 +659,7 @@ Both require the `X-Service-Key` header (`POPPER_CALLBACK_KEY`); a request witho
 - Send every request with `credentials: "include"` and an `Origin` that exactly matches `CORS_ALLOWED_ORIGINS`.
 - Send the CSRF token in `X-CSRF-Token` on every mutation (`POST`, `PATCH`, `PUT`, `DELETE`) except the seven endpoints used before a session exists: `register`, `verify-email`, `resend-verification`, `login`, `forgot-password`, `verify-reset-password` and `reset-password`. After a page reload, get it again from `GET /api/v1/auth/csrf-token`.
 - Restore the signed-in user after a reload with `GET /api/v1/auth/me`. It returns the user, platform role (`user` or `platform_admin`, never empty), `email_verified`, `must_change_password`, session expiry, and `memberships`: the user's projects with the role in each.
+- "Continue with Google" is a plain navigation to `GET /api/v1/auth/google/start`. The user comes back on `{APP_URL}/` signed in: call `me` and `csrf-token` as after a reload. A failure comes back on `{APP_URL}/auth/login?error=CODE`; the codes are in [Sign-in with Google](#sign-in-with-google).
 - On sign-out call `POST /api/v1/auth/logout`.
 - On `401` with `SESSION_EXPIRED` or `USER_SUSPENDED` the session cookie is already cleared; send the user back to sign-in.
 
@@ -681,7 +721,9 @@ Settings come from environment variables; `.env.example` lists them all with saf
 |---|---|
 | `RESEND_API_KEY` | Resend key used to send email. Empty in `local`: each message is written to the API log instead. Required in `staging` and `production`. |
 | `EMAIL_FROM` | Sender shown on emails; must be an address on the domain verified in Resend. |
-| `APP_URL` | Address of the frontend, put in emails as the sign-in link (`http://localhost:3000` locally). Must be `https://` in production. Empty: emails carry no link. |
+| `APP_URL` | Address of the frontend, put in emails as the sign-in link (`http://localhost:3000` locally). Must be `https://` in production. Empty: emails carry no link. Sign-in with Google redirects the browser here. |
+| `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | The OAuth client from the Google Cloud console. Empty: sign-in with Google is off. |
+| `GOOGLE_OAUTH_REDIRECT_URI` | This API's `/api/v1/auth/google/callback`, exactly as listed on that client (`http://localhost:8080/api/v1/auth/google/callback` locally). |
 | `AUTH_CODE_RATE_LIMIT` | Requests per window and client address to the five code endpoints (default 20). |
 | `OTP_TTL_MINUTES`, `OTP_MAX_ATTEMPTS`, `OTP_RESEND_COOLDOWN_SECONDS`, `OTP_MAX_SENDS_PER_HOUR`, `OTP_LOCK_AFTER_FAILURES`, `OTP_LOCK_MINUTES` | Limits of the emailed one-time codes; defaults 10, 5, 60, 5, 10, 60. Not passed by the Compose files: add them there to change them. |
 | `DEFAULT_ADMIN_EMAIL`, `DEFAULT_ADMIN_PASSWORD` | A Platform Admin created when the API starts if the account is missing (`admin@gmail.com` in the local stack). Local development only: staging and production refuse to start with them. An existing account keeps its password. |
@@ -783,6 +825,7 @@ Switching the store does not move files. Rows written under one store point at k
 
 - Request bodies are limited to 1 MiB (`REQUEST_MAX_BODY_BYTES`); dataset uploads, project files, result files and profile pictures have their own limits, in [Configuration](#storage-and-upload-limits).
 - The sign-in and code [rate limits](#passwords-sessions-and-rate-limits) are counted per client IP and per API process.
+- The two Google routes have no rate limit yet: each call to the callback with a valid state makes the API ask Google once. Add a limit at the ingress before public deployment.
 - Production Compose does not configure Uvicorn's trusted proxy addresses, so behind a proxy all requests may share one IP and one login quota. Before public deployment, make Uvicorn trust only the real proxy addresses and add a shared rate limit at the ingress. Do not use caller-supplied forwarding headers as client identity.
 - Sign-up depends on email: `RESEND_API_KEY` is required in `staging` and `production`, and while the provider is down or over quota no account can be verified, admin-created ones included.
 
