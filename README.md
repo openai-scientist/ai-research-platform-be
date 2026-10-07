@@ -269,7 +269,7 @@ Someone who is not a member gets `404` for everything in a project, so its exist
 
 ### Datasets
 
-CSV only. A file must be UTF-8, have a header row of unique, non-empty column names, at least one data row, and the same number of values on every row. The size limit is 50 MiB by default (`DATASET_MAX_UPLOAD_BYTES`); a header may have at most 2000 columns with names of at most 200 characters.
+A CSV file, or an Excel workbook (`.xlsx`; not `.xls`). The first sheet of a workbook is converted to CSV when it is uploaded, and that CSV is what the version stores, what a download returns and what Popper reads; the other sheets are ignored. A file must be UTF-8, have a header row of unique, non-empty column names, at least one data row, and the same number of values on every row. The size limit is 50 MiB by default (`DATASET_MAX_UPLOAD_BYTES`); a header may have at most 2000 columns with names of at most 200 characters.
 
 The Platform records the row count, column names, size, and SHA-256. A file that fails a check is refused and nothing is stored.
 
@@ -596,7 +596,7 @@ The `q` parameter matches a substring, case-insensitively, and needs at least 3 
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` `POST` | `/projects/{id}/datasets` | List datasets; upload a CSV as a new dataset (multipart: `name`, `description`, `file`) |
+| `GET` `POST` | `/projects/{id}/datasets` | List datasets; upload a CSV or `.xlsx` file as a new dataset (multipart: `name`, `description`, `file`) |
 | `GET` `PATCH` | `/projects/{id}/datasets/{dataset_id}` | Read; rename or describe |
 | `GET` `POST` | `/projects/{id}/datasets/{dataset_id}/versions` | List versions; upload a new version |
 | `GET` | `/projects/{id}/datasets/{dataset_id}/versions/{version_id}/download` | Download a version's file |
