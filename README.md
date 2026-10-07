@@ -522,6 +522,7 @@ What a sign-in does depends on the address Google reports:
 - `change-password` and `reset-password` never touch the link.
 - A user without a password gets `401 INVALID_CREDENTIALS` on `login` like any wrong password, and sets one with `forgot-password`.
 - A link cannot be removed yet.
+- A user without an avatar gets the Google profile picture at sign-in, stored like an uploaded one. An avatar that is already there is never replaced; a user who removes theirs gets the Google picture again at the next sign-in with Google. A picture that cannot be fetched does not stop the sign-in.
 
 **Google Cloud setup.** In the [Google Cloud console](https://console.cloud.google.com/), in one project:
 
