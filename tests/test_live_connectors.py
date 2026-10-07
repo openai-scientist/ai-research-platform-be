@@ -1,20 +1,38 @@
-"""The whole flow against public databases on the internet. Never run by CI.
+"""The whole flow against public databases on the internet, and Google. Never run by CI.
 
 Set PLATFORM_LIVE_CONNECTOR_TESTS=1 to run them; `-s` shows how long each step took. The
 connector factory is the real one and private hosts stay refused, so the host check runs with
 real DNS answers too.
+
+The Google tests also need the PLATFORM_LIVE_GOOGLE_* variables: an OAuth client, a refresh
+token it was issued with the `drive.readonly` scope, and a spreadsheet and a folder that
+account can open. They only read.
 """
 
 import json
 import os
+import secrets
 import time
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import UUID
 
 import pytest
+import pytest_asyncio
 from httpx import AsyncClient
 
+from platform_be.models.google_connection_grant import GoogleConnectionGrant
 from platform_be.services.connectors import build_connector_factory
-from tests.conftest import Harness, login, mutation_headers
+from platform_be.services.google_drive_oauth import build_google_drive_oauth
+from tests.conftest import (
+    APP_URL,
+    GOOGLE_CONNECTIONS_REDIRECT_URI,
+    Harness,
+    login,
+    mutation_headers,
+    open_harness,
+)
 from tests.test_connection_browse_api import failure, preview
 from tests.test_dataset_imports_api import import_dataset, import_version
 from tests.test_projects_api import PROJECTS, create_project
@@ -29,6 +47,16 @@ pytestmark = pytest.mark.skipif(
 # Published at https://rnacentral.org/help/public-database; kept out of the repository anyway.
 RNACENTRAL_PASSWORD = os.environ.get("PLATFORM_LIVE_RNACENTRAL_PASSWORD")
 BIGQUERY_KEY = os.environ.get("PLATFORM_BIGQUERY_TEST_SERVICE_ACCOUNT")
+GOOGLE_CLIENT_ID = os.environ.get("PLATFORM_LIVE_GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("PLATFORM_LIVE_GOOGLE_CLIENT_SECRET")
+GOOGLE_REFRESH_TOKEN = os.environ.get("PLATFORM_LIVE_GOOGLE_REFRESH_TOKEN")
+GOOGLE_SPREADSHEET = os.environ.get("PLATFORM_LIVE_GOOGLE_SPREADSHEET")
+GOOGLE_FOLDER = os.environ.get("PLATFORM_LIVE_GOOGLE_FOLDER")
+
+needs_google_client = pytest.mark.skipif(
+    not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
+    reason="PLATFORM_LIVE_GOOGLE_CLIENT_ID and PLATFORM_LIVE_GOOGLE_CLIENT_SECRET are not set",
+)
 
 RNACENTRAL = {
     "name": "RNAcentral",
@@ -306,4 +334,207 @@ async def test_bigquery_from_connection_to_run(harness: Harness) -> None:
         run = await start_run(client, session, project["id"], version["id"])
         assert run.status_code == 201, run.text
         steps.done("run")
+    steps.show()
+
+
+@pytest_asyncio.fixture
+async def google_live(tmp_path) -> AsyncIterator[Harness]:
+    """A harness whose Google is Google: the real OAuth client and the real APIs."""
+    async with open_harness(
+        tmp_path,
+        app_url=APP_URL,
+        google_oauth_client_id=GOOGLE_CLIENT_ID,
+        google_oauth_client_secret=GOOGLE_CLIENT_SECRET,
+        google_oauth_connections_redirect_uri=GOOGLE_CONNECTIONS_REDIRECT_URI,
+    ) as harness:
+        oauth = build_google_drive_oauth(harness.settings)
+        harness.app.state.google_drive_oauth = oauth
+        harness.app.state.connector_factory = build_connector_factory(
+            harness.settings, google_oauth=oauth
+        )
+        yield harness
+
+
+async def google_project(harness: Harness, client: AsyncClient) -> tuple[dict, dict]:
+    session = await login(harness, client, uid="live", email="live@example.com")
+    return session, await create_project(client, session, name="Live Google sources")
+
+
+async def google_grant(harness: Harness, session: dict, project: dict, refresh_token: str) -> str:
+    """A grant as the callback stores it. Giving access takes a person at Google's consent
+    page, so that one step is not taken here: the refresh token comes from the environment."""
+    grant = GoogleConnectionGrant(
+        user_id=UUID(session["user"]["id"]),
+        project_id=UUID(project["id"]),
+        state_hash=secrets.token_hex(32),
+        secret_ciphertext=harness.app.state.secret_box.seal({"refresh_token": refresh_token}),
+        google_subject="live-google-account",
+        account_email="live@example.com",
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+    async with harness.factory() as db:
+        db.add(grant)
+        await db.commit()
+    return str(grant.id)
+
+
+async def create_google_connection(
+    client: AsyncClient, session: dict, project: dict, grant_id: str, kind: str, config: dict
+):
+    return await client.post(
+        f"{PROJECTS}/{project['id']}/connections",
+        json={
+            "name": f"Live {kind} {secrets.token_hex(4)}",
+            "kind": kind,
+            "config": config,
+            "grant_id": grant_id,
+        },
+        headers=mutation_headers(session["csrf_token"]),
+    )
+
+
+async def import_first_tab(
+    client: AsyncClient, session: dict, project: dict, connection_id: str, schema: str
+) -> dict:
+    """Browse one file down to the tab listed first (tabs are listed by name), preview it
+    and import it; what was imported."""
+    url = f"{PROJECTS}/{project['id']}/connections/{connection_id}"
+    tables = await client.get(f"{url}/tables", params={"schema": schema})
+    assert tables.status_code == 200, tables.text
+    assert tables.json()["data"], schema
+    source = {"type": "table", "schema": schema, "name": tables.json()["data"][0]["name"]}
+
+    listed = await client.get(f"{url}/columns", params={"schema": schema, "table": source["name"]})
+    assert listed.status_code == 200, listed.text
+    columns = [column["name"] for column in listed.json()["data"]]
+    assert columns
+
+    shown = await preview(client, session, url, source)
+    assert shown.status_code == 200, shown.text
+    assert [column["name"] for column in shown.json()["data"]["columns"]] == columns
+    assert 0 < len(shown.json()["data"]["rows"]) <= 100
+
+    imported = await import_dataset(
+        client,
+        session,
+        project["id"],
+        connection_id,
+        source,
+        name=f"Live rows {secrets.token_hex(4)}",
+    )
+    assert imported.status_code == 201, imported.text
+    version = imported.json()["data"]["latest_version"]
+    assert version["column_names"] == columns
+    assert version["row_count"] >= 1
+    assert version["source"]["source"] == source
+    return {"tab": source["name"], "columns": len(columns), "rows": version["row_count"]}
+
+
+@needs_google_client
+@pytest.mark.asyncio
+async def test_google_refuses_a_refresh_token_it_never_issued(google_live: Harness) -> None:
+    async with google_live.client() as client:
+        session, project = await google_project(google_live, client)
+        grant_id = await google_grant(google_live, session, project, "1//not-a-refresh-token")
+        created = await create_google_connection(
+            client,
+            session,
+            project,
+            grant_id,
+            "google_sheets",
+            # A well-formed ID; Google is never asked about it.
+            {"spreadsheet": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"},
+        )
+        assert failure(created) == (422, "CONNECTION_FAILED", "access_revoked")
+
+
+@needs_google_client
+@pytest.mark.skipif(
+    not (GOOGLE_REFRESH_TOKEN and GOOGLE_SPREADSHEET),
+    reason="PLATFORM_LIVE_GOOGLE_REFRESH_TOKEN and PLATFORM_LIVE_GOOGLE_SPREADSHEET are not set",
+)
+@pytest.mark.asyncio
+async def test_google_sheets_from_connection_to_dataset(google_live: Harness) -> None:
+    steps = Steps("Google Sheets")
+    async with google_live.client() as client:
+        session, project = await google_project(google_live, client)
+        grant_id = await google_grant(google_live, session, project, GOOGLE_REFRESH_TOKEN)
+
+        nowhere = await create_google_connection(
+            client,
+            session,
+            project,
+            grant_id,
+            "google_sheets",
+            {"spreadsheet": "1-no-spreadsheet-has-this-id-0123456789abcdefghij"},
+        )
+        assert failure(nowhere) == (422, "CONNECTION_FAILED", "permission_denied")
+        steps.done("refused_unknown_spreadsheet")
+
+        # The grant is still good: the connection it was meant for does not exist yet.
+        created = await create_google_connection(
+            client, session, project, grant_id, "google_sheets", {"spreadsheet": GOOGLE_SPREADSHEET}
+        )
+        assert created.status_code == 201, created.text
+        connection = created.json()["data"]
+        assert GOOGLE_REFRESH_TOKEN not in created.text
+        steps.done("create")
+
+        url = f"{PROJECTS}/{project['id']}/connections/{connection['id']}"
+        schemas = await client.get(f"{url}/schemas")
+        assert schemas.status_code == 200, schemas.text
+        assert schemas.json()["data"] == [connection["config"]["title"]]
+        steps.done("schemas")
+
+        title = connection["config"]["title"]
+        steps.seconds["imported"] = await import_first_tab(
+            client, session, project, connection["id"], title
+        )
+        steps.done("browse_preview_import")
+
+        query = await preview(client, session, url, {"type": "query", "sql": "SELECT 1"})
+        assert failure(query) == (422, "SOURCE_INVALID", "unsupported_source")
+    steps.show()
+
+
+@needs_google_client
+@pytest.mark.skipif(
+    not (GOOGLE_REFRESH_TOKEN and GOOGLE_FOLDER),
+    reason="PLATFORM_LIVE_GOOGLE_REFRESH_TOKEN and PLATFORM_LIVE_GOOGLE_FOLDER are not set",
+)
+@pytest.mark.asyncio
+async def test_google_drive_from_connection_to_datasets(google_live: Harness) -> None:
+    steps = Steps("Google Drive")
+    async with google_live.client() as client:
+        session, project = await google_project(google_live, client)
+        grant_id = await google_grant(google_live, session, project, GOOGLE_REFRESH_TOKEN)
+        created = await create_google_connection(
+            client, session, project, grant_id, "google_drive", {"folder": GOOGLE_FOLDER}
+        )
+        assert created.status_code == 201, created.text
+        connection = created.json()["data"]
+        assert connection["config"]["folder_name"]
+        assert GOOGLE_REFRESH_TOKEN not in created.text
+        steps.done("create")
+
+        url = f"{PROJECTS}/{project['id']}/connections/{connection['id']}"
+        schemas = await client.get(f"{url}/schemas")
+        assert schemas.status_code == 200, schemas.text
+        files = schemas.json()["data"]
+        assert files
+        steps.done("schemas")
+
+        # Every file of the folder, whatever its type: the names say which types were read.
+        imported = {}
+        for file in files:
+            imported[file] = await import_first_tab(
+                client, session, project, connection["id"], file
+            )
+            steps.done(f"import {file}")
+        steps.seconds["imported"] = imported
+
+        missing = await client.get(
+            f"{url}/columns", params={"schema": "no file has this name", "table": "Sheet1"}
+        )
+        assert failure(missing) == (422, "SOURCE_INVALID", "source_not_found")
     steps.show()
