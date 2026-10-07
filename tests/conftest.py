@@ -18,6 +18,7 @@ from platform_be.main import create_app
 from tests.fakes import (
     FakeConnectorFactory,
     FakeEmailSender,
+    FakeGoogleDriveOAuth,
     FakeGoogleOAuth,
     FakePopperClient,
 )
@@ -27,6 +28,7 @@ CALLBACK_KEY = "test-popper-callback-key"
 PASSWORD = "correct horse battery"
 APP_URL = "http://localhost:3000"
 GOOGLE_CLIENT_ID = "test-client.apps.googleusercontent.com"
+GOOGLE_CONNECTIONS_REDIRECT_URI = "http://localhost:8080/api/v1/connections/google/callback"
 # A Fernet key for tests only.
 CONNECTION_KEY = "dGVzdC1vbmx5LWNvbm5lY3Rpb24tc2VjcmV0LWtleSE="
 
@@ -57,6 +59,9 @@ class Harness:
         # Only where the settings turn the feature on; elsewhere it stays off.
         if app.state.google_oauth is not None:
             app.state.google_oauth = self.google
+        self.google_drive = FakeGoogleDriveOAuth()
+        if app.state.google_drive_oauth is not None:
+            app.state.google_drive_oauth = self.google_drive
         self.connectors = FakeConnectorFactory()
         app.state.connector_factory = self.connectors
         self.transport = ASGITransport(app=app, raise_app_exceptions=False)
@@ -117,13 +122,17 @@ async def harness(tmp_path) -> AsyncIterator[Harness]:
 
 @pytest_asyncio.fixture
 async def google_harness(tmp_path) -> AsyncIterator[Harness]:
-    """A harness with sign-in with Google turned on; Google itself is `harness.google`."""
+    """A harness with sign-in with Google and Google connections turned on.
+
+    Google itself is `harness.google` for sign-in and `harness.google_drive` for Drive access.
+    """
     async with open_harness(
         tmp_path,
         app_url=APP_URL,
         google_oauth_client_id=GOOGLE_CLIENT_ID,
         google_oauth_client_secret="test-google-client-secret",
         google_oauth_redirect_uri="http://localhost:8080/api/v1/auth/google/callback",
+        google_oauth_connections_redirect_uri=GOOGLE_CONNECTIONS_REDIRECT_URI,
     ) as harness:
         yield harness
 

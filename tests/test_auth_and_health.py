@@ -44,6 +44,12 @@ async def test_health_probes_and_openapi(harness: Harness) -> None:
         "/api/v1/auth/me/avatar",
         "/api/v1/auth/csrf-token",
     }
+    # Listed even while the feature is off, like the sign-in pair above.
+    assert {
+        "/api/v1/projects/{project_id}/connections/google/start",
+        "/api/v1/connections/google/callback",
+        "/api/v1/projects/{project_id}/connections/{connection_id}/reauthorize",
+    } <= set(schema["paths"])
     login_responses = schema["paths"]["/api/v1/auth/login"]["post"]["responses"]
     assert {"200", "401", "403", "413", "422", "429"}.issubset(login_responses)
     register_responses = schema["paths"]["/api/v1/auth/register"]["post"]["responses"]

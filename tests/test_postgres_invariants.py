@@ -927,3 +927,55 @@ async def test_a_real_table_is_imported_and_a_run_starts_from_it(
         run = await start_run(client, session, project["id"], second["id"])
         assert run.status_code == 201, run.text
         assert harness.popper.started[0]["dataset"] == again.content
+
+
+@pytest.mark.asyncio
+async def test_two_returns_from_google_with_one_state_store_one_refresh_token(
+    postgres_harness: Harness,
+) -> None:
+    from platform_be.models.google_connection_grant import GoogleConnectionGrant
+    from platform_be.services.google_drive_oauth import GoogleGrant
+    from platform_be.services.secret_box import SecretBox
+    from tests.test_google_connection_grant import CALLBACK, STATE_COOKIE, start
+
+    harness = postgres_harness
+    harness.settings.app_url = "http://localhost:3000"
+    harness.app.state.google_drive_oauth = harness.google_drive
+    harness.google_drive.grant = GoogleGrant("the-refresh-token", "google-sub-1", "dat@gmail.com")
+    harness.google_drive.hold = asyncio.Event()
+    async with harness.client() as client, harness.client() as replay:
+        session = await login(harness, client, uid="twice", email="twice@example.com")
+        project = await create_project(client, session)
+        state = await start(client, project["id"])
+        replay.cookies.set(STATE_COOKIE, state)
+
+        # Both get past the check of the grant before either has Google's answer.
+        returns = [
+            asyncio.create_task(browser.get(CALLBACK, params={"code": "code", "state": state}))
+            for browser in (client, replay)
+        ]
+        await wait_until(lambda: len(harness.google_drive.codes) == 2)
+        harness.google_drive.hold.set()
+        locations = sorted(
+            response.headers["location"] for response in await asyncio.gather(*returns)
+        )
+
+    async with harness.factory() as db:
+        (grant,) = await db.scalars(select(GoogleConnectionGrant))
+    page = f"http://localhost:3000/projects/{project['id']}/connections"
+    assert locations == [f"{page}?error=GOOGLE_ACCESS_FAILED", f"{page}?google_grant={grant.id}"]
+    assert SecretBox(CONNECTION_KEY).open(grant.secret_ciphertext) == {
+        "refresh_token": "the-refresh-token"
+    }
+
+
+@pytest.mark.asyncio
+async def test_two_connections_cannot_be_made_from_one_google_grant_at_once(
+    postgres_harness: Harness,
+) -> None:
+    from tests.test_google_sheets_connection_api import one_grant_makes_one_connection
+
+    harness = postgres_harness
+    harness.settings.app_url = "http://localhost:3000"
+    harness.app.state.google_drive_oauth = harness.google_drive
+    await one_grant_makes_one_connection(harness)
