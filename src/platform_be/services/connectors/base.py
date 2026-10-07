@@ -19,6 +19,11 @@ REASON_MESSAGES = {
     "query_failed": "The database rejected the query",
     "query_timeout": "The query did not finish in time",
     "scan_limit_exceeded": "The query would scan more data than this server allows",
+    "access_revoked": "Google no longer accepts the stored access. Reauthorize the connection",
+    "rate_limited": "Google is limiting requests for this account. Try again shortly",
+    "unsupported_source": "This kind of connection reads tables only, not queries",
+    "source_malformed": ("The first row must name every column that holds values, each name once"),
+    "source_too_large": "The file is larger than a dataset may be",
 }
 
 # A NUL byte is not valid in a PostgreSQL parameter and would make the driver raise.
