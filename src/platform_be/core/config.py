@@ -70,6 +70,11 @@ class Settings(BaseSettings):
     email_timeout_seconds: float = Field(default=10, ge=1, le=30)
     # Address of the frontend, put in emails as the sign-in link. No link when empty.
     app_url: str | None = None
+    # Sign-in with Google. Off unless these three and app_url are all set. The redirect URI
+    # is this API's /auth/google/callback, exactly as registered in the Google Cloud console.
+    google_oauth_client_id: str | None = None
+    google_oauth_client_secret: SecretStr | None = None
+    google_oauth_redirect_uri: str | None = None
     # How long an admin waits before sending a user's sign-in details again.
     invite_resend_cooldown_seconds: int = Field(default=60, ge=0, le=3600)
     # How long a project invitation can be accepted after it was last sent.
@@ -125,6 +130,9 @@ class Settings(BaseSettings):
         "r2_secret_access_key",
         "resend_api_key",
         "app_url",
+        "google_oauth_client_id",
+        "google_oauth_client_secret",
+        "google_oauth_redirect_uri",
         "default_admin_email",
         "default_admin_password",
         "connection_secret_key",
