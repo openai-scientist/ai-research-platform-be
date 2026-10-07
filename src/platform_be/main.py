@@ -25,6 +25,7 @@ from platform_be.services.connectors.gate import ConnectionGate
 from platform_be.services.default_admin import ensure_default_admin
 from platform_be.services.email_sender import build_email_sender
 from platform_be.services.file_store import build_file_store
+from platform_be.services.google_drive_oauth import build_google_drive_oauth
 from platform_be.services.google_oauth import build_google_oauth
 from platform_be.services.invite_candidates_stream import InviteCandidatesHub
 from platform_be.services.notification_stream import NotificationHub
@@ -89,6 +90,7 @@ def create_app(
     app.state.popper_client = build_popper_client(settings)
     app.state.email_sender = build_email_sender(settings)
     app.state.google_oauth = build_google_oauth(settings)
+    app.state.google_drive_oauth = build_google_drive_oauth(settings)
     app.state.notification_hub = notification_hub
     app.state.invite_candidates_hub = invite_candidates_hub
     app.state.secret_box = (
@@ -97,7 +99,9 @@ def create_app(
         else None
     )
     app.state.connector_executor = connector_executor
-    app.state.connector_factory = build_connector_factory(settings, executor=connector_executor)
+    app.state.connector_factory = build_connector_factory(
+        settings, executor=connector_executor, google_oauth=app.state.google_drive_oauth
+    )
     app.state.connection_gate = ConnectionGate(
         max_concurrent=settings.connection_max_concurrent_queries,
         max_per_project=settings.connection_max_concurrent_per_owner,

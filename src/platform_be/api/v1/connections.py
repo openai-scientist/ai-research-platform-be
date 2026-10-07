@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_be.auth.sessions import Principal, require_active_csrf, require_active_principal
@@ -19,6 +19,7 @@ from platform_be.core.responses import ApiResponse, ErrorResponse, ok, paginated
 from platform_be.core.search import SearchTerm, matches
 from platform_be.db.session import get_db
 from platform_be.models.data_connection import DataConnection
+from platform_be.models.google_connection_grant import GoogleConnectionGrant
 from platform_be.services.access import (
     ensure_writable_project,
     lock_project_scope,
@@ -39,6 +40,11 @@ from platform_be.services.connectors.bigquery import (
     parse_service_account,
 )
 from platform_be.services.connectors.gate import ConnectionGate, get_connection_gate
+from platform_be.services.connectors.google_drive import GoogleDriveConnector, parse_folder_id
+from platform_be.services.connectors.google_sheets import (
+    GoogleSheetsConnector,
+    parse_spreadsheet_id,
+)
 from platform_be.services.connectors.network_guard import is_host
 from platform_be.services.connectors.values import approximate_size, to_text
 from platform_be.services.secret_box import SecretBox, SecretBoxError, get_secret_box
@@ -175,10 +181,86 @@ class CreateBigQueryConnection(BaseModel, extra="forbid"):
         return self
 
 
+class GoogleSheetsConfig(BaseModel, extra="forbid"):
+    spreadsheet: Annotated[str, StringConstraints(min_length=1, max_length=2048)] = Field(
+        description=(
+            "The address of the spreadsheet as the browser shows it "
+            "(`https://docs.google.com/spreadsheets/d/<id>/...`), or the ID alone."
+        )
+    )
+
+    @field_validator("spreadsheet")
+    @classmethod
+    def validate_spreadsheet(cls, value: str) -> str:
+        return parse_spreadsheet_id(value)
+
+
+class CreateGoogleSheetsConnection(BaseModel, extra="forbid"):
+    """One Google spreadsheet, read as the Google account that gave access.
+
+    The spreadsheet is the only schema and each tab is a table whose first row names the
+    columns. The saved `config` holds `spreadsheet_id`, `title`, `account_email` and
+    `google_subject`.
+    """
+
+    name: ConnectionName
+    kind: Literal["google_sheets"]
+    config: GoogleSheetsConfig
+    grant_id: UUID = Field(
+        description=(
+            "The `google_grant` the browser came back from Google with. It works once, for "
+            "the user who started and in that project, within 10 minutes."
+        )
+    )
+
+
+class GoogleDriveConfig(BaseModel, extra="forbid"):
+    folder: Annotated[str, StringConstraints(min_length=1, max_length=2048)] = Field(
+        description=(
+            "The address of the folder as the browser shows it "
+            "(`https://drive.google.com/drive/folders/<id>`), or the ID alone."
+        )
+    )
+
+    @field_validator("folder")
+    @classmethod
+    def validate_folder(cls, value: str) -> str:
+        return parse_folder_id(value)
+
+
+class CreateGoogleDriveConnection(BaseModel, extra="forbid"):
+    """One Google Drive folder, read as the Google account that gave access.
+
+    Each CSV file, Google spreadsheet and Excel workbook (`.xlsx`) directly in the folder is
+    a schema, named like the file, and each of its tabs is a table whose first row names the
+    columns; a CSV file has one table, named like the file. Folders inside the folder are
+    not read. The saved `config` holds `folder_id`, `folder_name`, `account_email` and
+    `google_subject`.
+    """
+
+    name: ConnectionName
+    kind: Literal["google_drive"]
+    config: GoogleDriveConfig
+    grant_id: UUID = Field(
+        description=(
+            "The `google_grant` the browser came back from Google with. It works once, for "
+            "the user and the project it was given to."
+        )
+    )
+
+
 CreateConnection = Annotated[
-    CreatePostgresConnection | CreateMysqlConnection | CreateBigQueryConnection,
+    CreatePostgresConnection
+    | CreateMysqlConnection
+    | CreateBigQueryConnection
+    | CreateGoogleSheetsConnection
+    | CreateGoogleDriveConnection,
     Field(discriminator="kind"),
 ]
+
+
+class ReauthorizeConnection(BaseModel, extra="forbid"):
+    grant_id: UUID
 
 
 class RenameConnection(BaseModel, extra="forbid"):
@@ -352,6 +434,9 @@ def _read_failed(error: ConnectorError) -> APIError:
         "query_failed",
         "query_timeout",
         "scan_limit_exceeded",
+        "unsupported_source",
+        "source_malformed",
+        "source_too_large",
     )
     code = "SOURCE_INVALID" if about_source else "CONNECTION_FAILED"
     return APIError(422, code, error.message, reason=error.reason)
@@ -389,8 +474,8 @@ async def _probe(
     kind: str,
     config: dict[str, Any],
     secret: dict[str, Any],
-) -> ConnectorError | None:
-    """Connect for real and return what went wrong, if anything.
+) -> tuple[Connector | None, ConnectorError | None]:
+    """Connect for real: the connector that answered, or what went wrong.
 
     Holds a slot, never the Platform's database session: the caller commits first.
     """
@@ -399,15 +484,97 @@ async def _probe(
             connector = await factory(kind, config, secret)
             await connector.test()
         except ConnectorError as exc:
-            return exc
-    return None
+            return None, exc
+    return connector, None
 
 
 def _audit_target(config: dict[str, Any]) -> dict[str, Any]:
-    """Where a connection points, for an audit event: a server, or a BigQuery project."""
+    """Where a connection points, for an audit event: a server, a BigQuery project, a
+    spreadsheet or a Drive folder. Never the Google account: its address is personal data."""
     if "host" in config:
         return {"host": config["host"], "port": config["port"]}
+    if "spreadsheet_id" in config:
+        return {"spreadsheet_id": config["spreadsheet_id"]}
+    if "folder_id" in config:
+        return {"folder_id": config["folder_id"]}
     return {"project_id": config["project_id"]}
+
+
+def _grant_invalid() -> APIError:
+    return APIError(
+        422,
+        "GOOGLE_GRANT_INVALID",
+        "The Google access has expired or was already used. Connect the Google account again.",
+    )
+
+
+def _usable_grant(grant_id: UUID, principal: Principal, project_id: UUID) -> list[Any]:
+    """What makes a grant usable here: it is this user's, for this project, holds Google's
+    answer and has not expired."""
+    return [
+        GoogleConnectionGrant.id == grant_id,
+        GoogleConnectionGrant.user_id == principal.user.id,
+        GoogleConnectionGrant.project_id == project_id,
+        GoogleConnectionGrant.secret_ciphertext.is_not(None),
+        GoogleConnectionGrant.expires_at > datetime.now(UTC),
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class _GoogleAccess:
+    subject: str
+    email: str
+    # The refresh token. Kept out of the repr, like the secret of a saved connection.
+    secret: dict[str, Any] = field(repr=False)
+
+
+async def _google_access(
+    request: Request,
+    db: AsyncSession,
+    box: SecretBox,
+    principal: Principal,
+    project_id: UUID,
+    grant_id: UUID,
+) -> _GoogleAccess:
+    """Read what a grant holds without using it up: the connection has yet to be tried.
+
+    Grants that expired go away here as well as when a new one is started, so a refresh
+    token nobody used does not outlive its 10 minutes for long.
+    """
+    if request.app.state.google_drive_oauth is None:
+        raise APIError(
+            503, "CONNECTIONS_NOT_CONFIGURED", "Google connections are not configured here"
+        )
+    await db.execute(
+        delete(GoogleConnectionGrant).where(GoogleConnectionGrant.expires_at <= datetime.now(UTC))
+    )
+    grant = await db.scalar(
+        select(GoogleConnectionGrant).where(*_usable_grant(grant_id, principal, project_id))
+    )
+    try:
+        if grant is None:
+            raise _grant_invalid()
+        return _GoogleAccess(
+            grant.google_subject, grant.account_email, box.open(grant.secret_ciphertext)
+        )
+    except (APIError, SecretBoxError):
+        # Committed first: the rollback that follows an error would bring the expired back.
+        await db.commit()
+        raise _grant_invalid() from None
+
+
+async def _use_grant(
+    db: AsyncSession, principal: Principal, project_id: UUID, grant_id: UUID
+) -> None:
+    """Spend a grant in the caller's transaction, or refuse: it is good for one connection.
+
+    One statement, so of two requests with the same grant only one finds it.
+    """
+    used = await db.execute(
+        delete(GoogleConnectionGrant).where(*_usable_grant(grant_id, principal, project_id))
+    )
+    if used.rowcount != 1:
+        raise _grant_invalid()
 
 
 def _audit_failed_test(
@@ -470,13 +637,18 @@ async def list_connections(
     "",
     response_model=ApiResponse[ConnectionItem],
     status_code=201,
-    summary="Connect the project to an external database",
+    summary="Connect the project to an external database, a Google spreadsheet or a Drive folder",
     description=(
         "Connects once to check the details; nothing is saved when that fails (422 "
         "`CONNECTION_FAILED`, with `error.reason`). Project Manager or Researcher only. "
         "Use a read-only database user: every member who can contribute can run queries "
         "with it. For `bigquery`, a service account with the roles BigQuery Job User and "
-        "BigQuery Data Viewer; queries are billed to its project."
+        "BigQuery Data Viewer; queries are billed to its project. For `google_sheets` and "
+        "`google_drive`, `grant_id` takes the place of `secret`: every member who can "
+        "contribute then reads that one spreadsheet, or the files directly in that one "
+        "folder, as the Google account that gave access. A grant that is not this user's, "
+        "not for this project, expired or already used answers 422 `GOOGLE_GRANT_INVALID`; "
+        "one whose connection failed can be tried again with another address."
     ),
     responses={
         **PROBE_ERRORS,
@@ -500,13 +672,29 @@ async def create_connection(
     if await _name_taken(db, project_id, body.name):
         raise _name_exists()
 
-    config = body.config.model_dump()
-    secret = body.secret.model_dump()
+    by_grant = isinstance(body, CreateGoogleSheetsConnection | CreateGoogleDriveConnection)
+    if by_grant:
+        access = await _google_access(request, db, box, principal, project_id, body.grant_id)
+        config = {
+            **(
+                {"spreadsheet_id": body.config.spreadsheet}
+                if isinstance(body, CreateGoogleSheetsConnection)
+                else {"folder_id": body.config.folder}
+            ),
+            "account_email": access.email,
+            "google_subject": access.subject,
+        }
+        secret = access.secret
+    else:
+        config = body.config.model_dump()
+        secret = body.secret.model_dump()
     connection_id = uuid4()
     request_id = getattr(request.state, "request_id", None)
     # Hand the session back before talking to a server the user chose: it may never answer.
     await db.commit()
-    error = await _probe(gate, factory, project_id, principal.user.id, body.kind, config, secret)
+    connector, error = await _probe(
+        gate, factory, project_id, principal.user.id, body.kind, config, secret
+    )
     if error is not None:
         _audit_failed_test(
             db, request, principal, project_id, connection_id, body.kind, config, error
@@ -520,6 +708,13 @@ async def create_connection(
     ensure_writable_project(project)
     if await _name_taken(db, project_id, body.name):
         raise _name_exists()
+    if by_grant:
+        # With the row, in one transaction: a grant is spent only by a connection that exists.
+        await _use_grant(db, principal, project_id, body.grant_id)
+        if isinstance(connector, GoogleSheetsConnector):
+            config["title"] = connector.title
+        if isinstance(connector, GoogleDriveConnector):
+            config["folder_name"] = connector.folder_name
     now = datetime.now(UTC)
     row = DataConnection(
         id=connection_id,
@@ -672,7 +867,7 @@ async def test_connection(
     kind, config = row.kind, row.config
     await db.commit()
 
-    error = await _probe(gate, factory, project_id, principal.user.id, kind, config, secret)
+    _, error = await _probe(gate, factory, project_id, principal.user.id, kind, config, secret)
     # The wait may have been long: the project, the caller's role and the row itself are
     # read again, and the row is locked so a concurrent delete cannot slip in before the write.
     project, _ = await require_project_access(db, principal, project_id, contribute=True)
@@ -701,6 +896,104 @@ async def test_connection(
         _audit_failed_test(db, request, principal, project_id, connection_id, kind, config, error)
     await db.flush()
     return ok(_item(row), "Connection tested")
+
+
+@router.post(
+    "/{connection_id}/reauthorize",
+    response_model=ApiResponse[ConnectionItem],
+    summary="Give a Google connection a fresh access to the same Google account",
+    description=(
+        "For a connection whose `last_error_code` or read failure says `access_revoked`: "
+        "send the user through `connections/google/start` again and pass the new "
+        "`google_grant` here. The connection keeps its ID and what it points at. The grant "
+        "must come from the Google account the connection was created with (422 "
+        "`GOOGLE_ACCOUNT_MISMATCH` otherwise), and the spreadsheet or folder must open with it "
+        "(422 `CONNECTION_FAILED`); when either fails the stored access stays as it was."
+    ),
+    responses={
+        **PROBE_ERRORS,
+        422: {
+            "model": ErrorResponse,
+            "description": (
+                "`GOOGLE_GRANT_INVALID`, `GOOGLE_ACCOUNT_MISMATCH`, `CONNECTION_FAILED`, or "
+                "`CONNECTION_NOT_GOOGLE` for a connection of another kind"
+            ),
+        },
+    },
+)
+async def reauthorize_connection(
+    project_id: UUID,
+    connection_id: UUID,
+    body: ReauthorizeConnection,
+    request: Request,
+    principal: Principal = Depends(require_active_csrf),
+    db: AsyncSession = Depends(get_db),
+    box: SecretBox | None = Depends(get_secret_box),
+    gate: ConnectionGate = Depends(get_connection_gate),
+    factory: ConnectorFactory = Depends(get_connector_factory),
+) -> ApiResponse[ConnectionItem]:
+    project, _ = await require_project_access(db, principal, project_id, contribute=True)
+    ensure_writable_project(project)
+    box = _require_box(box)
+    gate.check_rate(principal.user.id)
+    row = await _get_connection(db, project_id, connection_id)
+    kind, config = row.kind, row.config
+    if "google_subject" not in config:
+        raise APIError(422, "CONNECTION_NOT_GOOGLE", "Only a Google connection can be reauthorized")
+    access = await _google_access(request, db, box, principal, project_id, body.grant_id)
+
+    def same_account(config: dict[str, Any]) -> None:
+        # A connection says whose access it reads with. A token of another account would
+        # make that untrue, and hand the project whatever that account can open.
+        if access.subject != config["google_subject"]:
+            raise APIError(
+                422,
+                "GOOGLE_ACCOUNT_MISMATCH",
+                "Use the Google account this connection was created with",
+            )
+
+    same_account(config)
+    await db.commit()
+
+    _, error = await _probe(
+        gate, factory, project_id, principal.user.id, kind, config, access.secret
+    )
+    if error is not None:
+        _audit_failed_test(db, request, principal, project_id, connection_id, kind, config, error)
+        # Committed first: the rollback that follows an error would erase the audit row.
+        await db.commit()
+        raise APIError(422, "CONNECTION_FAILED", error.message, reason=error.reason)
+
+    # As after any wait: everything is read again, and the row is locked for the write.
+    project, _ = await require_project_access(db, principal, project_id, contribute=True)
+    ensure_writable_project(project)
+    row = await db.scalar(
+        select(DataConnection)
+        .where(DataConnection.id == connection_id, DataConnection.project_id == project_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if row is None:
+        raise APIError(404, "NOT_FOUND", "Connection was not found")
+    same_account(row.config)
+    await _use_grant(db, principal, project_id, body.grant_id)
+    row.secret_ciphertext = box.seal(access.secret)
+    # The same account may have changed its address since.
+    row.config = {**row.config, "account_email": access.email}
+    row.last_tested_at = datetime.now(UTC)
+    row.last_error_code = None
+    record_audit(
+        db,
+        actor_user_id=principal.user.id,
+        action="connection.reauthorized",
+        resource_type="data_connection",
+        resource_id=connection_id,
+        project_id=project_id,
+        request_id=getattr(request.state, "request_id", None),
+        details={"kind": kind, **_audit_target(config)},
+    )
+    await db.flush()
+    return ok(_item(row), "Connection reauthorized")
 
 
 @router.get(
