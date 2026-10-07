@@ -554,13 +554,17 @@ async def get_run_events(
         or 0
     )
     rows = (
-        await db.execute(
-            select(RunEvent)
-            .where(RunEvent.run_id == run.id, RunEvent.seq > after)
-            .order_by(RunEvent.seq.asc())
-            .limit(limit)
+        (
+            await db.execute(
+                select(RunEvent)
+                .where(RunEvent.run_id == run.id, RunEvent.seq > after)
+                .order_by(RunEvent.seq.asc())
+                .limit(limit)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     items = [
         RunEventItem(
             seq=e.seq,
@@ -615,12 +619,16 @@ async def stream_run_events(
         # Historical events stream without pacing
         async with factory() as db:
             historical = (
-                await db.execute(
-                    select(RunEvent)
-                    .where(RunEvent.run_id == run_id, RunEvent.seq > current_seq)
-                    .order_by(RunEvent.seq.asc())
+                (
+                    await db.execute(
+                        select(RunEvent)
+                        .where(RunEvent.run_id == run_id, RunEvent.seq > current_seq)
+                        .order_by(RunEvent.seq.asc())
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             for evt in historical:
                 current_seq = evt.seq
                 item = RunEventItem(
@@ -634,9 +642,7 @@ async def stream_run_events(
                 )
                 yield f"event: run-event\nid: {evt.seq}\ndata: {item.model_dump_json()}\n\n"
 
-            run_status = await db.scalar(
-                select(ResearchRun.status).where(ResearchRun.id == run_id)
-            )
+            run_status = await db.scalar(select(ResearchRun.status).where(ResearchRun.id == run_id))
             if run_status in ("completed", "failed", "budget_exceeded"):
                 yield f'event: run-ended\ndata: {{"status":"{run_status}"}}\n\n'
                 return
@@ -657,12 +663,16 @@ async def stream_run_events(
                     async with factory() as db:
                         await get_principal(request, db)
                         new_events = (
-                            await db.execute(
-                                select(RunEvent)
-                                .where(RunEvent.run_id == run_id, RunEvent.seq > current_seq)
-                                .order_by(RunEvent.seq.asc())
+                            (
+                                await db.execute(
+                                    select(RunEvent)
+                                    .where(RunEvent.run_id == run_id, RunEvent.seq > current_seq)
+                                    .order_by(RunEvent.seq.asc())
+                                )
                             )
-                        ).scalars().all()
+                            .scalars()
+                            .all()
+                        )
                         for evt in new_events:
                             current_seq = evt.seq
                             had_new_events = True
@@ -675,7 +685,8 @@ async def stream_run_events(
                                 actor=evt.actor,
                                 payload=evt.payload or {},
                             )
-                            yield f"event: run-event\nid: {evt.seq}\ndata: {item.model_dump_json()}\n\n"
+                            data = item.model_dump_json()
+                            yield f"event: run-event\nid: {evt.seq}\ndata: {data}\n\n"
 
                         run_status = await db.scalar(
                             select(ResearchRun.status).where(ResearchRun.id == run_id)

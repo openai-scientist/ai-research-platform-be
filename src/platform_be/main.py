@@ -29,8 +29,8 @@ from platform_be.services.google_drive_oauth import build_google_drive_oauth
 from platform_be.services.google_oauth import build_google_oauth
 from platform_be.services.invite_candidates_stream import InviteCandidatesHub
 from platform_be.services.notification_stream import NotificationHub
-from platform_be.services.run_event_stream import RunEventHub
 from platform_be.services.popper_client import build_popper_client
+from platform_be.services.run_event_stream import RunEventHub
 from platform_be.services.secret_box import SecretBox
 
 logger = logging.getLogger("platform_be.http")

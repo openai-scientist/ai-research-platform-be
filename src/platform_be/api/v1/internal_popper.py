@@ -24,8 +24,8 @@ from platform_be.models.research import (
 )
 from platform_be.services.access import lock_project_scope
 from platform_be.services.file_store import FileStore, get_file_store, iter_file, safe_filename
-from platform_be.services.runs import ingest_popper_state, normalize_popper_status
 from platform_be.services.run_event_stream import run_events_changed
+from platform_be.services.runs import ingest_popper_state, normalize_popper_status
 
 ArtifactKind = Literal["paper_pdf", "paper_tex", "figure", "results", "other"]
 

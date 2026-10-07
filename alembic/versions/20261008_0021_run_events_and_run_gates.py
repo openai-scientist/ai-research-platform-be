@@ -5,9 +5,8 @@ Revises: 20261007_0020
 Create Date: 2026-10-08
 """
 
-# pyrefly: ignore [missing-import]
 import sqlalchemy as sa
-# pyrefly: ignore [missing-import]
+
 from alembic import op
 
 revision = "20261008_0021"
@@ -18,12 +17,8 @@ depends_on = None
 
 def upgrade() -> None:
     # 1. Update research_runs: make dataset_version_id & research_context_id nullable
-    op.alter_column(
-        "research_runs", "dataset_version_id", existing_type=sa.Uuid(), nullable=True
-    )
-    op.alter_column(
-        "research_runs", "research_context_id", existing_type=sa.Uuid(), nullable=True
-    )
+    op.alter_column("research_runs", "dataset_version_id", existing_type=sa.Uuid(), nullable=True)
+    op.alter_column("research_runs", "research_context_id", existing_type=sa.Uuid(), nullable=True)
 
     # 2. Add topic-to-hypothesis fields to research_runs
     op.add_column("research_runs", sa.Column("topic", sa.Text(), nullable=True))
@@ -140,9 +135,5 @@ def downgrade() -> None:
     op.drop_column("research_runs", "domains")
     op.drop_column("research_runs", "topic")
 
-    op.alter_column(
-        "research_runs", "research_context_id", existing_type=sa.Uuid(), nullable=False
-    )
-    op.alter_column(
-        "research_runs", "dataset_version_id", existing_type=sa.Uuid(), nullable=False
-    )
+    op.alter_column("research_runs", "research_context_id", existing_type=sa.Uuid(), nullable=False)
+    op.alter_column("research_runs", "dataset_version_id", existing_type=sa.Uuid(), nullable=False)
