@@ -761,6 +761,27 @@ def test_a_real_server_accepts_good_details_and_names_what_is_wrong(run, pool, m
     run(scenario())
 
 
+def test_the_first_sign_in_of_an_account_works_without_tls(run, pool, mysql_url) -> None:
+    """Until an account has signed in once, the server asks for its password under an RSA key.
+
+    PyMySQL 1.2.1 to 1.2.3 lose the server's answer to that exchange: the sign-in succeeds
+    and the driver raises all the same.
+    """
+    user, password = f"first_{uuid4().hex[:12]}", f"pw-{uuid4().hex}"
+    with direct(mysql_url) as admin:
+        # Named, so the test cannot pass on a server whose default is another plugin.
+        admin.execute(
+            f"CREATE USER '{user}'@'%' IDENTIFIED WITH caching_sha2_password BY '{password}'"
+        )
+    try:
+        with direct(mysql_url) as admin:
+            admin.execute(f"GRANT SELECT ON `{mysql_url.database}`.* TO '{user}'@'%'")
+        run(real_connector(pool, mysql_url, username=user, password=password).test())
+    finally:
+        with direct(mysql_url) as admin:
+            admin.execute(f"DROP USER '{user}'@'%'")
+
+
 def test_browsing_lists_the_database_and_the_tables_and_columns_in_it(
     run, pool, mysql_url, database
 ) -> None:
