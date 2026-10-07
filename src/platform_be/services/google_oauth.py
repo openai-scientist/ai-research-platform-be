@@ -9,10 +9,11 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 
@@ -24,6 +25,12 @@ AUTHORIZATION_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 ISSUERS = frozenset({"https://accounts.google.com", "accounts.google.com"})
 TIMEOUT_SECONDS = 10
+# Profile pictures come from this domain only; nothing else is fetched on Google's word.
+PICTURE_HOST_SUFFIX = ".googleusercontent.com"
+PICTURE_TIMEOUT_SECONDS = 5
+# The address ends in the size Google cuts the picture to, 96 pixels unless asked.
+PICTURE_SIZE = re.compile(r"=s\d+(-c)?$")
+PICTURE_PIXELS = 256
 
 
 class GoogleOAuthError(Exception):
@@ -39,6 +46,8 @@ class GoogleIdentity:
     # The Google Workspace domain that manages the account; empty for a personal account.
     hosted_domain: str | None
     name: str | None
+    # Address of the account's profile picture, when Google gave one.
+    picture: str | None = None
 
 
 class GoogleOAuth:
@@ -90,14 +99,49 @@ class GoogleOAuth:
         return self._identity(claims)
 
     def _identity(self, claims: dict[str, Any]) -> GoogleIdentity:
-        hosted_domain, name = claims.get("hd"), claims.get("name")
+        hosted_domain, name, picture = claims.get("hd"), claims.get("name"), claims.get("picture")
         return GoogleIdentity(
             subject=claims["sub"],
             email=claims["email"],
             email_verified=claims.get("email_verified") is True,
             hosted_domain=hosted_domain if isinstance(hosted_domain, str) else None,
             name=name if isinstance(name, str) else None,
+            picture=picture if isinstance(picture, str) else None,
         )
+
+    async def fetch_picture(self, url: str, max_bytes: int) -> bytes | None:
+        """The profile picture at `url`, or None when it cannot be had.
+
+        Never raises: a picture is not worth a failed sign-in.
+        """
+        target = urlsplit(url)
+        if target.scheme != "https" or not (target.hostname or "").endswith(PICTURE_HOST_SUFFIX):
+            logger.warning("google sign-in: profile picture is not at a Google address")
+            return None
+        url = PICTURE_SIZE.sub(f"=s{PICTURE_PIXELS}-c", url)
+        try:
+            async with (
+                asyncio.timeout(PICTURE_TIMEOUT_SECONDS),
+                httpx.AsyncClient(
+                    timeout=PICTURE_TIMEOUT_SECONDS, transport=self._transport
+                ) as client,
+                client.stream("GET", url) as response,
+            ):
+                if not response.is_success:
+                    logger.warning(
+                        "google sign-in: profile picture refused: %s", response.status_code
+                    )
+                    return None
+                image = bytearray()
+                async for chunk in response.aiter_bytes():
+                    image += chunk
+                    if len(image) > max_bytes:
+                        logger.warning("google sign-in: profile picture is too large")
+                        return None
+                return bytes(image)
+        except Exception as exc:
+            logger.warning("google sign-in: profile picture not fetched: %s", type(exc).__name__)
+            return None
 
 
 async def request_token(

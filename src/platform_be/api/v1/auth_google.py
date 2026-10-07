@@ -1,3 +1,4 @@
+import logging
 import secrets
 from datetime import UTC, datetime
 
@@ -17,10 +18,13 @@ from platform_be.models.identity import AuthSession, User, UserStatus
 from platform_be.services import auth_emails
 from platform_be.services.access import lock_user
 from platform_be.services.audit import record_audit
+from platform_be.services.avatars import adopt_avatar
 from platform_be.services.email_sender import EmailSender, get_email_sender
+from platform_be.services.file_store import FileStore, get_file_store
 from platform_be.services.google_oauth import GoogleOAuth, GoogleOAuthError
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
+logger = logging.getLogger("platform_be.auth_google")
 
 STATE_COOKIE = "platform_google_state"
 STATE_MAX_AGE_SECONDS = 600
@@ -91,7 +95,8 @@ async def google_start(
         "cookie set, or to `/auth/login?error=CODE` with nothing changed. `CODE` is "
         "`GOOGLE_SIGN_IN_FAILED`, `GOOGLE_EMAIL_NOT_VERIFIED` (the address is not a "
         "verified Gmail or Google Workspace one) or `USER_SUSPENDED`. An unknown address "
-        "gets a new verified account; a known one is linked to the Google account."
+        "gets a new verified account; a known one is linked to the Google account. A user "
+        "without an avatar gets the Google profile picture; an uploaded avatar is kept."
     ),
     responses=FEATURE_OFF,
 )
@@ -103,6 +108,7 @@ async def google_callback(
     oauth: GoogleOAuth = Depends(get_google_oauth),
     db: AsyncSession = Depends(get_db),
     sender: EmailSender = Depends(get_email_sender),
+    store: FileStore = Depends(get_file_store),
 ) -> RedirectResponse:
     settings: Settings = request.app.state.settings
     app_url = settings.app_url.rstrip("/")
@@ -201,7 +207,18 @@ async def google_callback(
     # The cookie goes on the redirect itself: FastAPI drops cookies set on the injected
     # response when a handler returns its own.
     response = RedirectResponse(f"{app_url}/", status_code=302)
+    user_id, has_avatar = user.id, user.avatar_storage_key is not None
     await start_session(db, response, settings, user)
+    if identity.picture and not has_avatar:
+        # After the session is stored, and with no row locked while Google is asked: the
+        # user is signed in whether or not the picture arrives.
+        try:
+            image = await oauth.fetch_picture(identity.picture, settings.avatar_max_upload_bytes)
+            if image:
+                await adopt_avatar(db, store, request, user_id=user_id, image=image)
+        except Exception:
+            await db.rollback()
+            logger.warning("google sign-in: profile picture not kept", exc_info=True)
     if linked:
         # After the commit in start_session, so the email never describes a rolled-back link.
         subject, text, html = auth_emails.google_linked(user.email, now, password_cleared)

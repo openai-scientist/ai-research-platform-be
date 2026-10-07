@@ -1,6 +1,7 @@
 """User avatars: a small image kept in the file store under its own ``users/`` prefix."""
 
 import logging
+from collections.abc import AsyncIterator
 from pathlib import PurePosixPath
 from uuid import UUID, uuid4
 
@@ -109,6 +110,52 @@ async def replace_avatar(
         raise
     await _discard(store, old_key)
     return user
+
+
+async def adopt_avatar(
+    db: AsyncSession, store: FileStore, request: Request, *, user_id: UUID, image: bytes
+) -> bool:
+    """Give a user without an avatar this image; True when it became the avatar.
+
+    A user who has one keeps it: a picture someone chose is never replaced by one they did
+    not. Commits.
+    """
+    extension = sniff_image(image[:HEAD_BYTES])
+    if extension is None:
+        return False
+
+    async def chunks() -> AsyncIterator[bytes]:
+        yield image
+
+    # Stored before the user row is locked, like an upload.
+    new_key = f"users/{user_id}/avatar/{uuid4().hex}{extension}"
+    stored = await store.put(new_key, chunks())
+    try:
+        user = await lock_user(db, user_id)
+        adopted = user.avatar_storage_key is None
+        if adopted:
+            user.avatar_storage_key = new_key
+            user.avatar_content_type = AVATAR_TYPES[extension]
+            record_audit(
+                db,
+                actor_user_id=user_id,
+                action="user.avatar_updated",
+                resource_type="user",
+                resource_id=user_id,
+                request_id=getattr(request.state, "request_id", None),
+                details={
+                    "content_type": AVATAR_TYPES[extension],
+                    "size_bytes": stored.size_bytes,
+                    "source": "google",
+                },
+            )
+        await db.commit()
+    except Exception:
+        await _discard(store, new_key)
+        raise
+    if not adopted:
+        await _discard(store, new_key)
+    return adopted
 
 
 async def remove_avatar(
