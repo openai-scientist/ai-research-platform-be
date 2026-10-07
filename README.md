@@ -69,6 +69,12 @@ The tests of the BigQuery connector run against a stand-in for BigQuery's REST A
 PLATFORM_BIGQUERY_TEST_SERVICE_ACCOUNT=/path/to/key.json uv run pytest tests/test_bigquery_connector.py
 ```
 
+`tests/test_live_connectors.py` takes the whole flow, from a new connection to a run, through public databases on the internet: Rfam (MySQL), RNAcentral (PostgreSQL, password on its [help page](https://rnacentral.org/help/public-database)) and, with the key file above, BigQuery. It is skipped unless asked for, and CI never runs it:
+
+```bash
+PLATFORM_LIVE_CONNECTOR_TESTS=1 PLATFORM_LIVE_RNACENTRAL_PASSWORD=... uv run pytest tests/test_live_connectors.py -s
+```
+
 ## How the Platform works
 
 The project is the top-level scope: there is no organization or workspace above it.
@@ -82,7 +88,8 @@ Invite members by email              registered users only; role: project_manage
    ↓
 The invited user accepts             within 24 hours; no access to the project before that
    ↓
-Upload a dataset (CSV)               project: draft → data_ready
+Upload a dataset (CSV), or import    project: draft → data_ready
+one through a data connection
    ↓
 Write the research context           every save is a new version
    ↓
@@ -167,6 +174,8 @@ Someone who is not a member gets `404` for everything in a project, so its exist
 | Download dataset and result files | ✓ | ✓ | ✓ | ✓ |
 | Upload a dataset or a new version; rename a dataset | ✓ | ✓ | ✓ | 403 |
 | Upload or delete a project file | ✓ | ✓ | ✓ | 403 |
+| List data connections (never their credentials) | ✓ | ✓ | ✓ | ✓ |
+| Create, rename, delete or test a data connection; browse and preview through it; import from it | ✓ | ✓ | ✓ | 403 |
 | Save the research context | ✓ | ✓ | ✓ | 403 |
 | Start or sync a run; decide a frame review | ✓ | ✓ | ✓ | 403 |
 | Abandon a run | ✓ | ✓ | 403 | 403 |
@@ -180,6 +189,20 @@ Someone who is not a member gets `404` for everything in a project, so its exist
 CSV only. A file must be UTF-8, have a header row of unique, non-empty column names, at least one data row, and the same number of values on every row. The size limit is 50 MiB by default (`DATASET_MAX_UPLOAD_BYTES`); a header may have at most 2000 columns with names of at most 200 characters.
 
 The Platform records the row count, column names, size, and SHA-256. A file that fails a check is refused and nothing is stored.
+
+### Data connections
+
+The second way to bring data in: a project saves a connection to an external database, browses its tables, previews rows live, and imports one table or one `SELECT` statement as a dataset version. Kinds: `postgres` (Supabase included), `mysql` (MariaDB included) and `bigquery`.
+
+- **A run never queries the external database.** An import writes a CSV file checked the way an upload is, and the version records where it came from (`source_type`, `source`). Importing the same source again adds a version with what the source holds now.
+- **Creating a connection tests it.** Nothing is saved when the test fails; the answer is 422 `CONNECTION_FAILED` and `error.reason` says why (`auth_failed`, `tls_unavailable`, `host_not_allowed`, ...).
+- **Only the name can change.** Another host, database or user means deleting the connection and creating a new one, so stored credentials are never sent anywhere but where they were tested.
+- **Credentials** are encrypted with `CONNECTION_SECRET_KEY` before they are stored and are never returned, logged or audited. Without the key the feature is off: saved connections can still be listed, renamed and deleted, and everything that needs the credentials (creating, testing, browsing, previewing, importing) answers 503 `CONNECTIONS_NOT_CONFIGURED`.
+- **Reads are read-only as far as the connection can make them**: a read-only transaction, one statement per call, a time limit; on BigQuery only `SELECT`, within a scan limit. That stops writes to tables, not everything a database role may be allowed to do. The real protection is the role: connect as a user that can only read. Every member who may contribute to the project can run any `SELECT` that user can.
+- A preview returns at most 100 rows and stores nothing. An import that would exceed `DATASET_MAX_UPLOAD_BYTES`, or holds a value longer than 100 000 characters, is refused, never cut.
+- Previews and imports are audited with a hash of the SQL, not its text.
+
+An import runs inside the request, for up to `CONNECTION_IMPORT_TIMEOUT_SECONDS` (300). A client whose request is cut off on the way should list the datasets before trying again: the import may have finished.
 
 ### Project files
 
@@ -466,6 +489,15 @@ All paths start with `/api/v1`. Full schemas and error cases are in Swagger UI a
 | `GET` `PATCH` | `/projects/{id}/datasets/{dataset_id}` | Read; rename or describe |
 | `GET` `POST` | `/projects/{id}/datasets/{dataset_id}/versions` | List versions; upload a new version |
 | `GET` | `/projects/{id}/datasets/{dataset_id}/versions/{version_id}/download` | Download a version's file |
+| `POST` | `/projects/{id}/datasets/from-connection` | Import a table or a `SELECT` through a data connection as a new dataset |
+| `POST` | `/projects/{id}/datasets/{dataset_id}/versions/from-connection` | Import it again as the next version |
+| `GET` `POST` | `/projects/{id}/connections` | List data connections (`q`); test and save a new one (`kind`: `postgres`, `mysql`, `bigquery`) |
+| `GET` `PATCH` `DELETE` | `/projects/{id}/connections/{connection_id}` | Read; rename; delete with its stored credentials |
+| `POST` | `/projects/{id}/connections/{connection_id}/test` | Test again; the outcome is in `last_tested_at` and `last_error_code` |
+| `GET` | `/projects/{id}/connections/{connection_id}/schemas` | Schemas the database user can read (BigQuery: datasets) |
+| `GET` | `/projects/{id}/connections/{connection_id}/tables` | Tables and views of one `schema`, at most 500 (`search`) |
+| `GET` | `/projects/{id}/connections/{connection_id}/columns` | Column names and types of one `table` |
+| `POST` | `/projects/{id}/connections/{connection_id}/preview` | First rows of a table or a `SELECT`, as text |
 | `GET` `POST` | `/projects/{id}/files` | List files (`q`, `kind`); upload a PDF, CSV or Excel file (multipart: `file`) |
 | `GET` | `/projects/{id}/files/{file_id}/download` | Download a file |
 | `DELETE` | `/projects/{id}/files/{file_id}` | Delete a file |
@@ -561,8 +593,23 @@ Settings come from environment variables; `.env.example` lists them all with saf
 | `PUBLIC_BASE_URL` | Address Popper uses to call this API back, without `/api/v1`. |
 | `RUN_DEFAULT_BUDGET_USD` | Spending cap of a run when the user gives none (5). |
 | `RUN_MAX_BUDGET_USD` | Highest cap a user may ask for (20). |
+| `CONNECTION_SECRET_KEY` | Fernet key that encrypts the credentials of data connections. Empty: the feature is off. |
+| `CONNECTION_ALLOW_PRIVATE_HOSTS` | Lets a connection point at a loopback or private address (default `false`). Local development only: staging and production refuse to start with it, and the production Compose file does not pass it. |
+| `CONNECTION_CONNECT_TIMEOUT_SECONDS`, `CONNECTION_QUERY_TIMEOUT_SECONDS`, `CONNECTION_IMPORT_TIMEOUT_SECONDS` | Longest a connection attempt, a browse or preview, and a whole import may take (10, 60, 300). |
+| `CONNECTION_MAX_CONCURRENT_QUERIES`, `CONNECTION_MAX_CONCURRENT_PER_OWNER` | Calls to external databases running at once in one API process, and how many of them one project or one user may hold (4, 2). A call over the limit answers 429 `CONNECTION_BUSY` at once. |
+| `CONNECTION_PROBE_RATE_LIMIT`, `CONNECTION_QUERY_RATE_LIMIT` | Per user and window (`AUTH_SESSION_RATE_WINDOW_SECONDS`): connections created or tested (30), and reads through a saved one (120). Over it: 429 `RATE_LIMITED`. |
+| `CONNECTION_PREVIEW_MAX_ROWS` | Rows a preview returns (100). |
+| `CONNECTION_BIGQUERY_MAX_BYTES_BILLED` | The most one BigQuery query may scan, in bytes (1 GiB). |
 
 The two Popper keys are different secrets of at least 32 characters in production. The callback endpoints are reachable by anyone who can reach the API; the key is what protects them, so keep the API behind TLS.
+
+Generate the connection key once and keep a copy somewhere safe:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+A lost or replaced key leaves every saved connection unreadable (409 `CONNECTION_SECRET_UNREADABLE`): each one has to be deleted and created again. Datasets already imported are not affected.
 
 ## Operations
 
@@ -600,6 +647,16 @@ task prod:up
 task prod:migrate
 ```
 
+That order is for the first start only. **When a release brings a migration, migrate before the new code serves requests**: the new code reads columns the old schema does not have, and every dataset and run endpoint would answer 500 in between.
+
+```bash
+docker compose --env-file docker/prod.env.local -f docker/docker-compose.prod.yml build api
+task prod:migrate              # runs in a one-off container of the new image
+task prod:up
+```
+
+The data connection migrations (`20261006_0017` adds the connections table, `20261006_0018` adds where a dataset version came from) only add a table and columns with defaults, so existing rows need nothing. To roll back, start the previous code first, then downgrade with the new image, the only one that holds these migration scripts: `docker compose --env-file docker/prod.env.local -f docker/docker-compose.prod.yml run --rm api alembic downgrade 20261006_0017`, run before the image is replaced, or from a checkout of the new code. Downgrading to `20261006_0017` drops the two source columns, and with them the record of which versions were imported; downgrading to `20261006_0016` also deletes every saved connection and its credentials.
+
 Other shortcuts: `task prod:status`, `task prod:logs`, `task prod:down` (keeps the database and storage volumes). Each runs `docker compose --env-file docker/prod.env.local -f docker/docker-compose.prod.yml ...`.
 
 The production API binds to `127.0.0.1` and expects a TLS-terminating reverse proxy in front of it. PostgreSQL has no published host port.
@@ -616,4 +673,9 @@ EventSource clients reconnect to receive a fresh notification snapshot.
 - Sign-up depends on email: `RESEND_API_KEY` is required in `staging` and `production`, and while the provider is down or over quota no account can be verified, admin-created ones included.
 - The migration that adds email verification must run before the new code starts: the code reads a column the old schema does not have.
 - Production Compose does not configure Uvicorn's trusted proxy addresses, so behind a proxy all requests may share one IP and one login quota. Before public deployment, make Uvicorn trust only the real proxy addresses and add a shared rate limit at the ingress. Do not use caller-supplied forwarding headers as client identity.
+- Data connections reach hosts that users choose. Names are resolved once and the address checked: loopback, private, link-local (cloud metadata included) and IPv4-in-IPv6 transition ranges are refused, in staging as in production, and the connection is made to the checked address.
+- The limits on data connections (slots, per-user rates) are counted per API process, like the sign-in limit. Run one replica, or expect them to multiply by the number of workers.
+- TLS to an external database defaults to `require`: encrypted, certificate not checked, which also works with self-signed and private-CA servers. `verify-full` checks the certificate against public authorities and the host name; `disable` is for servers without TLS and sends the password and the rows in the clear.
+- An import keeps its request open for up to 300 seconds. A reverse proxy with a shorter read timeout cuts the response while the import still completes.
+- The server has no fixed outbound address yet, so a database behind an allowlist firewall cannot be connected.
 - The hosting platform is not selected yet.
