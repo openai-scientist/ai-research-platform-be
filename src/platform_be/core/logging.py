@@ -22,10 +22,14 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(data, ensure_ascii=False, default=str)
 
 
-class _HideGoogleCallbackQuery(logging.Filter):
-    """Cut the query string from the server's access line for the Google callback.
+# Where Google sends the browser back with a one-use code: sign-in, and Drive access.
+_GOOGLE_CALLBACKS = ("/auth/google/callback", "/connections/google/callback")
 
-    Uvicorn prints the full request target, and that one carries Google's sign-in code.
+
+class _HideGoogleCallbackQuery(logging.Filter):
+    """Cut the query string from the server's access line for the Google callbacks.
+
+    Uvicorn prints the full request target, and those carry Google's one-use code.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -34,7 +38,7 @@ class _HideGoogleCallbackQuery(logging.Filter):
             isinstance(args, tuple)
             and len(args) == 5
             and isinstance(args[2], str)
-            and "/auth/google/callback" in args[2]
+            and any(path in args[2] for path in _GOOGLE_CALLBACKS)
         ):
             record.args = (*args[:2], args[2].split("?", 1)[0], *args[3:])
         return True
