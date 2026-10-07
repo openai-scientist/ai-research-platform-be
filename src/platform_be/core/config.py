@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     popper_callback_key: SecretStr | None = None
     popper_timeout_seconds: float = Field(default=30, ge=1, le=300)
     # Address Popper uses to call this API back, without the API prefix.
-    public_base_url: str = "http://localhost:8000"
+    public_base_url: str = "http://localhost:8080"
     run_default_budget_usd: Decimal = Field(default=Decimal("5"), gt=0)
     run_max_budget_usd: Decimal = Field(default=Decimal("20"), gt=0)
     # Email goes through Resend. Without a key, local and test write each message to the log.

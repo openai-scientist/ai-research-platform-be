@@ -27,9 +27,9 @@ task migrate                   # in a second terminal, on a fresh database
 
 | What | Where |
 |---|---|
-| API | `http://localhost:8000` |
-| Swagger UI | `http://localhost:8000/docs` |
-| OpenAPI schema | `http://localhost:8000/openapi.json` |
+| API | `http://localhost:8080` |
+| Swagger UI | `http://localhost:8080/docs` |
+| OpenAPI schema | `http://localhost:8080/openapi.json` |
 | Liveness / readiness | `/api/v1/health/live`, `/api/v1/health/ready` (checks PostgreSQL) |
 
 Other shortcuts: `task down` (stops the stack, keeps the database volume), `task restart`, `task status`, `task logs`; `task --list` describes them all.

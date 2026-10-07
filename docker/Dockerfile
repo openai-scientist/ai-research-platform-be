@@ -22,5 +22,5 @@ COPY --chown=app:app src ./src
 # Uploaded files live here; a volume mounted on it inherits this ownership.
 RUN mkdir -p /app/var/storage && chown -R app:app /app/var
 USER app
-EXPOSE 8000
-CMD ["uvicorn", "platform_be.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-graceful-shutdown", "30"]
+EXPOSE 8080
+CMD ["uvicorn", "platform_be.main:app", "--host", "0.0.0.0", "--port", "8080", "--timeout-graceful-shutdown", "30"]

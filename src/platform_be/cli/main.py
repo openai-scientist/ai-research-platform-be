@@ -13,7 +13,7 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="Run the API server")
     run.add_argument("--host", default="0.0.0.0")
-    run.add_argument("--port", type=int, default=8000)
+    run.add_argument("--port", type=int, default=8080)
     run.add_argument("--reload", action="store_true")
     bootstrap = commands.add_parser("bootstrap-admin", help="Grant the first Platform Admin role")
     bootstrap.add_argument("--email", required=True)
