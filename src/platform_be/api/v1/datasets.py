@@ -1,8 +1,10 @@
 from datetime import UTC, datetime
+from pathlib import PurePosixPath
 from typing import IO, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
@@ -28,7 +30,7 @@ from platform_be.services.access import (
 )
 from platform_be.services.audit import record_audit
 from platform_be.services.connectors import ConnectorFactory, get_connector_factory
-from platform_be.services.connectors.base import QuerySource, Source
+from platform_be.services.connectors.base import ConnectorError, QuerySource, Source
 from platform_be.services.connectors.csv_export import (
     CellTooLarge,
     EmptyResult,
@@ -36,6 +38,7 @@ from platform_be.services.connectors.csv_export import (
     export_csv,
 )
 from platform_be.services.connectors.gate import ConnectionGate, get_connection_gate
+from platform_be.services.connectors.google_drive import NOT_XLSX, XlsxBook, open_workbook
 from platform_be.services.csv_inspection import DuplicateColumns, InvalidCsv, check_header
 from platform_be.services.dataset_ingest import (
     StoredCsv,
@@ -64,8 +67,8 @@ DATASET_ERRORS = {
 UPLOAD_ERRORS = {
     **DATASET_ERRORS,
     413: {"model": ErrorResponse, "description": "The file is larger than the upload limit"},
-    415: {"model": ErrorResponse, "description": "Only .csv files are accepted"},
-    422: {"model": ErrorResponse, "description": "The file is not a usable CSV dataset"},
+    415: {"model": ErrorResponse, "description": "Only .csv and .xlsx files are accepted"},
+    422: {"model": ErrorResponse, "description": "The file is not a usable dataset"},
 }
 IMPORT_ERRORS = {
     **READ_ERRORS,
@@ -211,14 +214,59 @@ async def _latest_versions(db: AsyncSession, dataset_ids: list[UUID]) -> dict[UU
     return {version.dataset_id: version for version in rows}
 
 
+async def _workbook_csv(file: IO[bytes], max_bytes: int) -> IO[bytes]:
+    """The first sheet of an uploaded Excel workbook, as a temporary CSV file.
+
+    Its first row names the columns, the way a tab read through a connection is a table.
+    """
+    try:
+        workbook = await run_in_threadpool(open_workbook, file, max_bytes)
+        try:
+            book = XlsxBook(workbook, run_in_threadpool)
+            sheets = await book.tables()
+            if not sheets:
+                raise ConnectorError("source_malformed", NOT_XLSX)
+            stream = await book.read(sheets[0], max_rows=None)
+            check_header([column.name for column in stream.columns])
+            return await export_csv(stream, max_bytes=max_bytes)
+        finally:
+            await run_in_threadpool(workbook.close)
+    except ResultTooLarge:
+        raise APIError(
+            413, "DATASET_TOO_LARGE", f"The first sheet takes more than {max_bytes} bytes as CSV"
+        ) from None
+    except CellTooLarge as exc:
+        raise APIError(422, "INVALID_DATASET", str(exc)) from None
+    except EmptyResult:
+        raise APIError(
+            422, "INVALID_DATASET", "The first sheet needs a header row and at least one data row"
+        ) from None
+    except InvalidCsv as exc:
+        raise APIError(422, "INVALID_DATASET", str(exc)) from exc
+    except ConnectorError as exc:
+        if exc.reason == "source_too_large":
+            raise APIError(413, "DATASET_TOO_LARGE", exc.message) from None
+        raise APIError(422, "INVALID_DATASET", exc.message) from None
+
+
 async def _receive_csv(
-    upload: UploadFile, store: FileStore, version_id: UUID, key: str
+    upload: UploadFile, store: FileStore, version_id: UUID, key: str, max_bytes: int
 ) -> StoredCsv:
-    """Validate the uploaded CSV and store it. Nothing is stored when the file is rejected."""
+    """Validate the uploaded CSV or Excel file and store it as CSV.
+
+    Nothing is stored when the file is rejected.
+    """
     filename = safe_filename(upload.filename, "dataset.csv")
-    if not filename.lower().endswith(".csv"):
-        raise APIError(415, "UNSUPPORTED_FILE_TYPE", "Only .csv files are accepted")
-    summary, stored = await store_csv(upload.file, store, key)
+    extension = PurePosixPath(filename).suffix.lower()
+    if extension == ".csv":
+        summary, stored = await store_csv(upload.file, store, key)
+    elif extension == ".xlsx":
+        with await _workbook_csv(upload.file, max_bytes) as handle:
+            summary, stored = await store_csv(handle, store, key)
+        # What is stored and downloaded is the CSV, so the name says so.
+        filename = filename[: -len(extension)] + ".csv"
+    else:
+        raise APIError(415, "UNSUPPORTED_FILE_TYPE", "Only .csv and .xlsx files are accepted")
     return StoredCsv(version_id, key, filename, summary, stored)
 
 
@@ -406,7 +454,8 @@ async def list_datasets(
     status_code=201,
     summary="Upload a new dataset",
     description=(
-        "Send a multipart form with `name`, optional `description`, and a UTF-8 `.csv` file. "
+        "Send a multipart form with `name`, optional `description`, and a UTF-8 `.csv` file or an "
+        "Excel `.xlsx` workbook, whose first sheet is stored as CSV. "
         "The file becomes version 1. Project Manager or Researcher only."
     ),
     responses=UPLOAD_ERRORS,
@@ -416,7 +465,7 @@ async def create_dataset(
     request: Request,
     name: str = Form(min_length=2, max_length=160),
     description: str | None = Form(default=None, max_length=5000),
-    file: UploadFile = File(description="UTF-8 CSV with a header row"),
+    file: UploadFile = File(description="UTF-8 CSV or .xlsx workbook, with a header row"),
     principal: Principal = Depends(require_active_csrf),
     db: AsyncSession = Depends(get_db),
     store: FileStore = Depends(get_file_store),
@@ -433,7 +482,11 @@ async def create_dataset(
     # The file is stored before any lock is taken, so a slow upload never blocks the project.
     dataset_id, version_id = uuid4(), uuid4()
     csv = await _receive_csv(
-        file, store, version_id, storage_key(project_id, dataset_id, version_id)
+        file,
+        store,
+        version_id,
+        storage_key(project_id, dataset_id, version_id),
+        request.app.state.settings.dataset_max_upload_bytes,
     )
     dataset, version = await create_dataset_with_version(
         db,
@@ -600,14 +653,17 @@ async def list_dataset_versions(
     response_model=ApiResponse[DatasetVersionItem],
     status_code=201,
     summary="Upload a new version of a dataset",
-    description="Earlier versions stay as they are. Project Manager or Researcher only.",
+    description=(
+        "A `.csv` file or an `.xlsx` workbook, as for a new dataset. Earlier versions stay as "
+        "they are. Project Manager or Researcher only."
+    ),
     responses=UPLOAD_ERRORS,
 )
 async def add_dataset_version(
     project_id: UUID,
     dataset_id: UUID,
     request: Request,
-    file: UploadFile = File(description="UTF-8 CSV with a header row"),
+    file: UploadFile = File(description="UTF-8 CSV or .xlsx workbook, with a header row"),
     principal: Principal = Depends(require_active_csrf),
     db: AsyncSession = Depends(get_db),
     store: FileStore = Depends(get_file_store),
@@ -618,7 +674,11 @@ async def add_dataset_version(
 
     version_id = uuid4()
     csv = await _receive_csv(
-        file, store, version_id, storage_key(project_id, dataset_id, version_id)
+        file,
+        store,
+        version_id,
+        storage_key(project_id, dataset_id, version_id),
+        request.app.state.settings.dataset_max_upload_bytes,
     )
     version = await append_version(
         db,
@@ -680,7 +740,7 @@ async def import_dataset_version(
     summary="Download the file of a dataset version",
     response_class=StreamingResponse,
     responses={
-        200: {"content": {"text/csv": {}}, "description": "The file exactly as it was uploaded"},
+        200: {"content": {"text/csv": {}}, "description": "The version's CSV file"},
         404: DATASET_ERRORS[404],
     },
 )

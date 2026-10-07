@@ -1,5 +1,7 @@
 import hashlib
+import io
 
+import openpyxl
 import pytest
 from httpx import AsyncClient
 
@@ -93,7 +95,7 @@ async def test_rejected_uploads_leave_nothing_behind(harness: Harness, tmp_path)
         assert bad.status_code == 422
         assert bad.json()["error"]["code"] == "INVALID_DATASET"
 
-        wrong_type = await upload_dataset(client, session, project["id"], filename="scores.xlsx")
+        wrong_type = await upload_dataset(client, session, project["id"], filename="scores.xls")
         assert wrong_type.status_code == 415
         assert wrong_type.json()["error"]["code"] == "UNSUPPORTED_FILE_TYPE"
 
@@ -213,3 +215,68 @@ async def test_csv_with_an_unreasonable_header_is_refused(harness: Harness) -> N
             refused = await upload_dataset(client, session, project["id"], content=content)
             assert refused.status_code == 422
             assert refused.json()["error"]["code"] == "INVALID_DATASET"
+
+
+def xlsx(*sheets: list[list]) -> bytes:
+    book = openpyxl.Workbook()
+    book.remove(book.active)
+    for number, rows in enumerate(sheets):
+        sheet = book.create_sheet(f"Sheet{number}")
+        for row in rows:
+            sheet.append(row)
+    saved = io.BytesIO()
+    book.save(saved)
+    return saved.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_excel_upload_is_stored_as_the_csv_of_its_first_sheet(
+    harness: Harness, tmp_path
+) -> None:
+    async with harness.client() as client:
+        session = await login(harness, client, uid="owner", email="owner@example.com")
+        project = await create_project(client, session)
+        base = f"{PROJECTS}/{project['id']}/datasets"
+        workbook = xlsx(
+            [["student_id", "school", "exam_score"], [1, "A", 70], [2, "Trường B", 81.5]],
+            [["ignored"], ["x"]],
+        )
+
+        created = await upload_dataset(
+            client, session, project["id"], content=workbook, filename="Scores.XLSX"
+        )
+        assert created.status_code == 201, created.text
+        version = created.json()["data"]["latest_version"]
+        assert version["original_filename"] == "Scores.csv"
+        assert version["column_names"] == ["student_id", "school", "exam_score"]
+        assert version["row_count"] == 2
+        assert version["source_type"] == "upload"
+
+        dataset_id = created.json()["data"]["id"]
+        download = await client.get(f"{base}/{dataset_id}/versions/{version['id']}/download")
+        expected = "student_id,school,exam_score\r\n1,A,70\r\n2,Trường B,81.5\r\n"
+        assert download.content.decode() == expected
+        assert version["sha256"] == hashlib.sha256(download.content).hexdigest()
+
+        added = await client.post(
+            f"{base}/{dataset_id}/versions",
+            files={"file": ("more.xlsx", xlsx([["a"], [1]]), "application/octet-stream")},
+            headers=mutation_headers(session["csrf_token"]),
+        )
+        assert added.status_code == 201, added.text
+        assert added.json()["data"]["version_number"] == 2
+
+        stored_before = [path for path in (tmp_path / "storage").rglob("*") if path.is_file()]
+        for name, content in (
+            ("renamed.xlsx", CSV),
+            ("header-only.xlsx", xlsx([["a", "b"]])),
+            ("same-names.xlsx", xlsx([["a", "a"], [1, 2]])),
+            ("unnamed-column.xlsx", xlsx([["a", None], [1, 2]])),
+        ):
+            refused = await upload_dataset(
+                client, session, project["id"], name=name, content=content, filename=name
+            )
+            assert refused.status_code == 422, (name, refused.text)
+            assert refused.json()["error"]["code"] == "INVALID_DATASET"
+        stored = [path for path in (tmp_path / "storage").rglob("*") if path.is_file()]
+        assert stored == stored_before
