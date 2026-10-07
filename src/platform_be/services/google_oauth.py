@@ -77,56 +77,70 @@ class GoogleOAuth:
             "redirect_uri": self._redirect_uri,
             "grant_type": "authorization_code",
         }
-        try:
-            async with (
-                asyncio.timeout(TIMEOUT_SECONDS),
-                httpx.AsyncClient(timeout=TIMEOUT_SECONDS, transport=self._transport) as client,
-            ):
-                response = await client.post(TOKEN_URL, data=form)
-        except Exception as exc:
-            # The code and the secret stay out of the log.
-            logger.error("google sign-in: token request failed: %s", type(exc).__name__)
-            raise GoogleOAuthError from None
+        response = await request_token(form, transport=self._transport, flow="google sign-in")
         if not response.is_success:
             # Usual for a code that was used before or made up.
             logger.warning("google sign-in: token request refused: %s", response.status_code)
             raise GoogleOAuthError
         try:
-            claims = _claims(response.json()["id_token"])
+            claims = id_token_claims(response.json()["id_token"], self._client_id)
         except Exception:
-            logger.error("google sign-in: the answer carries no readable ID token")
+            logger.error("google sign-in: the answer carries no valid ID token for this client")
             raise GoogleOAuthError from None
         return self._identity(claims)
 
     def _identity(self, claims: dict[str, Any]) -> GoogleIdentity:
-        subject, email, expires_at = claims.get("sub"), claims.get("email"), claims.get("exp")
-        if (
-            claims.get("aud") != self._client_id
-            or not isinstance(claims.get("iss"), str)
-            or claims["iss"] not in ISSUERS
-            or not isinstance(expires_at, int | float)
-            or expires_at <= time.time()
-            or not (isinstance(subject, str) and subject)
-            or not (isinstance(email, str) and email)
-        ):
-            logger.error("google sign-in: the ID token is not a valid one for this client")
-            raise GoogleOAuthError
         hosted_domain, name = claims.get("hd"), claims.get("name")
         return GoogleIdentity(
-            subject=subject,
-            email=email,
+            subject=claims["sub"],
+            email=claims["email"],
             email_verified=claims.get("email_verified") is True,
             hosted_domain=hosted_domain if isinstance(hosted_domain, str) else None,
             name=name if isinstance(name, str) else None,
         )
 
 
-def _claims(id_token: str) -> dict[str, Any]:
-    """The payload of a JWT: the middle of its three base64url parts."""
+async def request_token(
+    form: dict[str, str], *, transport: httpx.AsyncBaseTransport | None, flow: str
+) -> httpx.Response:
+    """Post to Google's token endpoint; GoogleOAuthError when no answer comes back.
+
+    `flow` names the caller in the log. The form holds a code or a token, and the client
+    secret: none of it is logged.
+    """
+    try:
+        async with (
+            asyncio.timeout(TIMEOUT_SECONDS),
+            httpx.AsyncClient(timeout=TIMEOUT_SECONDS, transport=transport) as client,
+        ):
+            return await client.post(TOKEN_URL, data=form)
+    except Exception as exc:
+        logger.error("%s: token request failed: %s", flow, type(exc).__name__)
+        raise GoogleOAuthError from None
+
+
+def id_token_claims(id_token: str, client_id: str) -> dict[str, Any]:
+    """The claims of an ID token Google issued to this client, with `sub` and `email` set.
+
+    Raises ValueError for any other token. The token must come straight from Google's token
+    endpoint: the signature is not checked.
+    """
+    # The payload of a JWT: the middle of its three base64url parts.
     payload = id_token.split(".")[1]
     claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
     if not isinstance(claims, dict):
         raise ValueError("ID token payload is not an object")
+    subject, email, expires_at = claims.get("sub"), claims.get("email"), claims.get("exp")
+    if (
+        claims.get("aud") != client_id
+        or not isinstance(claims.get("iss"), str)
+        or claims["iss"] not in ISSUERS
+        or not isinstance(expires_at, int | float)
+        or expires_at <= time.time()
+        or not (isinstance(subject, str) and subject)
+        or not (isinstance(email, str) and email)
+    ):
+        raise ValueError("ID token is not a valid one for this client")
     return claims
 
 
