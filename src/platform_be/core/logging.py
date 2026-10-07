@@ -22,6 +22,24 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(data, ensure_ascii=False, default=str)
 
 
+class _HideGoogleCallbackQuery(logging.Filter):
+    """Cut the query string from the server's access line for the Google callback.
+
+    Uvicorn prints the full request target, and that one carries Google's sign-in code.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if (
+            isinstance(args, tuple)
+            and len(args) == 5
+            and isinstance(args[2], str)
+            and "/auth/google/callback" in args[2]
+        ):
+            record.args = (*args[:2], args[2].split("?", 1)[0], *args[3:])
+        return True
+
+
 def configure_logging(level: str = "INFO") -> None:
     handler = logging.StreamHandler()
     handler.setFormatter(JsonFormatter())
@@ -32,3 +50,6 @@ def configure_logging(level: str = "INFO") -> None:
     # The storage SDK logs every request at debug level, signed headers included.
     for name in ("boto3", "botocore", "s3transfer", "urllib3", "httpx", "httpcore", "hpack"):
         logging.getLogger(name).setLevel(logging.INFO)
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(item, _HideGoogleCallbackQuery) for item in access.filters):
+        access.addFilter(_HideGoogleCallbackQuery())
