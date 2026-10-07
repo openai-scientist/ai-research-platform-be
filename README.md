@@ -6,18 +6,46 @@ The research itself is done by **Popper**, a separate service. The Platform send
 
 ## Contents
 
-- [Quick start](#quick-start)
+- [Features](#features)
+- [Tech stack](#tech-stack)
+- [Getting started](#getting-started)
+- [Project structure](#project-structure)
+- [Development](#development)
 - [How the Platform works](#how-the-platform-works)
 - [Roles and permissions](#roles-and-permissions)
 - [Research features](#research-features)
-- [Authentication](#authentication)
+- [Accounts and authentication](#accounts-and-authentication)
 - [API reference](#api-reference)
+- [Frontend integration](#frontend-integration)
 - [Configuration](#configuration)
-- [Operations](#operations)
+- [Deployment and operations](#deployment-and-operations)
 
-## Quick start
+## Features
 
-You need Python 3.12+, [`uv`](https://docs.astral.sh/uv/), Docker with the Compose plugin, and [Task](https://taskfile.dev/docs/installation).
+- **Accounts and sessions**: email and password sign-up with an emailed 6-digit code, cookie sessions with CSRF protection, password reset, profile pictures, accounts created by an admin.
+- **Projects and members**: five fixed roles, invitations by email that expire after 24 hours, archive and restore, no hard delete.
+- **Research inputs**: versioned CSV datasets (uploaded, or imported through a data connection to PostgreSQL, MySQL or BigQuery), project files, a versioned research context.
+- **Runs**: one run at a time per project, sent to Popper with a spending cap; frame review; result files.
+- **Collaboration**: comments on runs and result files, notifications over SSE, an audit log of every change.
+
+## Tech stack
+
+| Area | Choice |
+|---|---|
+| Language and API | Python 3.12+, FastAPI, Uvicorn |
+| Database | PostgreSQL 16, SQLAlchemy (async, `asyncpg`), Alembic migrations |
+| File storage | A local directory or a Cloudflare R2 bucket |
+| Email | Resend |
+| External data | `asyncpg` (PostgreSQL), PyMySQL (MySQL), `google-cloud-bigquery` |
+| Tooling | [`uv`](https://docs.astral.sh/uv/), Ruff, pytest, Docker Compose, [Task](https://taskfile.dev/docs/installation) |
+
+## Getting started
+
+### Prerequisites
+
+Python 3.12+, [`uv`](https://docs.astral.sh/uv/), Docker with the Compose plugin, and [Task](https://taskfile.dev/docs/installation).
+
+### Run the local stack
 
 ```bash
 cp .env.example .env.local
@@ -32,7 +60,7 @@ task migrate                   # in a second terminal, on a fresh database
 | OpenAPI schema | `http://localhost:8080/openapi.json` |
 | Liveness / readiness | `/api/v1/health/live`, `/api/v1/health/ready` (checks PostgreSQL) |
 
-Other shortcuts: `task down` (stops the stack, keeps the database volume), `task restart`, `task status`, `task logs`; `task --list` describes them all.
+### The first Platform Admin
 
 The local stack starts with a Platform Admin: `admin@gmail.com`, with the password set in `DEFAULT_ADMIN_PASSWORD` (see `.env.example`). It is created once the migrations have been applied (`task migrate`, then `task restart`).
 
@@ -44,7 +72,45 @@ docker compose --env-file .env.local -f docker/docker-compose.dev.yml run --rm a
 
 The command refuses to run when a Platform Admin already exists, and does not accept an unregistered, unverified or suspended account.
 
-Tests and static checks, on the host:
+### Task shortcuts
+
+| Command | What it does |
+|---|---|
+| `task up` | Start or rebuild the local API and PostgreSQL |
+| `task down` | Stop the stack, keep the database volume |
+| `task restart` | Restart the containers without rebuilding |
+| `task status`, `task logs` | Container status; follow the logs |
+| `task migrate` | Apply pending database migrations |
+| `task prod:*` | The same for the production stack; see [Production stack](#production-stack) |
+
+`task --list` describes them all.
+
+## Project structure
+
+```text
+src/platform_be/
+  main.py          the FastAPI application
+  api/v1/          routes, one module per resource
+  auth/            sessions
+  cli/             the `platform-be` command: `run`, `bootstrap-admin`
+  core/            settings, errors, response envelope, middleware, roles, security
+  db/              engine and session
+  models/          SQLAlchemy models
+  services/        business rules, file stores, email, the Popper client
+    connectors/    PostgreSQL, MySQL and BigQuery connectors, with the network guard
+alembic/           database migrations
+docker/            Dockerfile, Compose files for dev and prod, the prod settings template
+tests/             pytest suite
+Taskfile.yml       shortcuts for the two stacks
+```
+
+`docs/` holds the frontend handoff documents and the Popper contract. It is kept locally and is not tracked in Git.
+
+## Development
+
+### Tests and static checks
+
+On the host:
 
 ```bash
 uv sync --all-groups
@@ -53,9 +119,16 @@ uv run ruff check src alembic tests
 uv run pytest
 ```
 
-Tests run on SQLite in memory. The tests that need real PostgreSQL behaviour (locks, concurrent requests) are skipped unless `PLATFORM_POSTGRES_TEST_URL` points at a scratch database.
+Tests run on SQLite in memory. Some need a real service and are skipped unless a variable points at one:
 
-The tests of the MySQL connector that need a real server are skipped unless `PLATFORM_MYSQL_TEST_URL` points at one, as a user who can create databases and users. The Platform itself runs no MySQL: a throwaway container is enough, and it is gone once stopped.
+| Variable | Turns on |
+|---|---|
+| `PLATFORM_POSTGRES_TEST_URL` | Tests of real PostgreSQL behaviour (locks, concurrent requests), against a scratch database |
+| `PLATFORM_MYSQL_TEST_URL` | Tests of the MySQL connector against a real server |
+| `PLATFORM_BIGQUERY_TEST_SERVICE_ACCOUNT` | The one test that talks to BigQuery itself |
+| `PLATFORM_LIVE_CONNECTOR_TESTS=1` | The whole flow through public databases on the internet |
+
+**MySQL.** The URL must be of a user who can create databases and users. The Platform itself runs no MySQL: a throwaway container is enough, and it is gone once stopped.
 
 ```bash
 docker run --rm -d --name connector-test-mysql -e MYSQL_ROOT_PASSWORD=scratch -e MYSQL_DATABASE=connector_test -p 127.0.0.1:3306:3306 --tmpfs /var/lib/mysql mysql:8
@@ -63,17 +136,27 @@ PLATFORM_MYSQL_TEST_URL=mysql://root:scratch@127.0.0.1:3306/connector_test uv ru
 docker stop connector-test-mysql
 ```
 
-The tests of the BigQuery connector run against a stand-in for BigQuery's REST API, through Google's own client library. One test talks to BigQuery itself and is skipped unless `PLATFORM_BIGQUERY_TEST_SERVICE_ACCOUNT` is the path of a service account key file. The account needs the roles BigQuery Job User and BigQuery Data Viewer on its project; the test reads a few rows of a public dataset, which is billed to that project (well inside the free monthly quota). CI never runs it.
+**BigQuery.** The connector tests run against a stand-in for BigQuery's REST API, through Google's own client library. One test talks to BigQuery itself and needs the path of a service account key file. The account needs the roles BigQuery Job User and BigQuery Data Viewer on its project; the test reads a few rows of a public dataset, which is billed to that project (well inside the free monthly quota). CI never runs it.
 
 ```bash
 PLATFORM_BIGQUERY_TEST_SERVICE_ACCOUNT=/path/to/key.json uv run pytest tests/test_bigquery_connector.py
 ```
 
-`tests/test_live_connectors.py` takes the whole flow, from a new connection to a run, through public databases on the internet: Rfam (MySQL), RNAcentral (PostgreSQL, password on its [help page](https://rnacentral.org/help/public-database)) and, with the key file above, BigQuery. It is skipped unless asked for, and CI never runs it:
+**Public databases.** `tests/test_live_connectors.py` takes the whole flow, from a new connection to a run, through Rfam (MySQL), RNAcentral (PostgreSQL, password on its [help page](https://rnacentral.org/help/public-database)) and, with the key file above, BigQuery. CI never runs it.
 
 ```bash
 PLATFORM_LIVE_CONNECTOR_TESTS=1 PLATFORM_LIVE_RNACENTRAL_PASSWORD=... uv run pytest tests/test_live_connectors.py -s
 ```
+
+### Migrations
+
+Alembic owns the database schema. App startup never creates or migrates tables. Apply migrations once during local setup or deployment with `task migrate`. Do not point a developer command at a production database.
+
+### Running without Popper
+
+Leave `POPPER_BASE_URL` empty. Everything works except the three actions that talk to Popper (starting a run, syncing a run, deciding a frame review), which answer `503 POPPER_NOT_CONFIGURED`. The test suite uses an in-memory stand-in (`tests/fakes.py`).
+
+The API Popper must offer, and the two endpoints it calls back, are specified in `docs/popper-integration-contract.md`. Popper v2 does not implement that contract yet.
 
 ## How the Platform works
 
@@ -153,7 +236,7 @@ There are five fixed roles. A role alone decides access: there is no permission 
 
 Someone who is not a member gets `404` for everything in a project, so its existence is not revealed. A member whose role is too low gets `403 ROLE_REQUIRED`.
 
-**Projects**
+### Projects
 
 | Action | Platform Admin | Project Manager | Researcher / Reviewer |
 |---|:-:|:-:|:-:|
@@ -166,7 +249,7 @@ Someone who is not a member gets `404` for everything in a project, so its exist
 | Complete / reopen | ✓ | ✓ | 403 |
 | Read the project audit log | ✓ | ✓ | 404 |
 
-**Inside a project**
+### Inside a project
 
 | Action | Platform Admin | Project Manager | Researcher | Reviewer |
 |---|:-:|:-:|:-:|:-:|
@@ -263,13 +346,9 @@ Notifications are created for these events:
 
 Membership notices go to the one person concerned and never to the person who acted. Archiving, restoring, completing, reopening and starting a run notify nobody. `added_to_project` is an older kind: it is no longer created, and existing ones are still listed.
 
-A notification carries no text; the frontend words it from `kind`. Only invitations are also sent by email.
+A notification carries no text; the frontend words it from `kind`. Only invitations are also sent by email. Clients receive them live over SSE: see [Realtime notifications](#realtime-notifications).
 
 ### Project invitations
-
-`GET /projects/{id}/invite-candidates` gives Project Managers and Platform Admins a paginated user picker (`q`, `limit`, `offset`). It returns only active, email-verified regular user accounts (excluding Platform Admins) with `id`, `email`, `display_name` and `avatar_url`. Active members and pending invitations, even expired ones, are excluded before counting and pagination. Revoked membership history does not exclude a user. Archived projects answer `409 PROJECT_ARCHIVED`. See [the frontend handoff](docs/api/project-invite-candidates-handoff.md) for examples.
-
-`GET /projects/{id}/invite-candidates/stream` accepts the same query parameters and follows that page with SSE. Each `invite-candidates` event contains the full GET envelope: replace the page and pagination. Snapshots arrive immediately and after committed membership/account changes, across API workers through PostgreSQL LISTEN/NOTIFY. Rollbacks publish nothing. `session-ended` or `access-ended` tells the frontend to close the stream; reconnect gets current state. Heartbeats revalidate access without polling candidates.
 
 `POST /projects/{id}/members` invites a registered user with a role. The member row is returned with `status: "invited"`, `invite_sent_at`, `invite_expires_at`, `invite_expired` and `invite_email_sent` (false when the email provider refused the message; the invitation still exists). The user gets a `project_invited` notification and an email.
 
@@ -291,49 +370,9 @@ A notification carries no text; the frontend words it from `kind`. Only invitati
 | 409 | `PROJECT_ARCHIVED` | Invite, resend or accept on an archived project |
 | 404 | `NOT_FOUND` | Accept or decline of an invitation that is not the caller's or is already answered |
 
-### Realtime notifications for frontend clients
+**Choosing whom to invite.** `GET /projects/{id}/invite-candidates` gives Project Managers and Platform Admins a paginated user picker (`q`, `limit`, `offset`). It returns only active, email-verified regular user accounts (excluding Platform Admins) with `id`, `email`, `display_name` and `avatar_url`. Active members and pending invitations, even expired ones, are excluded before counting and pagination. Revoked membership history does not exclude a user. Archived projects answer `409 PROJECT_ARCHIVED`. The same page can be followed live: see [Invite candidates stream](#invite-candidates-stream).
 
-Open authenticated SSE `GET /api/v1/notifications/stream?limit=50` after sign-in. `limit`
-defaults to `50` and accepts `1`–`100`; the server sends `notifications` immediately and
-after each committed notification, read/read-all action, or membership removal:
-
-```text
-event: notifications
-data: {"items":[{"id":"...","kind":"run_finished","project_id":"...","project_name":"...","run_id":null,"actor_user_id":null,"actor_display_name":null,"created_at":"...","read_at":null}],"unread_count":3}
-```
-
-`items` are newest first with the `NotificationItem` fields from `GET /notifications`. Each
-event is a snapshot: replace the window and badge, do not append or poll. `unread_count` is
-the total visible unread count. Reconnection gets another current snapshot; no cursor is used.
-
-```ts
-const stream = new EventSource("/api/v1/notifications/stream?limit=50", { withCredentials: true });
-stream.addEventListener("notifications", (event) => {
-  const { items, unread_count } = JSON.parse((event as MessageEvent<string>).data);
-  replaceNotificationWindow(items); setUnreadBadge(unread_count);
-});
-stream.addEventListener("session-ended", (event) => {
-  const { code } = JSON.parse((event as MessageEvent<string>).data);
-  stream.close(); beginSignInFlow(code); // SESSION_EXPIRED, USER_SUSPENDED, UNAUTHENTICATED
-});
-const stopNotifications = () => stream.close(); // call on logout/unmount; network errors reconnect
-```
-
-Ignore the 15-second keep-alive comment: it rechecks the session but does not extend idle
-expiry. Initial connection and notification snapshots use normal session activity. The proxy
-must disable buffering and use read/idle timeouts over 15 seconds. A separate frontend origin
-needs credential CORS for its exact origin and cross-site-capable cookies. `GET /notifications`
-remains for paginated history; the CSRF-protected read `POST`s trigger a new snapshot.
-
-Frontend integration instructions: [docs/notifications-handoff.md](./docs/notifications-handoff.md).
-
-### Running without Popper
-
-Leave `POPPER_BASE_URL` empty. Everything works except the three actions that talk to Popper (starting a run, syncing a run, deciding a frame review), which answer `503 POPPER_NOT_CONFIGURED`. The test suite uses an in-memory stand-in (`tests/fakes.py`).
-
-The API Popper must offer, and the two endpoints it calls back, are specified in `docs/popper-integration-contract.md` (kept locally; `docs/` is not tracked in Git). Popper v2 does not implement that contract yet.
-
-## Authentication
+## Accounts and authentication
 
 The Platform owns accounts, passwords, sessions, and roles; there is no external identity provider. The login name is the email address; there is no separate username.
 
@@ -352,9 +391,11 @@ The Platform owns accounts, passwords, sessions, and roles; there is no external
 | Edit own profile | `PATCH /api/v1/auth/me` with `{ "display_name" }` | `200`. The email cannot be changed. |
 | Set own picture | `POST /api/v1/auth/me/avatar`, a multipart form with one `file` | `200` with the new `avatar_url`. `415 UNSUPPORTED_IMAGE_TYPE`, `413 REQUEST_BODY_TOO_LARGE`. `DELETE` on the same path removes it. |
 
-`login` and `verify-email` set the HttpOnly session cookie and return the user, session expiry, and CSRF token. None of the six endpoints above the change-password row takes a CSRF token; all need an allowed `Origin`.
+`login` and `verify-email` set the HttpOnly session cookie and return the user, session expiry, and CSRF token. None of the seven endpoints above the change-password row takes a CSRF token; all need an allowed `Origin`.
 
-**One-time codes.** A code is 6 digits, emailed on its own labelled line, never in the subject. Only a keyed digest is stored.
+### One-time codes
+
+A code is 6 digits, emailed on its own labelled line, never in the subject. Only a keyed digest is stored.
 
 | Rule | Value | Setting |
 |---|---|---|
@@ -375,11 +416,18 @@ Sign-up codes and reset codes are counted separately and cannot stand in for eac
 - After `change-password` and `reset-password` the user is emailed a notice that the password changed.
 - When email is down or the provider's quota is spent, no new account can be verified. There is no bypass.
 
-**Rate limits**, per client address and API process, each over `AUTH_SESSION_RATE_WINDOW_SECONDS` (`429 RATE_LIMITED` with `Retry-After`): `login` and `register` share `AUTH_SESSION_RATE_LIMIT` (10); `verify-email`, `resend-verification`, `forgot-password`, `verify-reset-password` and `reset-password` share `AUTH_CODE_RATE_LIMIT` (20).
+### Passwords, sessions and rate limits
 
 Passwords are 8 to 128 characters. Only an scrypt hash with its own salt is stored (`PASSWORD_SCRYPT_LOG2_N` sets the cost); emails are compared without regard to letter case.
 
 A session stays valid for 30 days from login (`SESSION_ABSOLUTE_DAYS`) as long as it is used at least once every 7 days (`SESSION_IDLE_MINUTES`, default 10080). There is no refresh token: each request extends the idle window on the server.
+
+Rate limits are counted per client address and API process, each over `AUTH_SESSION_RATE_WINDOW_SECONDS` (60), and answer `429 RATE_LIMITED` with `Retry-After`:
+
+| Endpoints | Limit | Setting |
+|---|---|---|
+| `login`, `register` | 10, shared | `AUTH_SESSION_RATE_LIMIT` |
+| `verify-email`, `resend-verification`, `forgot-password`, `verify-reset-password`, `reset-password` | 20, shared | `AUTH_CODE_RATE_LIMIT` |
 
 ### Accounts created by a Platform Admin
 
@@ -405,8 +453,6 @@ Platform Admin cannot be granted at creation, and `PUT /api/v1/users/{id}/platfo
 
 The user list also shows `last_login_at` and `created_by_user_id` (the admin, or `null` for a self-registered account). `PATCH /api/v1/users/{id}` with `{ "display_name" }` lets an admin rename a user.
 
-What the Platform does not do: a code at every sign-in (two-factor), changing the email of an account, and alerts for a new device. Accounts that existed before email verification was added count as verified.
-
 ### Profile pictures
 
 A picture is a PNG, JPEG or WebP image of at most 4 MiB (`AVATAR_MAX_UPLOAD_BYTES`). The type is read from the first bytes of the file; its name and declared content type are ignored, so SVG, GIF and renamed files are refused.
@@ -417,130 +463,17 @@ A picture is a PNG, JPEG or WebP image of at most 4 MiB (`AVATAR_MAX_UPLOAD_BYTE
 - The `v` part changes with every upload. With the current `v` the response may be cached for a year; a URL without it, or with an old one, still returns the current picture but is checked again on every use. Always use the URL the API returned last.
 - Images are stored exactly as uploaded, in the same store as project files under `users/`. Cropping, resizing and removing photo metadata (a phone photo carries its location) are the frontend's job before upload.
 
-### Rules for the frontend
+### What the Platform does not do
 
-- Send every request with `credentials: "include"` and an `Origin` that exactly matches `CORS_ALLOWED_ORIGINS`.
-- Send the CSRF token in `X-CSRF-Token` on every mutation (`POST`, `PATCH`, `PUT`, `DELETE`) except the seven endpoints used before a session exists: `register`, `verify-email`, `resend-verification`, `login`, `forgot-password`, `verify-reset-password` and `reset-password`. After a page reload, get it again from `GET /api/v1/auth/csrf-token`.
-- Restore the signed-in user after a reload with `GET /api/v1/auth/me`. It returns the user, platform role (`user` or `platform_admin`, never empty), `email_verified`, `must_change_password`, session expiry, and `memberships`: the user's projects with the role in each.
-- On sign-out call `POST /api/v1/auth/logout`.
-- On `401` with `SESSION_EXPIRED` or `USER_SUSPENDED` the session cookie is already cleared; send the user back to sign-in.
+A code at every sign-in (two-factor), changing the email of an account, and alerts for a new device. Accounts that existed before email verification was added count as verified.
 
 ## API reference
 
 All paths start with `/api/v1`. Full schemas and error cases are in Swagger UI at `/docs`.
 
-**Session**
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/auth/register` | Create an account with email and password; emails a 6-digit code |
-| `POST` | `/auth/verify-email` | Enter the code and the password; verifies the email and sets the session cookie |
-| `POST` | `/auth/resend-verification` | Email a new verification code |
-| `POST` | `/auth/forgot-password` | Email a code to set a new password |
-| `POST` | `/auth/verify-reset-password` | Verify the reset OTP and return a one-use reset token |
-| `POST` | `/auth/reset-password` | Set a new password with the verified reset token; ends every session |
-| `POST` | `/auth/login` | Sign in with email and password; sets the session cookie |
-| `POST` | `/auth/change-password` | Change the password; signs out the user's other sessions |
-| `POST` | `/auth/logout` | End the current session |
-| `POST` | `/auth/logout-all` | End every session of the signed-in user, on all devices |
-| `GET` | `/auth/me` | Signed-in user, platform role, session expiry, and project memberships |
-| `PATCH` | `/auth/me` | Change your own display name |
-| `POST` `DELETE` | `/auth/me/avatar` | Upload, replace or remove your own picture |
-| `GET` | `/auth/csrf-token` | CSRF token for the current session |
-
-**Administration**
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/users` | List users (Platform Admin) |
-| `POST` | `/users` | Create a user from an email; returns the temporary password (Platform Admin) |
-| `PATCH` | `/users/{id}` | Change a user's display name (Platform Admin) |
-| `POST` | `/users/{id}/invite` | Email the user's sign-in details again (Platform Admin) |
-| `POST` `DELETE` | `/users/{id}/avatar` | Upload, replace or remove a user's picture (Platform Admin) |
-| `GET` | `/users/{id}/avatar` | The user's picture (any signed-in user) |
-| `PATCH` | `/users/{id}/status` | Activate or suspend a user (Platform Admin) |
-| `PUT` | `/users/{id}/platform-role` | `{ "role": "platform_admin" }` grants Platform Admin, `{ "role": "user" }` removes it |
-| `GET` | `/audit` | Audit events: global for a Platform Admin, one project (`project_id`) for its Project Manager; filter by `action`, `resource_type`, `actor_user_id`, `from`/`to` |
-
-**Search.** The `q` parameter matches a substring, case-insensitively, and needs at least 3 characters. It is backed by `pg_trgm` GIN indexes on `users.email`, `users.display_name`, `projects.name`, `projects.description` and `datasets.name` (migration `20261005_0011`). Full-text search (`tsvector`) is the next step only when searching document content is needed.
-| `GET` | `/admin/usage/projects` | Runs and cost per project (Platform Admin; `q`, `from`, `to`) |
-
-**Projects and members**
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` `POST` | `/projects` | List my projects; create a project |
-| `GET` `PATCH` | `/projects/{id}` | Read or update project details |
-| `POST` | `/projects/{id}/archive`, `/restore` | Archive or restore a project |
-| `POST` | `/projects/{id}/complete`, `/reopen` | Mark the project completed; reopen it |
-| `GET` `POST` | `/projects/{id}/members` | List members and open invitations (`status`); invite a registered user by email |
-| `GET` | `/projects/{id}/invite-candidates` | Search eligible users to invite; excludes existing members and open invitations (Project Manager or Platform Admin) |
-| `GET` | `/projects/{id}/invite-candidates/stream` | SSE snapshots of the filtered candidate page after committed changes (Project Manager or Platform Admin) |
-| `PUT` `DELETE` | `/projects/{id}/members/{membership_id}` | Change a role; remove a member or cancel an invitation |
-| `POST` | `/projects/{id}/members/{membership_id}/invite` | Send an expired invitation again |
-| `GET` | `/invitations` | My open project invitations |
-| `POST` | `/invitations/{membership_id}/accept`, `/invitations/{membership_id}/decline` | Answer an invitation |
-
-**Research inputs**
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` `POST` | `/projects/{id}/datasets` | List datasets; upload a CSV as a new dataset (multipart: `name`, `description`, `file`) |
-| `GET` `PATCH` | `/projects/{id}/datasets/{dataset_id}` | Read; rename or describe |
-| `GET` `POST` | `/projects/{id}/datasets/{dataset_id}/versions` | List versions; upload a new version |
-| `GET` | `/projects/{id}/datasets/{dataset_id}/versions/{version_id}/download` | Download a version's file |
-| `POST` | `/projects/{id}/datasets/from-connection` | Import a table or a `SELECT` through a data connection as a new dataset |
-| `POST` | `/projects/{id}/datasets/{dataset_id}/versions/from-connection` | Import it again as the next version |
-| `GET` `POST` | `/projects/{id}/connections` | List data connections (`q`); test and save a new one (`kind`: `postgres`, `mysql`, `bigquery`) |
-| `GET` `PATCH` `DELETE` | `/projects/{id}/connections/{connection_id}` | Read; rename; delete with its stored credentials |
-| `POST` | `/projects/{id}/connections/{connection_id}/test` | Test again; the outcome is in `last_tested_at` and `last_error_code` |
-| `GET` | `/projects/{id}/connections/{connection_id}/schemas` | Schemas the database user can read (BigQuery: datasets) |
-| `GET` | `/projects/{id}/connections/{connection_id}/tables` | Tables and views of one `schema`, at most 500 (`search`) |
-| `GET` | `/projects/{id}/connections/{connection_id}/columns` | Column names and types of one `table` |
-| `POST` | `/projects/{id}/connections/{connection_id}/preview` | First rows of a table or a `SELECT`, as text |
-| `GET` `POST` | `/projects/{id}/files` | List files (`q`, `kind`); upload a PDF, CSV or Excel file (multipart: `file`) |
-| `GET` | `/projects/{id}/files/{file_id}/download` | Download a file |
-| `DELETE` | `/projects/{id}/files/{file_id}` | Delete a file |
-| `GET` `PUT` | `/projects/{id}/research-context` | Newest research context; save a new version |
-| `GET` | `/projects/{id}/research-context/versions`, `/versions/{n}` | Version history; one version |
-
-**Runs, review, and results**
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` `POST` | `/projects/{id}/runs` | List runs; start a run |
-| `GET` | `/projects/{id}/runs/{run_id}` | One run |
-| `POST` | `/projects/{id}/runs/{run_id}/sync` | Ask Popper for the run's current state |
-| `POST` | `/projects/{id}/runs/{run_id}/abandon` | Mark a run that cannot finish as failed (Project Manager) |
-| `GET` `POST` | `/projects/{id}/runs/{run_id}/frame-review` | Newest review request; decide the pending one |
-| `GET` | `/projects/{id}/runs/{run_id}/frame-reviews` | All review requests of the run |
-| `GET` | `/projects/{id}/runs/{run_id}/artifacts` | Result files |
-| `GET` | `/projects/{id}/runs/{run_id}/artifacts/{artifact_id}/download` | Download a result file |
-
-**Comments and notifications**
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` `POST` | `/projects/{id}/runs/{run_id}/comments` | List comments (`artifact_id` filter); add one |
-| `PATCH` `DELETE` | `/projects/{id}/runs/{run_id}/comments/{comment_id}` | Edit own comment; delete |
-| `GET` | `/notifications`, `/notifications/unread-count` | My notifications (`unread_only`); unread count |
-| `GET` | `/notifications/stream` | Real-time SSE snapshots of my latest notifications and unread count |
-| `POST` | `/notifications/{id}/read`, `/notifications/read-all` | Mark as read |
-
-**Called by Popper, not by the frontend**
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/internal/popper/runs/{run_id}/status` | Report a run's status, cost, and review request |
-| `POST` | `/internal/popper/runs/{run_id}/artifacts` | Deliver a result file |
-
-Both require the `X-Service-Key` header (`POPPER_CALLBACK_KEY`); a request without a valid key is refused with `401 SERVICE_KEY_INVALID` before its body is read.
-
 ### Response format
 
-REST/JSON endpoints return the same envelope. A successful `GET /notifications/stream` uses the
-SSE frames documented above; startup errors still use this JSON envelope. `meta.request_id`
-matches the `X-Request-ID` response header.
+REST/JSON endpoints return the same envelope. `meta.request_id` matches the `X-Request-ID` response header.
 
 ```json
 {
@@ -564,9 +497,171 @@ List endpoints return the array in `data` and fill `meta.pagination` with `{ "to
 
 Branch on `error.code`, not on `message`. `error.details` lists `{ "field", "message" }` entries for `VALIDATION_ERROR` (422) and is empty otherwise.
 
+The two SSE endpoints answer with event frames once the stream is open (see [Frontend integration](#frontend-integration)); an error before that still uses the JSON envelope.
+
+### Search
+
+The `q` parameter matches a substring, case-insensitively, and needs at least 3 characters. It is backed by `pg_trgm` GIN indexes on `users.email`, `users.display_name`, `projects.name`, `projects.description` and `datasets.name` (migration `20261005_0011`). Full-text search (`tsvector`) is the next step only when searching document content is needed.
+
+### Session
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/auth/register` | Create an account with email and password; emails a 6-digit code |
+| `POST` | `/auth/verify-email` | Enter the code and the password; verifies the email and sets the session cookie |
+| `POST` | `/auth/resend-verification` | Email a new verification code |
+| `POST` | `/auth/forgot-password` | Email a code to set a new password |
+| `POST` | `/auth/verify-reset-password` | Verify the reset OTP and return a one-use reset token |
+| `POST` | `/auth/reset-password` | Set a new password with the verified reset token; ends every session |
+| `POST` | `/auth/login` | Sign in with email and password; sets the session cookie |
+| `POST` | `/auth/change-password` | Change the password; signs out the user's other sessions |
+| `POST` | `/auth/logout` | End the current session |
+| `POST` | `/auth/logout-all` | End every session of the signed-in user, on all devices |
+| `GET` | `/auth/me` | Signed-in user, platform role, session expiry, and project memberships |
+| `PATCH` | `/auth/me` | Change your own display name |
+| `POST` `DELETE` | `/auth/me/avatar` | Upload, replace or remove your own picture |
+| `GET` | `/auth/csrf-token` | CSRF token for the current session |
+
+### Administration
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/users` | List users (Platform Admin) |
+| `POST` | `/users` | Create a user from an email; returns the temporary password (Platform Admin) |
+| `PATCH` | `/users/{id}` | Change a user's display name (Platform Admin) |
+| `POST` | `/users/{id}/invite` | Email the user's sign-in details again (Platform Admin) |
+| `POST` `DELETE` | `/users/{id}/avatar` | Upload, replace or remove a user's picture (Platform Admin) |
+| `GET` | `/users/{id}/avatar` | The user's picture (any signed-in user) |
+| `PATCH` | `/users/{id}/status` | Activate or suspend a user (Platform Admin) |
+| `PUT` | `/users/{id}/platform-role` | `{ "role": "platform_admin" }` grants Platform Admin, `{ "role": "user" }` removes it |
+| `GET` | `/audit` | Audit events: global for a Platform Admin, one project (`project_id`) for its Project Manager; filter by `action`, `resource_type`, `actor_user_id`, `from`/`to` |
+| `GET` | `/admin/usage/projects` | Runs and cost per project (Platform Admin; `q`, `from`, `to`) |
+
+### Projects and members
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` `POST` | `/projects` | List my projects; create a project |
+| `GET` `PATCH` | `/projects/{id}` | Read or update project details |
+| `POST` | `/projects/{id}/archive`, `/restore` | Archive or restore a project |
+| `POST` | `/projects/{id}/complete`, `/reopen` | Mark the project completed; reopen it |
+| `GET` `POST` | `/projects/{id}/members` | List members and open invitations (`status`); invite a registered user by email |
+| `GET` | `/projects/{id}/invite-candidates` | Search eligible users to invite; excludes existing members and open invitations (Project Manager or Platform Admin) |
+| `GET` | `/projects/{id}/invite-candidates/stream` | SSE snapshots of the filtered candidate page after committed changes (Project Manager or Platform Admin) |
+| `PUT` `DELETE` | `/projects/{id}/members/{membership_id}` | Change a role; remove a member or cancel an invitation |
+| `POST` | `/projects/{id}/members/{membership_id}/invite` | Send an expired invitation again |
+| `GET` | `/invitations` | My open project invitations |
+| `POST` | `/invitations/{membership_id}/accept`, `/invitations/{membership_id}/decline` | Answer an invitation |
+
+### Datasets and data connections
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` `POST` | `/projects/{id}/datasets` | List datasets; upload a CSV as a new dataset (multipart: `name`, `description`, `file`) |
+| `GET` `PATCH` | `/projects/{id}/datasets/{dataset_id}` | Read; rename or describe |
+| `GET` `POST` | `/projects/{id}/datasets/{dataset_id}/versions` | List versions; upload a new version |
+| `GET` | `/projects/{id}/datasets/{dataset_id}/versions/{version_id}/download` | Download a version's file |
+| `POST` | `/projects/{id}/datasets/from-connection` | Import a table or a `SELECT` through a data connection as a new dataset |
+| `POST` | `/projects/{id}/datasets/{dataset_id}/versions/from-connection` | Import it again as the next version |
+| `GET` `POST` | `/projects/{id}/connections` | List data connections (`q`); test and save a new one (`kind`: `postgres`, `mysql`, `bigquery`) |
+| `GET` `PATCH` `DELETE` | `/projects/{id}/connections/{connection_id}` | Read; rename; delete with its stored credentials |
+| `POST` | `/projects/{id}/connections/{connection_id}/test` | Test again; the outcome is in `last_tested_at` and `last_error_code` |
+| `GET` | `/projects/{id}/connections/{connection_id}/schemas` | Schemas the database user can read (BigQuery: datasets) |
+| `GET` | `/projects/{id}/connections/{connection_id}/tables` | Tables and views of one `schema`, at most 500 (`search`) |
+| `GET` | `/projects/{id}/connections/{connection_id}/columns` | Column names and types of one `table` |
+| `POST` | `/projects/{id}/connections/{connection_id}/preview` | First rows of a table or a `SELECT`, as text |
+
+### Project files and research context
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` `POST` | `/projects/{id}/files` | List files (`q`, `kind`); upload a PDF, CSV or Excel file (multipart: `file`) |
+| `GET` | `/projects/{id}/files/{file_id}/download` | Download a file |
+| `DELETE` | `/projects/{id}/files/{file_id}` | Delete a file |
+| `GET` `PUT` | `/projects/{id}/research-context` | Newest research context; save a new version |
+| `GET` | `/projects/{id}/research-context/versions`, `/versions/{n}` | Version history; one version |
+
+### Runs, review, and results
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` `POST` | `/projects/{id}/runs` | List runs; start a run |
+| `GET` | `/projects/{id}/runs/{run_id}` | One run |
+| `POST` | `/projects/{id}/runs/{run_id}/sync` | Ask Popper for the run's current state |
+| `POST` | `/projects/{id}/runs/{run_id}/abandon` | Mark a run that cannot finish as failed (Project Manager) |
+| `GET` `POST` | `/projects/{id}/runs/{run_id}/frame-review` | Newest review request; decide the pending one |
+| `GET` | `/projects/{id}/runs/{run_id}/frame-reviews` | All review requests of the run |
+| `GET` | `/projects/{id}/runs/{run_id}/artifacts` | Result files |
+| `GET` | `/projects/{id}/runs/{run_id}/artifacts/{artifact_id}/download` | Download a result file |
+
+### Comments and notifications
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` `POST` | `/projects/{id}/runs/{run_id}/comments` | List comments (`artifact_id` filter); add one |
+| `PATCH` `DELETE` | `/projects/{id}/runs/{run_id}/comments/{comment_id}` | Edit own comment; delete |
+| `GET` | `/notifications`, `/notifications/unread-count` | My notifications (`unread_only`); unread count |
+| `GET` | `/notifications/stream` | Real-time SSE snapshots of my latest notifications and unread count |
+| `POST` | `/notifications/{id}/read`, `/notifications/read-all` | Mark as read |
+
+### Called by Popper, not by the frontend
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/internal/popper/runs/{run_id}/status` | Report a run's status, cost, and review request |
+| `POST` | `/internal/popper/runs/{run_id}/artifacts` | Deliver a result file |
+
+Both require the `X-Service-Key` header (`POPPER_CALLBACK_KEY`); a request without a valid key is refused with `401 SERVICE_KEY_INVALID` before its body is read.
+
+## Frontend integration
+
+### Requests and sessions
+
+- Send every request with `credentials: "include"` and an `Origin` that exactly matches `CORS_ALLOWED_ORIGINS`.
+- Send the CSRF token in `X-CSRF-Token` on every mutation (`POST`, `PATCH`, `PUT`, `DELETE`) except the seven endpoints used before a session exists: `register`, `verify-email`, `resend-verification`, `login`, `forgot-password`, `verify-reset-password` and `reset-password`. After a page reload, get it again from `GET /api/v1/auth/csrf-token`.
+- Restore the signed-in user after a reload with `GET /api/v1/auth/me`. It returns the user, platform role (`user` or `platform_admin`, never empty), `email_verified`, `must_change_password`, session expiry, and `memberships`: the user's projects with the role in each.
+- On sign-out call `POST /api/v1/auth/logout`.
+- On `401` with `SESSION_EXPIRED` or `USER_SUSPENDED` the session cookie is already cleared; send the user back to sign-in.
+
+### Realtime notifications
+
+Open authenticated SSE `GET /api/v1/notifications/stream?limit=50` after sign-in. `limit` defaults to `50` and accepts `1`–`100`; the server sends `notifications` immediately and after each committed notification, read/read-all action, or membership removal:
+
+```text
+event: notifications
+data: {"items":[{"id":"...","kind":"run_finished","project_id":"...","project_name":"...","run_id":null,"actor_user_id":null,"actor_display_name":null,"created_at":"...","read_at":null}],"unread_count":3}
+```
+
+`items` are newest first with the `NotificationItem` fields from `GET /notifications`. Each event is a snapshot: replace the window and badge, do not append or poll. `unread_count` is the total visible unread count. Reconnection gets another current snapshot; no cursor is used.
+
+```ts
+const stream = new EventSource("/api/v1/notifications/stream?limit=50", { withCredentials: true });
+stream.addEventListener("notifications", (event) => {
+  const { items, unread_count } = JSON.parse((event as MessageEvent<string>).data);
+  replaceNotificationWindow(items); setUnreadBadge(unread_count);
+});
+stream.addEventListener("session-ended", (event) => {
+  const { code } = JSON.parse((event as MessageEvent<string>).data);
+  stream.close(); beginSignInFlow(code); // SESSION_EXPIRED, USER_SUSPENDED, UNAUTHENTICATED
+});
+const stopNotifications = () => stream.close(); // call on logout/unmount; network errors reconnect
+```
+
+Ignore the 15-second keep-alive comment: it rechecks the session but does not extend idle expiry. Initial connection and notification snapshots use normal session activity. The proxy must disable buffering and use read/idle timeouts over 15 seconds. A separate frontend origin needs credential CORS for its exact origin and cross-site-capable cookies. `GET /notifications` remains for paginated history; the CSRF-protected read `POST`s trigger a new snapshot.
+
+### Invite candidates stream
+
+`GET /projects/{id}/invite-candidates/stream` accepts the same query parameters as `GET /projects/{id}/invite-candidates` and follows that page with SSE. Each `invite-candidates` event contains the full GET envelope: replace the page and pagination. Snapshots arrive immediately and after committed membership/account changes, across API workers through PostgreSQL LISTEN/NOTIFY. Rollbacks publish nothing. `session-ended` or `access-ended` tells the frontend to close the stream; reconnect gets current state. Heartbeats revalidate access without polling candidates.
+
+### Handoff documents
+
+Step-by-step integration notes with real responses are kept in `docs/` (local, not tracked in Git): `frontend-api-handoff.md`, `notifications-handoff.md` and `data-connections-handoff.md`.
+
 ## Configuration
 
-Settings come from environment variables; `.env.example` lists them all with safe local defaults. The ones specific to research:
+Settings come from environment variables; `.env.example` lists them all with safe local defaults. The main ones:
+
+### Storage and upload limits
 
 | Variable | Purpose |
 |---|---|
@@ -579,13 +674,23 @@ Settings come from environment variables; `.env.example` lists them all with saf
 | `DATASET_MAX_UPLOAD_BYTES` | Largest dataset file (default 50 MiB). |
 | `ARTIFACT_MAX_UPLOAD_BYTES` | Largest result file Popper may deliver (default 50 MiB). |
 | `AVATAR_MAX_UPLOAD_BYTES` | Largest profile picture (default 4 MiB, at most 5 MiB). |
+
+### Email, accounts and invitations
+
+| Variable | Purpose |
+|---|---|
 | `RESEND_API_KEY` | Resend key used to send email. Empty in `local`: each message is written to the API log instead. Required in `staging` and `production`. |
 | `EMAIL_FROM` | Sender shown on emails; must be an address on the domain verified in Resend. |
-| `AUTH_CODE_RATE_LIMIT` | Requests per window and client address to the four code endpoints (default 20). |
+| `APP_URL` | Address of the frontend, put in emails as the sign-in link (`http://localhost:3000` locally). Must be `https://` in production. Empty: emails carry no link. |
+| `AUTH_CODE_RATE_LIMIT` | Requests per window and client address to the five code endpoints (default 20). |
 | `OTP_TTL_MINUTES`, `OTP_MAX_ATTEMPTS`, `OTP_RESEND_COOLDOWN_SECONDS`, `OTP_MAX_SENDS_PER_HOUR`, `OTP_LOCK_AFTER_FAILURES`, `OTP_LOCK_MINUTES` | Limits of the emailed one-time codes; defaults 10, 5, 60, 5, 10, 60. Not passed by the Compose files: add them there to change them. |
 | `DEFAULT_ADMIN_EMAIL`, `DEFAULT_ADMIN_PASSWORD` | A Platform Admin created when the API starts if the account is missing (`admin@gmail.com` in the local stack). Local development only: staging and production refuse to start with them. An existing account keeps its password. |
 | `PROJECT_INVITE_TTL_HOURS` | How long a project invitation can be accepted (default 24, at most 168). |
-| `APP_URL` | Address of the frontend, put in emails as the sign-in link (`http://localhost:3000` locally). Must be `https://` in production. Empty: emails carry no link. |
+
+### Popper and runs
+
+| Variable | Purpose |
+|---|---|
 | `POPPER_BASE_URL` | Popper's address. Empty: runs cannot start. |
 | `POPPER_SERVICE_KEY` | Sent to Popper in `X-Service-Key`. Required with the base URL. |
 | `POPPER_CALLBACK_KEY` | Expected from Popper in `X-Service-Key`. Required with the base URL. |
@@ -593,6 +698,13 @@ Settings come from environment variables; `.env.example` lists them all with saf
 | `PUBLIC_BASE_URL` | Address Popper uses to call this API back, without `/api/v1`. |
 | `RUN_DEFAULT_BUDGET_USD` | Spending cap of a run when the user gives none (5). |
 | `RUN_MAX_BUDGET_USD` | Highest cap a user may ask for (20). |
+
+The two Popper keys are different secrets of at least 32 characters in production. The callback endpoints are reachable by anyone who can reach the API; the key is what protects them, so keep the API behind TLS.
+
+### Data connections
+
+| Variable | Purpose |
+|---|---|
 | `CONNECTION_SECRET_KEY` | Fernet key that encrypts the credentials of data connections. Empty: the feature is off. |
 | `CONNECTION_ALLOW_PRIVATE_HOSTS` | Lets a connection point at a loopback or private address (default `false`). Local development only: staging and production refuse to start with it, and the production Compose file does not pass it. |
 | `CONNECTION_CONNECT_TIMEOUT_SECONDS`, `CONNECTION_QUERY_TIMEOUT_SECONDS`, `CONNECTION_IMPORT_TIMEOUT_SECONDS` | Longest a connection attempt, a browse or preview, and a whole import may take (10, 60, 300). |
@@ -600,8 +712,6 @@ Settings come from environment variables; `.env.example` lists them all with saf
 | `CONNECTION_PROBE_RATE_LIMIT`, `CONNECTION_QUERY_RATE_LIMIT` | Per user and window (`AUTH_SESSION_RATE_WINDOW_SECONDS`): connections created or tested (30), and reads through a saved one (120). Over it: 429 `RATE_LIMITED`. |
 | `CONNECTION_PREVIEW_MAX_ROWS` | Rows a preview returns (100). |
 | `CONNECTION_BIGQUERY_MAX_BYTES_BILLED` | The most one BigQuery query may scan, in bytes (1 GiB). |
-
-The two Popper keys are different secrets of at least 32 characters in production. The callback endpoints are reachable by anyone who can reach the API; the key is what protects them, so keep the API behind TLS.
 
 Generate the connection key once and keep a copy somewhere safe:
 
@@ -611,7 +721,42 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 A lost or replaced key leaves every saved connection unreadable (409 `CONNECTION_SECRET_UNREADABLE`): each one has to be deleted and created again. Datasets already imported are not affected.
 
-## Operations
+## Deployment and operations
+
+### Production stack
+
+Production uses a separate Compose project, database volume, storage volume, and configuration file. Copy the template inside `docker/`, set strong unique database, session, and Popper secrets, then validate and start the stack:
+
+```bash
+cp docker/prod.env.example docker/prod.env.local
+task prod:config               # checks the Compose file and the settings, starts nothing
+task prod:up
+task prod:migrate
+```
+
+Other shortcuts: `task prod:status`, `task prod:logs`, `task prod:down` (keeps the database and storage volumes). Each runs `docker compose --env-file docker/prod.env.local -f docker/docker-compose.prod.yml ...`.
+
+The production API binds to `127.0.0.1` (port `API_PORT`, default 8080) and expects a TLS-terminating reverse proxy in front of it. PostgreSQL has no published host port.
+
+The supplied CLI and Docker commands give Uvicorn a 30-second graceful-shutdown timeout; Compose reserves 40 seconds for the API to stop. When starting Uvicorn manually, also pass `--timeout-graceful-shutdown 30`. This bounds a restart even with open SSE connections; their EventSource clients reconnect to receive a fresh notification snapshot.
+
+### Releasing a migration
+
+The order above is for the first start only. **When a release brings a migration, migrate before the new code serves requests**: the new code reads columns the old schema does not have, and the endpoints that use them would answer 500 in between.
+
+```bash
+docker compose --env-file docker/prod.env.local -f docker/docker-compose.prod.yml build api
+task prod:migrate              # runs in a one-off container of the new image
+task prod:up
+```
+
+**Rolling back the data connection migrations.** `20261006_0017` adds the connections table and `20261006_0018` adds where a dataset version came from. They only add a table and columns with defaults, so existing rows need nothing. To roll back, start the previous code first, then downgrade with the new image, the only one that holds these migration scripts:
+
+```bash
+docker compose --env-file docker/prod.env.local -f docker/docker-compose.prod.yml run --rm api alembic downgrade 20261006_0017
+```
+
+Run it before the image is replaced, or from a checkout of the new code. Downgrading to `20261006_0017` drops the two source columns, and with them the record of which versions were imported; downgrading to `20261006_0016` also deletes every saved connection and its credentials.
 
 ### File storage
 
@@ -632,50 +777,23 @@ Files pass through the API in both directions, so the browser never needs R2 cre
 
 Switching the store does not move files. Rows written under one store point at keys the other does not have, so copy the files across with the same keys (for example `rclone copy`) before switching a database that already has uploads.
 
-### Migrations
-
-Alembic owns the database schema. App startup never creates or migrates tables. Apply migrations once during local setup or deployment with `task migrate`. Do not point a developer command at a production database.
-
-### Production stack
-
-Production uses a separate Compose project, database volume, storage volume, and configuration file. Copy the template inside `docker/`, set strong unique database, session, and Popper secrets, then validate and start the stack:
-
-```bash
-cp docker/prod.env.example docker/prod.env.local
-task prod:config               # checks the Compose file and the settings, starts nothing
-task prod:up
-task prod:migrate
-```
-
-That order is for the first start only. **When a release brings a migration, migrate before the new code serves requests**: the new code reads columns the old schema does not have, and every dataset and run endpoint would answer 500 in between.
-
-```bash
-docker compose --env-file docker/prod.env.local -f docker/docker-compose.prod.yml build api
-task prod:migrate              # runs in a one-off container of the new image
-task prod:up
-```
-
-The data connection migrations (`20261006_0017` adds the connections table, `20261006_0018` adds where a dataset version came from) only add a table and columns with defaults, so existing rows need nothing. To roll back, start the previous code first, then downgrade with the new image, the only one that holds these migration scripts: `docker compose --env-file docker/prod.env.local -f docker/docker-compose.prod.yml run --rm api alembic downgrade 20261006_0017`, run before the image is replaced, or from a checkout of the new code. Downgrading to `20261006_0017` drops the two source columns, and with them the record of which versions were imported; downgrading to `20261006_0016` also deletes every saved connection and its credentials.
-
-Other shortcuts: `task prod:status`, `task prod:logs`, `task prod:down` (keeps the database and storage volumes). Each runs `docker compose --env-file docker/prod.env.local -f docker/docker-compose.prod.yml ...`.
-
-The production API binds to `127.0.0.1` and expects a TLS-terminating reverse proxy in front of it. PostgreSQL has no published host port.
-
-The supplied CLI and Docker commands give Uvicorn a 30-second graceful-shutdown timeout;
-Compose reserves 40 seconds for the API to stop. When starting Uvicorn manually, also pass
-`--timeout-graceful-shutdown 30`. This bounds a restart even with open SSE connections; their
-EventSource clients reconnect to receive a fresh notification snapshot.
-
 ### Limits and deployment security
 
-- Request bodies are limited to 1 MiB (`REQUEST_MAX_BODY_BYTES`); dataset uploads, project files, result files and profile pictures have their own limits, above.
-- `login` and `register` together allow 10 requests per client IP per 60 seconds per API process (`AUTH_SESSION_RATE_LIMIT`, `AUTH_SESSION_RATE_WINDOW_SECONDS`); the four code endpoints together allow 20 (`AUTH_CODE_RATE_LIMIT`).
-- Sign-up depends on email: `RESEND_API_KEY` is required in `staging` and `production`, and while the provider is down or over quota no account can be verified, admin-created ones included.
-- The migration that adds email verification must run before the new code starts: the code reads a column the old schema does not have.
+**Requests and sign-in**
+
+- Request bodies are limited to 1 MiB (`REQUEST_MAX_BODY_BYTES`); dataset uploads, project files, result files and profile pictures have their own limits, in [Configuration](#storage-and-upload-limits).
+- The sign-in and code [rate limits](#passwords-sessions-and-rate-limits) are counted per client IP and per API process.
 - Production Compose does not configure Uvicorn's trusted proxy addresses, so behind a proxy all requests may share one IP and one login quota. Before public deployment, make Uvicorn trust only the real proxy addresses and add a shared rate limit at the ingress. Do not use caller-supplied forwarding headers as client identity.
+- Sign-up depends on email: `RESEND_API_KEY` is required in `staging` and `production`, and while the provider is down or over quota no account can be verified, admin-created ones included.
+
+**Data connections**
+
 - Data connections reach hosts that users choose. Names are resolved once and the address checked: loopback, private, link-local (cloud metadata included) and IPv4-in-IPv6 transition ranges are refused, in staging as in production, and the connection is made to the checked address.
 - The limits on data connections (slots, per-user rates) are counted per API process, like the sign-in limit. Run one replica, or expect them to multiply by the number of workers.
 - TLS to an external database defaults to `require`: encrypted, certificate not checked, which also works with self-signed and private-CA servers. `verify-full` checks the certificate against public authorities and the host name; `disable` is for servers without TLS and sends the password and the rows in the clear.
 - An import keeps its request open for up to 300 seconds. A reverse proxy with a shorter read timeout cuts the response while the import still completes.
 - The server has no fixed outbound address yet, so a database behind an allowlist firewall cannot be connected.
+
+**Not decided yet**
+
 - The hosting platform is not selected yet.
