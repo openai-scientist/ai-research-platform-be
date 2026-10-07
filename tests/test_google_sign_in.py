@@ -31,6 +31,7 @@ from tests.conftest import (
     mutation_headers,
     sign_in,
 )
+from tests.test_avatar_api import upload
 from tests.test_email_verification import AUTH, USERS, invalid, post, register, user_row
 from tests.test_password_reset import NEW_PASSWORD, forgot, reset
 
@@ -568,3 +569,104 @@ def test_the_access_log_never_shows_the_sign_in_code(google_harness: Harness) ->
     assert SIGN_IN_CODE not in slashed.getMessage()
     assert record.getMessage() == f'127.0.0.1:5000 - "GET {AUTH}/google/callback HTTP/1.1" 302'
     assert other.getMessage().endswith('"GET /api/v1/projects?search=code HTTP/1.1" 200')
+
+
+PICTURE = "https://lh3.googleusercontent.com/a/the-picture=s96-c"
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+JPEG = b"\xff\xd8\xff" + b"\x00" * 32
+WITH_PICTURE = replace(DAT, picture=PICTURE)
+
+
+@pytest.mark.asyncio
+async def test_the_client_fetches_a_picture_from_google_only() -> None:
+    asked: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(str(request.url))
+        if "missing" in request.url.path:
+            return httpx.Response(404)
+        if "broken" in request.url.path:
+            raise httpx.ConnectError("no route")
+        return httpx.Response(200, content=PNG)
+
+    oauth = google(handler)
+    # A larger picture than the 96 pixels Google's address asks for.
+    assert await oauth.fetch_picture(PICTURE, 1024) == PNG
+    assert asked == ["https://lh3.googleusercontent.com/a/the-picture=s256-c"]
+    assert await oauth.fetch_picture(PICTURE, len(PNG) - 1) is None
+    for address in (
+        "https://lh3.googleusercontent.com/a/missing",
+        "https://lh3.googleusercontent.com/a/broken",
+    ):
+        assert await oauth.fetch_picture(address, 1024) is None
+
+    del asked[:]
+    for address in (
+        "http://lh3.googleusercontent.com/a/the-picture",
+        "https://googleusercontent.com.example.org/a/the-picture",
+        "https://169.254.169.254/latest/meta-data",
+        "not an address",
+    ):
+        assert await oauth.fetch_picture(address, 1024) is None
+    assert asked == []
+
+
+@pytest.mark.asyncio
+async def test_the_id_token_names_the_picture() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id_token": id_token(picture=PICTURE)})
+
+    assert (await google(handler).exchange(SIGN_IN_CODE)).picture == PICTURE
+
+
+@pytest.mark.asyncio
+async def test_a_user_without_an_avatar_gets_the_google_picture(google_harness: Harness) -> None:
+    harness = google_harness
+    harness.google.image = PNG
+    async with harness.client() as client:
+        assert signed_in(await google_sign_in(harness, client, WITH_PICTURE))
+        profile = (await client.get(f"{AUTH}/me")).json()["data"]["user"]
+        served = await client.get(profile["avatar_url"])
+        assert (served.content, served.headers["content-type"]) == (PNG, "image/png")
+        assert harness.google.pictures == [PICTURE]
+
+        # Once there is an avatar, Google is not asked again.
+        harness.google.image = JPEG
+        assert signed_in(await google_sign_in(harness, client, WITH_PICTURE))
+        assert harness.google.pictures == [PICTURE]
+        again = (await client.get(f"{AUTH}/me")).json()["data"]["user"]
+        assert again["avatar_url"] == profile["avatar_url"]
+    async with harness.factory() as db:
+        events = (await db.scalars(select(AuditEvent).order_by(AuditEvent.created_at))).all()
+    (kept,) = [event for event in events if event.action == "user.avatar_updated"]
+    assert kept.details == {"content_type": "image/png", "size_bytes": len(PNG), "source": "google"}
+
+
+@pytest.mark.asyncio
+async def test_an_uploaded_avatar_is_kept_when_the_account_is_linked(
+    google_harness: Harness,
+) -> None:
+    harness = google_harness
+    harness.google.image = PNG
+    async with harness.client() as laptop, harness.client() as client:
+        session = await login(harness, laptop, uid="dat", email=EMAIL)
+        uploaded = await upload(laptop, session, JPEG)
+        assert uploaded.status_code == 200, uploaded.text
+
+        assert signed_in(await google_sign_in(harness, client, WITH_PICTURE))
+        profile = (await client.get(f"{AUTH}/me")).json()["data"]["user"]
+        assert (await client.get(profile["avatar_url"])).content == JPEG
+        assert harness.google.pictures == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image", [None, b"<html>not a picture</html>"])
+async def test_a_picture_that_cannot_be_used_does_not_stop_the_sign_in(
+    google_harness: Harness, image: bytes | None
+) -> None:
+    harness = google_harness
+    harness.google.image = image
+    async with harness.client() as client:
+        assert signed_in(await google_sign_in(harness, client, WITH_PICTURE))
+        profile = (await client.get(f"{AUTH}/me")).json()["data"]["user"]
+        assert profile["avatar_url"] is None

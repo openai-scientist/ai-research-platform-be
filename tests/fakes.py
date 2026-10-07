@@ -44,6 +44,9 @@ class FakeGoogleOAuth:
         # Who signs in next. Empty: the exchange fails, like a made-up code.
         self.identity: GoogleIdentity | None = None
         self.codes: list[str] = []
+        # What is at every picture address. Empty: the picture cannot be had.
+        self.image: bytes | None = None
+        self.pictures: list[str] = []
 
     def authorization_url(self, state: str) -> str:
         return f"https://accounts.google.com/o/oauth2/v2/auth?state={state}"
@@ -53,6 +56,10 @@ class FakeGoogleOAuth:
         if self.identity is None:
             raise GoogleOAuthError
         return self.identity
+
+    async def fetch_picture(self, url: str, max_bytes: int) -> bytes | None:
+        self.pictures.append(url)
+        return self.image
 
 
 class FakeGoogleDriveOAuth:
