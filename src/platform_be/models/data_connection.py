@@ -19,12 +19,13 @@ from platform_be.db.base import Base
 
 
 class DataConnection(Base):
-    """A saved connection to an external database that a project can read from."""
+    """A saved connection to an external data source that a project can read from."""
 
     __tablename__ = "data_connections"
     __table_args__ = (
         CheckConstraint(
-            "kind IN ('postgres', 'mysql', 'bigquery')", name="ck_data_connections_kind"
+            "kind IN ('postgres', 'mysql', 'bigquery', 'google_sheets', 'google_drive')",
+            name="ck_data_connections_kind",
         ),
         Index("ix_data_connections_project_created", "project_id", "created_at"),
     )
