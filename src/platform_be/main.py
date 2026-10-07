@@ -29,6 +29,7 @@ from platform_be.services.google_drive_oauth import build_google_drive_oauth
 from platform_be.services.google_oauth import build_google_oauth
 from platform_be.services.invite_candidates_stream import InviteCandidatesHub
 from platform_be.services.notification_stream import NotificationHub
+from platform_be.services.run_event_stream import RunEventHub
 from platform_be.services.popper_client import build_popper_client
 from platform_be.services.secret_box import SecretBox
 
@@ -53,6 +54,7 @@ def create_app(
     )
     notification_hub = NotificationHub(app_engine)
     invite_candidates_hub = InviteCandidatesHub(app_engine)
+    run_event_hub = RunEventHub(app_engine)
     connector_executor = build_connector_executor(settings)
 
     @asynccontextmanager
@@ -67,10 +69,13 @@ def create_app(
                 try:
                     await invite_candidates_hub.close()
                 finally:
-                    # Not waited for: a thread may be held by a server that never answers.
-                    connector_executor.shutdown(wait=False, cancel_futures=True)
-                    if owned_engine:
-                        await app_engine.dispose()
+                    try:
+                        await run_event_hub.close()
+                    finally:
+                        # Not waited for: a thread may be held by a server that never answers.
+                        connector_executor.shutdown(wait=False, cancel_futures=True)
+                        if owned_engine:
+                            await app_engine.dispose()
 
     app = FastAPI(
         title=settings.app_name,
@@ -93,6 +98,7 @@ def create_app(
     app.state.google_drive_oauth = build_google_drive_oauth(settings)
     app.state.notification_hub = notification_hub
     app.state.invite_candidates_hub = invite_candidates_hub
+    app.state.run_event_hub = run_event_hub
     app.state.secret_box = (
         SecretBox(settings.connection_secret_key.get_secret_value())
         if settings.connection_secret_key

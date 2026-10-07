@@ -1,12 +1,13 @@
 """Endpoints Popper calls to report on a run. Authenticated by a service key, not a session."""
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_be.core.config import Settings
@@ -14,10 +15,17 @@ from platform_be.core.errors import APIError
 from platform_be.core.responses import ApiResponse, ErrorResponse, ok
 from platform_be.core.security import service_key_matches
 from platform_be.db.session import get_db
-from platform_be.models.research import FINISHED_RUN_STATUSES, ResearchRun, RunArtifact
+from platform_be.models.research import (
+    FINISHED_RUN_STATUSES,
+    ResearchRun,
+    RunArtifact,
+    RunEvent,
+    RunGate,
+)
 from platform_be.services.access import lock_project_scope
 from platform_be.services.file_store import FileStore, get_file_store, iter_file, safe_filename
 from platform_be.services.runs import ingest_popper_state, normalize_popper_status
+from platform_be.services.run_event_stream import run_events_changed
 
 ArtifactKind = Literal["paper_pdf", "paper_tex", "figure", "results", "other"]
 
@@ -93,8 +101,27 @@ class ArtifactAck(BaseModel):
     size_bytes: int
 
 
+class InboundEvent(BaseModel):
+    source_seq: int = Field(
+        ge=1, description="Strictly increasing source sequence number from Engine"
+    )
+    type: str = Field(max_length=48)
+    stage_key: str | None = Field(default=None, max_length=32)
+    actor: str | None = Field(default=None, max_length=32)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class BatchEventsRequest(BaseModel):
+    events: list[InboundEvent] = Field(min_length=1, max_length=200)
+
+
+class BatchEventsAck(BaseModel):
+    accepted: int
+    skipped: int
+    last_source_seq: int
+
+
 async def _locked_run(db: AsyncSession, run_id: UUID) -> ResearchRun:
-    # The project scope is locked first, the same order every other project mutation uses.
     project_id = await db.scalar(select(ResearchRun.project_id).where(ResearchRun.id == run_id))
     if project_id is None:
         raise APIError(404, "NOT_FOUND", "Run was not found")
@@ -108,6 +135,108 @@ async def _locked_run(db: AsyncSession, run_id: UUID) -> ResearchRun:
     if run is None:
         raise APIError(404, "NOT_FOUND", "Run was not found")
     return run
+
+
+@router.post(
+    "/runs/{run_id}/events",
+    response_model=ApiResponse[BatchEventsAck],
+    summary="Ingest batch of streaming events from Popper Engine",
+    description="Ingests, validates, sequence-numbers, and stores events in run_events table.",
+)
+async def ingest_run_events(
+    run_id: UUID,
+    body: BatchEventsRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ApiResponse[BatchEventsAck]:
+    run = await _locked_run(db, run_id)
+    if run.status in FINISHED_RUN_STATUSES:
+        raise APIError(409, "RUN_FINISHED", "Run is already finished")
+
+    accepted_events: list[InboundEvent] = []
+    skipped = 0
+    expected_source_seq = run.last_source_seq + 1
+
+    for evt in body.events:
+        if evt.source_seq <= run.last_source_seq:
+            skipped += 1
+            continue
+        if evt.source_seq != expected_source_seq:
+            raise APIError(
+                422,
+                "EVENT_GAP",
+                f"Expected source_seq {expected_source_seq}, got {evt.source_seq}",
+            )
+        accepted_events.append(evt)
+        expected_source_seq += 1
+
+    for evt in accepted_events:
+        seq = run.last_seq + 1
+        now = datetime.now(UTC)
+        run_event = RunEvent(
+            run_id=run.id,
+            seq=seq,
+            source_seq=evt.source_seq,
+            type=evt.type,
+            stage_key=evt.stage_key,
+            actor=evt.actor,
+            payload=evt.payload,
+            created_at=now,
+        )
+        db.add(run_event)
+        run.last_seq = seq
+        run.last_source_seq = evt.source_seq
+
+        if evt.type == "run.started":
+            if run.status == "queued":
+                run.status = "running"
+                run.started_at = run.started_at or now
+        elif evt.type == "gate.opened":
+            gate_id = evt.payload.get("gate_id", "gate-1")
+            kind = evt.payload.get("kind", "screen")
+            run_gate = RunGate(
+                id=uuid4(),
+                run_id=run.id,
+                gate_key=gate_id,
+                kind=kind,
+                spec=evt.payload,
+                opened_seq=seq,
+                created_at=now,
+            )
+            db.add(run_gate)
+            run.status = "awaiting_review"
+        elif evt.type == "run.status":
+            new_status = evt.payload.get("status")
+            if new_status in ("running", "paused", "awaiting_review"):
+                run.status = new_status
+            elif new_status == "failed":
+                run.status = "failed"
+                run.failure_message = evt.payload.get("reason", "Engine reported failure")
+                run.finished_at = now
+        elif evt.type == "run.completed":
+            run.status = "completed"
+            run.finished_at = now
+
+        if "cost_usd" in evt.payload:
+            try:
+                run.cost_usd = Decimal(str(evt.payload["cost_usd"]))
+            except Exception:
+                pass
+
+    await db.flush()
+    if accepted_events:
+        run_events_changed(db, run.id)
+        notify_payload = f"{run.id}:{run.last_seq}"
+        await db.execute(text(f"SELECT pg_notify('run_events', '{notify_payload}')"))
+    await db.commit()
+
+    return ok(
+        BatchEventsAck(
+            accepted=len(accepted_events),
+            skipped=skipped,
+            last_source_seq=run.last_source_seq,
+        ),
+        "Events ingested successfully",
+    )
 
 
 @router.post(
@@ -174,11 +303,9 @@ async def deliver_run_artifact(
         raise APIError(409, "RUN_FINISHED", "A finished run accepts no more result files")
 
     artifact_id = uuid4()
-    # The name users see is a column; the stored path never depends on it.
     storage_key = f"projects/{run.project_id}/runs/{run.id}/artifacts/{artifact_id}/file"
     stored = await store.put(storage_key, iter_file(file.file))
     try:
-        # Serialize deliveries for one run so two copies of a file cannot both be recorded.
         await _locked_run(db, run_id)
         existing = await db.scalar(
             select(RunArtifact).where(
