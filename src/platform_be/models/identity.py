@@ -42,6 +42,9 @@ class User(Base):
     )
     # When the user proved the email with a one-time code. Empty: the account cannot sign in.
     email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Google's ID of the account that may sign in as this user, set at the first Google
+    # sign-in. Changing or resetting the password never touches it.
+    google_subject: Mapped[str | None] = mapped_column(String(255), unique=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # The admin who created the account; empty for a self-registered one.
     created_by_user_id: Mapped[UUID | None] = mapped_column(
