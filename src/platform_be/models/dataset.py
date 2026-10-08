@@ -1,9 +1,11 @@
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
     JSON,
     BigInteger,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -45,11 +47,17 @@ Index("uq_datasets_project_name", Dataset.project_id, func.lower(Dataset.name), 
 
 
 class DatasetVersion(Base):
-    """One uploaded file. Never changed or deleted, so a run can always be traced to its input."""
+    """One CSV file, uploaded or read from a data connection.
+
+    Never changed or deleted, so a run can always be traced to its input.
+    """
 
     __tablename__ = "dataset_versions"
     __table_args__ = (
         UniqueConstraint("dataset_id", "version_number", name="uq_dataset_versions_number"),
+        CheckConstraint(
+            "source_type IN ('upload', 'connection')", name="ck_dataset_versions_source_type"
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
@@ -63,6 +71,12 @@ class DatasetVersion(Base):
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     row_count: Mapped[int] = mapped_column(Integer, nullable=False)
     column_names: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    source_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="upload", server_default="upload"
+    )
+    # For a version read from a connection: which one, what was read and when. A copy rather
+    # than a foreign key, so deleting the connection leaves the version as it was.
+    source_details: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     created_by_user_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )

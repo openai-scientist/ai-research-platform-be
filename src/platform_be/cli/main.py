@@ -13,14 +13,20 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="Run the API server")
     run.add_argument("--host", default="0.0.0.0")
-    run.add_argument("--port", type=int, default=8000)
+    run.add_argument("--port", type=int, default=8080)
     run.add_argument("--reload", action="store_true")
     bootstrap = commands.add_parser("bootstrap-admin", help="Grant the first Platform Admin role")
     bootstrap.add_argument("--email", required=True)
     args = parser.parse_args()
 
     if args.command == "run":
-        uvicorn.run("platform_be.main:app", host=args.host, port=args.port, reload=args.reload)
+        uvicorn.run(
+            "platform_be.main:app",
+            host=args.host,
+            port=args.port,
+            reload=args.reload,
+            timeout_graceful_shutdown=30,
+        )
     elif args.command == "bootstrap-admin":
         try:
             asyncio.run(bootstrap_admin(args.email))

@@ -6,8 +6,9 @@ from sqlalchemy import select
 from platform_be.auth.sessions import normalize_email
 from platform_be.cli.bootstrap_admin import bootstrap_admin
 from platform_be.core.errors import APIError
+from platform_be.models.audit import AuditEvent
 from platform_be.models.identity import AuthSession, User, UserPlatformRole
-from tests.conftest import ORIGIN, PASSWORD, Harness, login
+from tests.conftest import ORIGIN, PASSWORD, Harness, login, mutation_headers, sign_in, verify
 
 
 @pytest.mark.asyncio
@@ -29,16 +30,38 @@ async def test_health_probes_and_openapi(harness: Harness) -> None:
     assert auth_paths == {
         "/api/v1/auth/register",
         "/api/v1/auth/login",
+        "/api/v1/auth/google/start",
+        "/api/v1/auth/google/callback",
+        "/api/v1/auth/verify-email",
+        "/api/v1/auth/resend-verification",
+        "/api/v1/auth/forgot-password",
+        "/api/v1/auth/reset-password",
+        "/api/v1/auth/verify-reset-password",
         "/api/v1/auth/change-password",
         "/api/v1/auth/logout",
         "/api/v1/auth/logout-all",
         "/api/v1/auth/me",
+        "/api/v1/auth/me/avatar",
         "/api/v1/auth/csrf-token",
     }
+    # Listed even while the feature is off, like the sign-in pair above.
+    assert {
+        "/api/v1/projects/{project_id}/connections/google/start",
+        "/api/v1/connections/google/callback",
+        "/api/v1/projects/{project_id}/connections/{connection_id}/reauthorize",
+    } <= set(schema["paths"])
     login_responses = schema["paths"]["/api/v1/auth/login"]["post"]["responses"]
     assert {"200", "401", "403", "413", "422", "429"}.issubset(login_responses)
     register_responses = schema["paths"]["/api/v1/auth/register"]["post"]["responses"]
     assert {"201", "403", "409", "413", "422", "429"}.issubset(register_responses)
+    for name, expected in (
+        ("verify-email", {"200", "400", "403", "413", "422", "429"}),
+        ("verify-reset-password", {"200", "400", "403", "413", "422", "429"}),
+        ("reset-password", {"200", "400", "403", "413", "422", "429"}),
+        ("resend-verification", {"200", "403", "413", "422", "429"}),
+        ("forgot-password", {"200", "403", "413", "422", "429"}),
+    ):
+        assert expected.issubset(schema["paths"][f"/api/v1/auth/{name}"]["post"]["responses"])
     assert {"200", "401", "403"}.issubset(
         schema["paths"]["/api/v1/auth/logout"]["post"]["responses"]
     )
@@ -52,6 +75,8 @@ async def test_health_probes_and_openapi(harness: Harness) -> None:
     assert set(request_properties) == {"email", "password"}
     assert "HTTPValidationError" not in schema["components"]["schemas"]
     assert "/api/v1/projects/{project_id}/members/{membership_id}" in schema["paths"]
+    assert {"post", "delete", "get"} == set(schema["paths"]["/api/v1/users/{user_id}/avatar"])
+    assert "/api/v1/users/{user_id}/invite" in schema["paths"]
     assert "/api/v1/research" not in schema["paths"]
 
 
@@ -78,6 +103,8 @@ async def test_sign_in_rate_limit_and_request_body_limit(harness: Harness) -> No
         credentials = {"email": "rate-limit@example.com", "password": PASSWORD}
         registered = await client.post("/api/v1/auth/register", json=credentials, headers=headers)
         assert registered.status_code == 201, registered.text
+        # Entering the code is counted elsewhere, so it does not use up a sign-in.
+        await verify(harness, client, credentials["email"])
         signed_in = await client.post("/api/v1/auth/login", json=credentials, headers=headers)
         assert signed_in.status_code == 200, signed_in.text
 
@@ -210,6 +237,10 @@ async def test_register_creates_an_account_and_login_checks_the_password(
             json={"email": "New@Example.com", "password": PASSWORD, "display_name": " New User "},
             headers=headers,
         )
+        # Registering signs nobody in.
+        assert "set-cookie" not in registered.headers
+        assert (await client.get("/api/v1/auth/me")).status_code == 401
+        user = (await verify(harness, client, "new@example.com"))["user"]
         again = await client.post(
             "/api/v1/auth/register",
             json={"email": "new@example.com", "password": "another password"},
@@ -241,13 +272,18 @@ async def test_register_creates_an_account_and_login_checks_the_password(
         assert (await client.get("/api/v1/auth/me")).status_code == 200
 
     assert registered.status_code == 201, registered.text
-    assert registered.json()["message"] == "Account registered"
-    user = registered.json()["data"]["user"]
+    assert registered.json()["message"] == "Verification code sent"
+    assert registered.json()["data"] == {
+        "email": "New@example.com",
+        "expires_in_seconds": 600,
+        "resend_after_seconds": 60,
+    }
     assert user["email"] == "New@example.com"
     assert user["display_name"] == "New User"
     assert user["status"] == "active"
-    assert user["platform_role"] is None
-    assert registered.json()["data"]["csrf_token"]
+    assert user["platform_role"] == "user"
+    assert user["email_verified"] is True
+    assert user["must_change_password"] is False
     assert again.status_code == 409
     assert again.json()["error"]["code"] == "EMAIL_ALREADY_REGISTERED"
     assert too_short.status_code == 422
@@ -392,3 +428,58 @@ async def test_logout_all_revokes_every_session_of_the_user(harness: Harness) ->
         assert (await phone.get("/api/v1/auth/me")).status_code == 401
         assert (await laptop.get("/api/v1/auth/me")).status_code == 401
         assert (await other.get("/api/v1/auth/me")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_platform_admin_creates_a_user_who_can_then_sign_in(harness: Harness) -> None:
+    new_user = {"email": "Hired@Example.com", "display_name": " New Hire "}
+    async with harness.client() as admin, harness.client() as member:
+        admin_session = await login(harness, admin, uid="pa", email="pa@example.com")
+        await bootstrap_admin(
+            "pa@example.com", settings=harness.settings, session_factory=harness.factory
+        )
+        member_session = await login(harness, member, uid="member", email="member@example.com")
+        headers = mutation_headers(admin_session["csrf_token"])
+
+        missing_csrf = await admin.post("/api/v1/users", json=new_user, headers={"Origin": ORIGIN})
+        not_admin = await member.post(
+            "/api/v1/users", json=new_user, headers=mutation_headers(member_session["csrf_token"])
+        )
+        created = await admin.post("/api/v1/users", json=new_user, headers=headers)
+        # Creating an account must not replace the admin's own session.
+        assert (await admin.get("/api/v1/auth/me")).json()["data"]["user"]["email"] == (
+            "pa@example.com"
+        )
+        listed = await admin.get("/api/v1/users", params={"q": "hired@example.com"})
+        async with harness.client() as client:
+            # The first sign-in asks for the code emailed to the new user.
+            signed_in = await sign_in(harness, client, "hired@example.com", "hired")
+        again = await admin.post(
+            "/api/v1/users", json={"email": "hired@example.com"}, headers=headers
+        )
+
+    assert missing_csrf.status_code == 403
+    assert missing_csrf.json()["error"]["code"] == "CSRF_INVALID"
+    assert not_admin.status_code == 403
+    assert not_admin.json()["error"]["code"] == "ROLE_REQUIRED"
+    assert created.status_code == 201, created.text
+    assert created.json()["message"] == "User created"
+    user = created.json()["data"]
+    assert user["email"] == "Hired@example.com"
+    assert user["display_name"] == "New Hire"
+    assert user["status"] == "active"
+    assert user["platform_role"] == "user"
+    assert user["temporary_password"] == "hired"
+    assert user["email_verified"] is False
+    assert user["must_change_password"] is True
+    assert user["created_by_user_id"] == admin_session["user"]["id"]
+    assert again.status_code == 409
+    assert again.json()["error"]["code"] == "EMAIL_ALREADY_REGISTERED"
+    assert [item["id"] for item in listed.json()["data"]] == [user["id"]]
+    assert signed_in.status_code == 200, signed_in.text
+    assert signed_in.json()["data"]["user"]["id"] == user["id"]
+
+    async with harness.factory() as db:
+        event = await db.scalar(select(AuditEvent).where(AuditEvent.action == "user.created"))
+    assert str(event.actor_user_id) == admin_session["user"]["id"]
+    assert event.resource_id == user["id"]

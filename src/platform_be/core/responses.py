@@ -38,6 +38,7 @@ class ErrorDetail(BaseModel):
 class ErrorBody(BaseModel):
     code: str
     details: list[ErrorDetail] = []
+    reason: str | None = None
 
 
 class ErrorMeta(BaseModel):
@@ -76,11 +77,15 @@ def error_content(
     message: str,
     request_id: str | None,
     details: Sequence[dict[str, str]] = (),
+    reason: str | None = None,
 ) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "details": list(details)}
+    if reason is not None:
+        error["reason"] = reason
     return {
         "success": False,
         "message": message,
-        "error": {"code": code, "details": list(details)},
+        "error": error,
         "meta": {"request_id": request_id},
     }
 
@@ -93,9 +98,10 @@ def error_response(
     *,
     details: Sequence[dict[str, str]] = (),
     headers: dict[str, str] | None = None,
+    reason: str | None = None,
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
-        content=error_content(code, message, request_id, details),
+        content=error_content(code, message, request_id, details, reason),
         headers=headers,
     )

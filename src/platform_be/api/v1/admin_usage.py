@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from platform_be.auth.sessions import Principal, require_platform_admin
 from platform_be.core.errors import APIError
 from platform_be.core.responses import ApiResponse, paginated
+from platform_be.core.search import SearchTerm, matches
 from platform_be.db.session import get_db
 from platform_be.models.project import Project
 from platform_be.models.research import ResearchRun
@@ -32,7 +33,8 @@ class ProjectUsageItem(BaseModel):
     response_model=ApiResponse[list[ProjectUsageItem]],
     summary="Runs and cost per project",
     description=(
-        "Platform Admin only. Projects with the highest cost come first. `from` and `to` "
+        "Platform Admin only. Projects with the highest cost come first. `q` finds "
+        "projects by name. `from` and `to` "
         "limit which runs are counted by the time they were created; projects with no "
         "run in the range are still listed, with zeros."
     ),
@@ -44,6 +46,7 @@ async def project_usage(
     to_time: datetime | None = Query(
         default=None, alias="to", description="Inclusive, ISO-8601 with a timezone offset"
     ),
+    q: SearchTerm = None,
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     _: Principal = Depends(require_platform_admin),
@@ -71,11 +74,13 @@ async def project_usage(
         .group_by(ResearchRun.project_id)
         .subquery()
     )
-    total = int(await db.scalar(select(func.count()).select_from(Project)) or 0)
+    named = [matches(q, Project.name)] if q else []
+    total = int(await db.scalar(select(func.count()).select_from(Project).where(*named)) or 0)
     rows = (
         await db.execute(
             select(Project, totals)
             .outerjoin(totals, totals.c.project_id == Project.id)
+            .where(*named)
             .order_by(func.coalesce(totals.c.cost_usd, 0).desc(), Project.created_at.desc())
             .limit(limit)
             .offset(offset)

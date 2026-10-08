@@ -38,7 +38,9 @@ class Notification(Base):
     __tablename__ = "notifications"
     __table_args__ = (
         CheckConstraint(
-            "kind IN ('run_awaiting_review', 'run_finished', 'added_to_project', 'run_commented')",
+            "kind IN ('run_awaiting_review', 'run_finished', 'added_to_project', "
+            "'run_commented', 'project_invited', 'invite_accepted', 'invite_declined', "
+            "'member_role_changed', 'removed_from_project')",
             name="ck_notifications_kind",
         ),
         Index("ix_notifications_recipient", "recipient_user_id", "read_at", "created_at"),

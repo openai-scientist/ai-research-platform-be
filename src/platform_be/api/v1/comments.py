@@ -20,6 +20,7 @@ from platform_be.services.access import (
     require_project_access,
 )
 from platform_be.services.audit import record_audit
+from platform_be.services.avatars import api_prefix, avatar_url
 from platform_be.services.notifications import notify_project_members
 from platform_be.services.runs import get_run
 
@@ -56,13 +57,16 @@ class CommentItem(BaseModel):
     artifact_id: str | None
     author_user_id: str
     author_display_name: str | None
+    author_avatar_url: str | None
     body: str | None = Field(description="Null once the comment is deleted.")
     deleted: bool
     created_at: datetime
     edited_at: datetime | None
 
 
-def _item(comment: Comment, author_display_name: str | None) -> CommentItem:
+def _item(
+    comment: Comment, author_display_name: str | None, author_avatar_url: str | None
+) -> CommentItem:
     deleted = comment.deleted_at is not None
     return CommentItem(
         id=str(comment.id),
@@ -70,11 +74,18 @@ def _item(comment: Comment, author_display_name: str | None) -> CommentItem:
         artifact_id=str(comment.artifact_id) if comment.artifact_id else None,
         author_user_id=str(comment.author_user_id),
         author_display_name=author_display_name,
+        author_avatar_url=author_avatar_url,
         body=None if deleted else comment.body,
         deleted=deleted,
         created_at=comment.created_at,
         edited_at=None if deleted else comment.edited_at,
     )
+
+
+def _own_item(comment: Comment, principal: Principal, prefix: str) -> CommentItem:
+    """The item for a comment the caller wrote."""
+    user = principal.user
+    return _item(comment, user.display_name, avatar_url(prefix, user.id, user.avatar_storage_key))
 
 
 async def _live_comment(db: AsyncSession, run_id: UUID, comment_id: UUID) -> Comment:
@@ -104,6 +115,7 @@ async def list_comments(
     offset: int = Query(default=0, ge=0),
     principal: Principal = Depends(require_active_principal),
     db: AsyncSession = Depends(get_db),
+    prefix: str = Depends(api_prefix),
 ) -> ApiResponse[list[CommentItem]]:
     await require_project_access(db, principal, project_id)
     run = await get_run(db, project_id, run_id)
@@ -113,7 +125,7 @@ async def list_comments(
     total = int(await db.scalar(select(func.count()).select_from(Comment).where(*filters)) or 0)
     rows = (
         await db.execute(
-            select(Comment, User.display_name)
+            select(Comment, User.display_name, User.avatar_storage_key)
             .join(User, User.id == Comment.author_user_id)
             .where(*filters)
             .order_by(Comment.created_at, Comment.id)
@@ -122,7 +134,13 @@ async def list_comments(
         )
     ).all()
     return paginated(
-        [_item(comment, name) for comment, name in rows], total=total, limit=limit, offset=offset
+        [
+            _item(comment, name, avatar_url(prefix, comment.author_user_id, key))
+            for comment, name, key in rows
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
     )
 
 
@@ -140,6 +158,7 @@ async def create_comment(
     body: CommentCreate,
     principal: Principal = Depends(require_active_csrf),
     db: AsyncSession = Depends(get_db),
+    prefix: str = Depends(api_prefix),
 ) -> ApiResponse[CommentItem]:
     project, _ = await require_project_access(db, principal, project_id)
     ensure_writable_project(project)
@@ -170,7 +189,7 @@ async def create_comment(
             only_user_id=run.created_by_user_id,
         )
     await db.flush()
-    return ok(_item(comment, principal.user.display_name), "Comment added")
+    return ok(_own_item(comment, principal, prefix), "Comment added")
 
 
 @router.patch(
@@ -186,6 +205,7 @@ async def edit_comment(
     body: CommentBody,
     principal: Principal = Depends(require_active_csrf),
     db: AsyncSession = Depends(get_db),
+    prefix: str = Depends(api_prefix),
 ) -> ApiResponse[CommentItem]:
     project, _ = await require_project_access(db, principal, project_id)
     ensure_writable_project(project)
@@ -197,7 +217,7 @@ async def edit_comment(
         comment.body = body.body
         comment.edited_at = datetime.now(UTC)
         await db.flush()
-    return ok(_item(comment, principal.user.display_name), "Comment updated")
+    return ok(_own_item(comment, principal, prefix), "Comment updated")
 
 
 @router.delete(
@@ -214,6 +234,7 @@ async def delete_comment(
     request: Request,
     principal: Principal = Depends(require_active_csrf),
     db: AsyncSession = Depends(get_db),
+    prefix: str = Depends(api_prefix),
 ) -> ApiResponse[CommentItem]:
     project, membership = await require_project_access(db, principal, project_id)
     ensure_writable_project(project)
@@ -238,7 +259,14 @@ async def delete_comment(
         details={"run_id": str(run.id), "author_user_id": str(comment.author_user_id)},
     )
     await db.flush()
-    author_name = await db.scalar(
-        select(User.display_name).where(User.id == comment.author_user_id)
+    author = (
+        await db.execute(
+            select(User.display_name, User.avatar_storage_key).where(
+                User.id == comment.author_user_id
+            )
+        )
+    ).one()
+    return ok(
+        _item(comment, author[0], avatar_url(prefix, comment.author_user_id, author[1])),
+        "Comment deleted",
     )
-    return ok(_item(comment, author_name), "Comment deleted")

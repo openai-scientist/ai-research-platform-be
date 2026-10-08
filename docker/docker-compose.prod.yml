@@ -21,6 +21,10 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     restart: unless-stopped
+    # A read from an external database can return a value of up to 1 GB. With a limit, only
+    # this container is stopped and restarted; without one the whole host runs out of memory.
+    mem_limit: ${API_MEMORY_LIMIT:-1g}
+    stop_grace_period: 40s
     environment:
       APP_ENV: production
       DEBUG: "false"
@@ -31,11 +35,29 @@ services:
       COOKIE_SECURE: "true"
       COOKIE_SAMESITE: ${COOKIE_SAMESITE:-lax}
       AUTH_SESSION_RATE_LIMIT: ${AUTH_SESSION_RATE_LIMIT:-10}
+      AUTH_CODE_RATE_LIMIT: ${AUTH_CODE_RATE_LIMIT:-20}
       AUTH_SESSION_RATE_WINDOW_SECONDS: ${AUTH_SESSION_RATE_WINDOW_SECONDS:-60}
       REQUEST_MAX_BODY_BYTES: ${REQUEST_MAX_BODY_BYTES:-1048576}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_ENDPOINT_URL: ${R2_ENDPOINT_URL:-}
+      R2_BUCKET: ${R2_BUCKET:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
       STORAGE_LOCAL_ROOT: /app/var/storage
       DATASET_MAX_UPLOAD_BYTES: ${DATASET_MAX_UPLOAD_BYTES:-52428800}
       ARTIFACT_MAX_UPLOAD_BYTES: ${ARTIFACT_MAX_UPLOAD_BYTES:-52428800}
+      PROJECT_FILE_MAX_UPLOAD_BYTES: ${PROJECT_FILE_MAX_UPLOAD_BYTES:-52428800}
+      AVATAR_MAX_UPLOAD_BYTES: ${AVATAR_MAX_UPLOAD_BYTES:-4194304}
+      RESEND_API_KEY: ${RESEND_API_KEY:?Set RESEND_API_KEY in the production environment file}
+      EMAIL_FROM: ${EMAIL_FROM:-AI Research Platform <no-reply@beyond8.io.vn>}
+      APP_URL: ${APP_URL:-}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-}
+      GOOGLE_OAUTH_CONNECTIONS_REDIRECT_URI: ${GOOGLE_OAUTH_CONNECTIONS_REDIRECT_URI:-}
+      PROJECT_INVITE_TTL_HOURS: ${PROJECT_INVITE_TTL_HOURS:-24}
+      INVITE_RESEND_COOLDOWN_SECONDS: ${INVITE_RESEND_COOLDOWN_SECONDS:-60}
       POPPER_BASE_URL: ${POPPER_BASE_URL:-}
       POPPER_SERVICE_KEY: ${POPPER_SERVICE_KEY:-}
       POPPER_CALLBACK_KEY: ${POPPER_CALLBACK_KEY:-}
@@ -43,15 +65,25 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?Set PUBLIC_BASE_URL in the production environment file}
       RUN_DEFAULT_BUDGET_USD: ${RUN_DEFAULT_BUDGET_USD:-5}
       RUN_MAX_BUDGET_USD: ${RUN_MAX_BUDGET_USD:-20}
+      CONNECTION_SECRET_KEY: ${CONNECTION_SECRET_KEY:-}
+      CONNECTION_CONNECT_TIMEOUT_SECONDS: ${CONNECTION_CONNECT_TIMEOUT_SECONDS:-10}
+      CONNECTION_QUERY_TIMEOUT_SECONDS: ${CONNECTION_QUERY_TIMEOUT_SECONDS:-60}
+      CONNECTION_IMPORT_TIMEOUT_SECONDS: ${CONNECTION_IMPORT_TIMEOUT_SECONDS:-300}
+      CONNECTION_MAX_CONCURRENT_QUERIES: ${CONNECTION_MAX_CONCURRENT_QUERIES:-4}
+      CONNECTION_MAX_CONCURRENT_PER_OWNER: ${CONNECTION_MAX_CONCURRENT_PER_OWNER:-2}
+      CONNECTION_PROBE_RATE_LIMIT: ${CONNECTION_PROBE_RATE_LIMIT:-30}
+      CONNECTION_QUERY_RATE_LIMIT: ${CONNECTION_QUERY_RATE_LIMIT:-120}
+      CONNECTION_PREVIEW_MAX_ROWS: ${CONNECTION_PREVIEW_MAX_ROWS:-100}
+      CONNECTION_BIGQUERY_MAX_BYTES_BILLED: ${CONNECTION_BIGQUERY_MAX_BYTES_BILLED:-1073741824}
     depends_on:
       db:
         condition: service_healthy
     ports:
-      - "127.0.0.1:${API_PORT:-8000}:8000"
+      - "127.0.0.1:${API_PORT:-8080}:8080"
     volumes:
       - platform_prod_storage:/app/var/storage
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/ready', timeout=2)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/v1/health/ready', timeout=2)"]
       interval: 10s
       timeout: 3s
       retries: 10

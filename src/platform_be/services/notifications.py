@@ -1,13 +1,14 @@
 from collections.abc import Iterable
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_be.core.roles import ProjectRole
 from platform_be.models.collaboration import Notification
 from platform_be.models.identity import User, UserStatus
 from platform_be.models.project import ProjectMembership
+from platform_be.services.notification_stream import notifications_changed
 
 
 def notify_user(
@@ -28,6 +29,27 @@ def notify_user(
             actor_user_id=actor_user_id,
         )
     )
+    notifications_changed(db, recipient_user_id)
+
+
+async def drop_invitation_notices(
+    db: AsyncSession, user_id: UUID, project_id: UUID, *, joined: bool = False
+) -> None:
+    """Remove the user's invitation notices for a project.
+
+    Called when the invitation is answered, cancelled or sent again, so an old notice
+    never comes back with a later invitation to the same project. Someone who joins
+    again also loses the notice that they were once removed.
+    """
+    kinds = ["project_invited", "removed_from_project"] if joined else ["project_invited"]
+    await db.execute(
+        delete(Notification).where(
+            Notification.recipient_user_id == user_id,
+            Notification.project_id == project_id,
+            Notification.kind.in_(kinds),
+        )
+    )
+    notifications_changed(db, user_id)
 
 
 async def notify_project_members(

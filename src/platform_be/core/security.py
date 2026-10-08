@@ -12,6 +12,17 @@ def token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def new_otp_code() -> str:
+    """Six random digits, leading zeros kept."""
+    return f"{secrets.randbelow(10**6):06d}"
+
+
+def otp_digest(signing_secret: str, purpose: str, user_id: object, code: str) -> str:
+    """What is stored for a one-time code: bound to its user and purpose, useless if leaked."""
+    message = f"{purpose}:{user_id}:{code}".encode()
+    return hmac.new(signing_secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
 def hash_password(password: str, log2_n: int) -> str:
     """Hash a password with scrypt. The result carries its own salt and cost parameters."""
     salt = secrets.token_bytes(16)

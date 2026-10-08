@@ -17,13 +17,38 @@ class RequestProtectionMiddleware:
     def __init__(self, app: ASGIApp, *, settings: Settings) -> None:
         self.app = app
         self.settings = settings
-        self._session_attempts: OrderedDict[str, deque[float]] = OrderedDict()
+        auth = f"{settings.api_prefix.rstrip('/')}/auth"
+        # Paths that share a limit, the attempts counted per client, and the limit's setting.
+        # Code traffic has its own limit so it cannot keep people from signing in.
+        self._throttles: list[tuple[frozenset[str], OrderedDict[str, deque[float]], str]] = [
+            (
+                frozenset({f"{auth}/login", f"{auth}/register"}),
+                OrderedDict(),
+                "auth_session_rate_limit",
+            ),
+            (
+                frozenset(
+                    f"{auth}/{name}"
+                    for name in (
+                        "verify-email",
+                        "resend-verification",
+                        "forgot-password",
+                        "verify-reset-password",
+                        "reset-password",
+                    )
+                ),
+                OrderedDict(),
+                "auth_code_rate_limit",
+            ),
+        ]
         prefix = re.escape(settings.api_prefix.rstrip("/"))
         # File uploads get their own, larger limit; every other route keeps the small one.
         self._dataset_upload_path = re.compile(
             rf"{prefix}/projects/[^/]+/datasets(/[^/]+/versions)?/?"
         )
+        self._project_file_upload_path = re.compile(rf"{prefix}/projects/[^/]+/files/?")
         self._artifact_upload_path = re.compile(rf"{prefix}/internal/popper/runs/[^/]+/artifacts/?")
+        self._avatar_upload_path = re.compile(rf"{prefix}/(auth/me|users/[^/]+)/avatar/?")
         self._popper_callback_prefix = f"{settings.api_prefix.rstrip('/')}/internal/popper/"
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -69,22 +94,22 @@ class RequestProtectionMiddleware:
                 )
                 return
 
-        auth_prefix = f"{self.settings.api_prefix.rstrip('/')}/auth"
-        if scope.get("method") == "POST" and scope.get("path") in (
-            f"{auth_prefix}/login",
-            f"{auth_prefix}/register",
-        ):
-            retry_after = self._consume_session_attempt(scope)
-            if retry_after is not None:
-                await self._reject(
-                    send,
-                    429,
-                    "RATE_LIMITED",
-                    "Too many sign-in attempts; try again later",
-                    request_id,
-                    headers={"retry-after": str(retry_after)},
-                )
-                return
+        if scope.get("method") == "POST":
+            for paths, attempts, limit_setting in self._throttles:
+                if scope.get("path") not in paths:
+                    continue
+                limit = getattr(self.settings, limit_setting)
+                retry_after = self._consume_attempt(scope, attempts, limit)
+                if retry_after is not None:
+                    await self._reject(
+                        send,
+                        429,
+                        "RATE_LIMITED",
+                        "Too many sign-in attempts; try again later",
+                        request_id,
+                        headers={"retry-after": str(retry_after)},
+                    )
+                    return
 
         # Count bytes as they pass instead of buffering, so a large upload never sits in memory.
         received = 0
@@ -131,26 +156,32 @@ class RequestProtectionMiddleware:
             path = scope.get("path", "")
             if self._dataset_upload_path.fullmatch(path):
                 return self.settings.dataset_max_upload_bytes
+            if self._project_file_upload_path.fullmatch(path):
+                return self.settings.project_file_max_upload_bytes
             if self._artifact_upload_path.fullmatch(path):
                 return self.settings.artifact_max_upload_bytes
+            if self._avatar_upload_path.fullmatch(path):
+                return self.settings.avatar_max_upload_bytes
         return self.settings.request_max_body_bytes
 
-    def _consume_session_attempt(self, scope: Scope) -> int | None:
+    def _consume_attempt(
+        self, scope: Scope, per_client: OrderedDict[str, deque[float]], limit: int
+    ) -> int | None:
         now = time.monotonic()
         window = self.settings.auth_session_rate_window_seconds
         client = scope.get("client")
         key = str(client[0]) if client else "unknown-client"
-        attempts = self._session_attempts.get(key)
+        attempts = per_client.get(key)
         if attempts is None:
-            if len(self._session_attempts) >= 4096:
-                self._session_attempts.popitem(last=False)
+            if len(per_client) >= 4096:
+                per_client.popitem(last=False)
             attempts = deque()
-            self._session_attempts[key] = attempts
+            per_client[key] = attempts
         else:
-            self._session_attempts.move_to_end(key)
+            per_client.move_to_end(key)
         while attempts and now - attempts[0] >= window:
             attempts.popleft()
-        if len(attempts) >= self.settings.auth_session_rate_limit:
+        if len(attempts) >= limit:
             return max(1, math.ceil(window - (now - attempts[0])))
         attempts.append(now)
         return None

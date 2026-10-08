@@ -4,9 +4,10 @@ from sqlalchemy import func, select, text
 
 from platform_be.cli.bootstrap_admin import bootstrap_admin
 from platform_be.models.project import Project, ProjectMembership
-from tests.conftest import Harness, login, mutation_headers
+from tests.conftest import ORIGIN, PASSWORD, Harness, login, mutation_headers
 
 PROJECTS = "/api/v1/projects"
+INVITATIONS = "/api/v1/invitations"
 
 
 async def create_project(client: AsyncClient, session: dict, **fields: object) -> dict:
@@ -19,9 +20,10 @@ async def create_project(client: AsyncClient, session: dict, **fields: object) -
     return response.json()["data"]
 
 
-async def add_member(
+async def invite_member(
     client: AsyncClient, session: dict, project_id: str, email: str, role: str
 ) -> dict:
+    """Invite a registered user; they have no access until they accept."""
     response = await client.post(
         f"{PROJECTS}/{project_id}/members",
         json={"email": email, "role": role},
@@ -29,6 +31,29 @@ async def add_member(
     )
     assert response.status_code == 201, response.text
     return response.json()["data"]
+
+
+async def accept_invitation(client: AsyncClient, session: dict, membership_id: str):
+    return await client.post(
+        f"{INVITATIONS}/{membership_id}/accept", headers=mutation_headers(session["csrf_token"])
+    )
+
+
+async def add_member(
+    client: AsyncClient, session: dict, project_id: str, email: str, role: str
+) -> dict:
+    """Invite a registered user and accept as that user, in a browser of their own."""
+    invited = await invite_member(client, session, project_id, email, role)
+    async with AsyncClient(transport=client._transport, base_url=ORIGIN) as invitee:
+        signed_in = await invitee.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": PASSWORD},
+            headers={"Origin": ORIGIN},
+        )
+        assert signed_in.status_code == 200, signed_in.text
+        accepted = await accept_invitation(invitee, signed_in.json()["data"], invited["id"])
+        assert accepted.status_code == 200, accepted.text
+    return {**invited, "status": "active"}
 
 
 @pytest.mark.asyncio
@@ -245,7 +270,7 @@ async def test_archived_project_is_read_only_and_restorable(harness: Harness) ->
 
 
 @pytest.mark.asyncio
-async def test_suspension_keeps_a_manager_in_shared_projects(harness: Harness) -> None:
+async def test_suspension_keeps_a_manager_in_every_project(harness: Harness) -> None:
     async with (
         harness.client() as admin_client,
         harness.client() as manager_client,
@@ -270,9 +295,11 @@ async def test_suspension_keeps_a_manager_in_shared_projects(harness: Harness) -
                 headers=admin_headers,
             )
 
-        # Nobody else works in a solo project, so its only manager can be suspended.
+        # The only manager of a project cannot be suspended, also when nobody else is in it.
         await create_project(solo_client, solo)
-        assert (await suspend(solo)).status_code == 200
+        alone = await suspend(solo)
+        assert alone.status_code == 409
+        assert alone.json()["error"]["code"] == "LAST_PROJECT_MANAGER"
 
         shared = await create_project(manager_client, manager)
         member = await add_member(
@@ -293,7 +320,7 @@ async def test_suspension_keeps_a_manager_in_shared_projects(harness: Harness) -
 
         suspended_target = await colleague_client.post(
             f"{PROJECTS}/{shared['id']}/members",
-            json={"email": "solo@example.com", "role": "reviewer"},
+            json={"email": "manager@example.com", "role": "reviewer"},
             headers=mutation_headers(colleague["csrf_token"]),
         )
         assert suspended_target.status_code == 409
@@ -324,6 +351,7 @@ async def test_project_actions_are_audited_per_project(harness: Harness) -> None
         assert [item["action"] for item in scoped.json()["data"]][::-1] == [
             "project.created",
             "project.member_added",
+            "project.member_invited",
             "project.member_added",
         ]
         assert {item["project_id"] for item in scoped.json()["data"]} == {project["id"]}

@@ -45,14 +45,17 @@ class ProjectMembership(Base):
             "role_code IN ('project_manager', 'researcher', 'reviewer')",
             name="ck_project_memberships_role",
         ),
-        CheckConstraint("status IN ('active', 'revoked')", name="ck_project_memberships_status"),
+        CheckConstraint(
+            "status IN ('invited', 'active', 'revoked')", name="ck_project_memberships_status"
+        ),
+        # One open row per user and project: an invitation or a membership, never both.
         Index(
-            "uq_project_membership_active",
+            "uq_project_membership_open",
             "user_id",
             "project_id",
             unique=True,
-            postgresql_where=text("status = 'active'"),
-            sqlite_where=text("status = 'active'"),
+            postgresql_where=text("status IN ('invited', 'active')"),
+            sqlite_where=text("status IN ('invited', 'active')"),
         ),
     )
 
@@ -75,3 +78,6 @@ class ProjectMembership(Base):
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Set while the row is, or was, an invitation: `invited` grants nothing until accepted.
+    invite_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    invite_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
