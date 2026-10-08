@@ -25,7 +25,11 @@ from platform_be.models.research import (
 from platform_be.services.access import lock_project_scope
 from platform_be.services.file_store import FileStore, get_file_store, iter_file, safe_filename
 from platform_be.services.run_event_stream import run_events_changed
-from platform_be.services.runs import ingest_popper_state, normalize_popper_status
+from platform_be.services.runs import (
+    engine_event_is_repeat,
+    ingest_popper_state,
+    normalize_popper_status,
+)
 
 ArtifactKind = Literal["paper_pdf", "paper_tex", "figure", "results", "other"]
 
@@ -121,6 +125,14 @@ class BatchEventsAck(BaseModel):
     last_source_seq: int
 
 
+def _apply_cost(run: ResearchRun, payload: dict[str, Any]) -> None:
+    if "cost_usd" in payload:
+        try:
+            run.cost_usd = Decimal(str(payload["cost_usd"]))
+        except Exception:
+            pass
+
+
 async def _locked_run(db: AsyncSession, run_id: UUID) -> ResearchRun:
     project_id = await db.scalar(select(ResearchRun.project_id).where(ResearchRun.id == run_id))
     if project_id is None:
@@ -169,7 +181,13 @@ async def ingest_run_events(
         accepted_events.append(evt)
         expected_source_seq += 1
 
+    stored = 0
     for evt in accepted_events:
+        if await engine_event_is_repeat(db, run, evt.type, evt.payload):
+            run.last_source_seq = evt.source_seq
+            _apply_cost(run, evt.payload)
+            continue
+        stored += 1
         seq = run.last_seq + 1
         now = datetime.now(UTC)
         run_event = RunEvent(
@@ -212,18 +230,27 @@ async def ingest_run_events(
                 run.status = "failed"
                 run.failure_message = evt.payload.get("reason", "Engine reported failure")
                 run.finished_at = now
+        elif evt.type == "gate.resolved":
+            # Answered outside the platform: the gate records the engine's answer.
+            gate = await db.scalar(
+                select(RunGate).where(
+                    RunGate.run_id == run.id, RunGate.gate_key == evt.payload.get("gate_id")
+                )
+            )
+            if gate is not None and gate.answer is None:
+                gate.answer = evt.payload.get("answer") or {
+                    k: evt.payload.get(k) for k in ("option_id", "dropped", "note")
+                }
+                gate.answered_at = now
+                gate.resolved_seq = seq
         elif evt.type == "run.completed":
             run.status = "completed"
             run.finished_at = now
 
-        if "cost_usd" in evt.payload:
-            try:
-                run.cost_usd = Decimal(str(evt.payload["cost_usd"]))
-            except Exception:
-                pass
+        _apply_cost(run, evt.payload)
 
     await db.flush()
-    if accepted_events:
+    if stored:
         run_events_changed(db, run.id)
         notify_payload = f"{run.id}:{run.last_seq}"
         await db.execute(text(f"SELECT pg_notify('run_events', '{notify_payload}')"))

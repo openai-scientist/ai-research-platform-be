@@ -52,6 +52,7 @@ from platform_be.services.research_markdown import render_research_markdown
 from platform_be.services.run_event_stream import RunEventHub, run_events_changed
 from platform_be.services.runs import (
     apply_run_status,
+    gate_answer_summary,
     get_run,
     ingest_popper_state,
     normalize_popper_status,
@@ -808,12 +809,17 @@ async def answer_gate(
         seq=resolved_seq,
         source_seq=None,
         type="gate.resolved",
-        stage_key=spec.get("stage_key", "screen"),
+        # The screen and scope gates belong to the UI groups of the same name.
+        stage_key=spec.get("stage_key") or gate.kind,
+        actor="pi",
         payload={
             "gate_id": gate.gate_key,
+            "kind": gate.kind,
             "option_id": body.option_id,
             "dropped": body.dropped,
             "note": clean_note,
+            "answer": dict(gate.answer),
+            "summary": gate_answer_summary(gate.kind, body.option_id, body.dropped),
         },
         created_at=now,
     )

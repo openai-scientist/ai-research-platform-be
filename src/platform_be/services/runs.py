@@ -15,6 +15,7 @@ from platform_be.models.research import (
     FINISHED_RUN_STATUSES,
     FrameReview,
     ResearchRun,
+    RunGate,
 )
 from platform_be.services.audit import record_audit
 from platform_be.services.file_store import FileStore, put_json
@@ -214,3 +215,37 @@ async def ingest_popper_state(
         )
     )
     await db.flush()
+
+
+def gate_answer_summary(kind: str, option_id: str, dropped: list[str]) -> str:
+    """The run studio's one-line record of a gate answer, as the engine words it."""
+    if option_id == "reject":
+        return "Asked for a new search." if kind == "screen" else "Asked for new scoping."
+    noun = "shortlist" if kind == "screen" else "scope"
+    if dropped:
+        papers = "paper" if len(dropped) == 1 else "papers"
+        return f"Approved the {noun} without {len(dropped)} {papers}."
+    return f"Approved the {noun}."
+
+
+async def engine_event_is_repeat(
+    db: AsyncSession, run: ResearchRun, type_: str, payload: dict
+) -> bool:
+    """True when the platform already recorded what an engine event says.
+
+    Answering a gate and pausing or resuming write their events at once, so the run studio
+    reacts without waiting for the engine. The engine then reports the same facts; those
+    repeats are not stored again.
+    """
+    if type_ == "run.status":
+        return payload.get("status") in ("running", "paused", "awaiting_review") and (
+            payload.get("status") == run.status
+        )
+    if type_ == "gate.resolved":
+        gate = await db.scalar(
+            select(RunGate).where(
+                RunGate.run_id == run.id, RunGate.gate_key == payload.get("gate_id")
+            )
+        )
+        return gate is not None and gate.answer is not None
+    return False

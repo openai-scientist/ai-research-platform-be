@@ -101,6 +101,8 @@ async def open_harness(tmp_path, **overrides: Any) -> AsyncIterator[Harness]:
         cursor = connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
+        # Run events wake their streams with Postgres NOTIFY; SQLite has nothing to wake.
+        connection.create_function("pg_notify", 2, lambda _channel, _payload: None)
 
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)

@@ -335,6 +335,8 @@ class FakePopperClient:
         self.runs: dict[str, PopperRunState] = {}
         self.started: list[dict[str, Any]] = []
         self.reviews: list[dict[str, Any]] = []
+        self.gate_answers: list[dict[str, Any]] = []
+        self.controls: list[tuple[str, str]] = []
         # Set to an exception instance to make the next call fail with it.
         self.fail_with: Exception | None = None
         # When True, the run is recorded and the call then fails, like a lost response.
@@ -349,27 +351,35 @@ class FakePopperClient:
         self,
         *,
         platform_run_id: UUID,
-        research_markdown: str,
-        dataset: IO[bytes],
-        dataset_filename: str,
         budget_usd: Decimal,
-        auto_review: bool,
         callback_url: str,
+        research_markdown: str | None = None,
+        dataset: IO[bytes] | None = None,
+        dataset_filename: str | None = None,
+        auto_review: bool = False,
+        topic: str | None = None,
+        domains: list[str] | None = None,
+        review_mode: str = "copilot",
     ) -> str:
         if not self.record_before_failing:
             self._maybe_fail()
         popper_run_id = f"popper-{platform_run_id}"
-        self.started.append(
-            {
-                "platform_run_id": platform_run_id,
-                "research_markdown": research_markdown,
-                "dataset": dataset.read(),
-                "dataset_filename": dataset_filename,
-                "budget_usd": budget_usd,
-                "auto_review": auto_review,
-                "callback_url": callback_url,
-            }
-        )
+        started: dict[str, Any] = {
+            "platform_run_id": platform_run_id,
+            "budget_usd": budget_usd,
+            "callback_url": callback_url,
+        }
+        if topic is not None:
+            started.update(topic=topic, domains=domains, review_mode=review_mode)
+        else:
+            assert dataset is not None
+            started.update(
+                research_markdown=research_markdown,
+                dataset=dataset.read(),
+                dataset_filename=dataset_filename,
+                auto_review=auto_review,
+            )
+        self.started.append(started)
         self.runs[popper_run_id] = PopperRunState(popper_run_id=popper_run_id, status="running")
         self._maybe_fail()
         return popper_run_id
@@ -391,6 +401,24 @@ class FakePopperClient:
         self.reviews.append(
             {"popper_run_id": popper_run_id, "review_sequence": review_sequence, **decision}
         )
+
+    async def answer_gate(
+        self, popper_run_id: str, *, gate_id: str, decision: dict[str, Any]
+    ) -> None:
+        self._maybe_fail()
+        self.gate_answers.append({"popper_run_id": popper_run_id, "gate_id": gate_id, **decision})
+
+    async def pause(self, popper_run_id: str) -> None:
+        self._maybe_fail()
+        self.controls.append(("pause", popper_run_id))
+
+    async def resume(self, popper_run_id: str) -> None:
+        self._maybe_fail()
+        self.controls.append(("resume", popper_run_id))
+
+    async def cancel(self, popper_run_id: str) -> None:
+        self._maybe_fail()
+        self.controls.append(("cancel", popper_run_id))
 
 
 class FakeConnector:
