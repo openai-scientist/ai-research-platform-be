@@ -24,7 +24,7 @@ The research itself is done by **Popper**, a separate service. The Platform send
 
 - **Accounts and sessions**: email and password sign-up with an emailed 6-digit code, sign-in with Google, cookie sessions with CSRF protection, password reset, profile pictures, accounts created by an admin.
 - **Projects and members**: five fixed roles, invitations by email that expire after 24 hours, archive and restore, no hard delete.
-- **Research inputs**: versioned CSV datasets (uploaded, or imported through a data connection to PostgreSQL, MySQL, BigQuery, a Google spreadsheet or a Google Drive folder), project files, a versioned research context.
+- **Research inputs**: versioned CSV datasets (uploaded, or imported through a data connection to PostgreSQL, MySQL, BigQuery, a Google spreadsheet, a Google Drive folder, Prometheus or InfluxDB), project files, a versioned research context.
 - **Runs**: one run at a time per project, sent to Popper with a spending cap; frame review; result files.
 - **Collaboration**: comments on runs and result files, notifications over SSE, an audit log of every change.
 
@@ -128,6 +128,7 @@ Tests run on SQLite in memory. Some need a real service and are skipped unless a
 | `PLATFORM_BIGQUERY_TEST_SERVICE_ACCOUNT` | The one test that talks to BigQuery itself |
 | `PLATFORM_LIVE_CONNECTOR_TESTS=1` | The whole flow through public databases on the internet |
 | `PLATFORM_LIVE_GOOGLE_REFRESH_TOKEN` and the four beside it | With the line above: the whole flow through Google's own Drive and Sheets APIs |
+| `PLATFORM_LIVE_PROMETHEUS_URL`, `PLATFORM_LIVE_INFLUXDB_URL` and those beside them | With the same line: the whole flow through a Prometheus and an InfluxDB server |
 
 **MySQL.** The URL must be of a user who can create databases and users. The Platform itself runs no MySQL: a throwaway container is enough, and it is gone once stopped.
 
@@ -162,6 +163,21 @@ One way to get the refresh token: add `https://developers.google.com/oauthplaygr
 
 ```bash
 PLATFORM_LIVE_CONNECTOR_TESTS=1 uv run pytest tests/test_live_connectors.py -k google -s
+```
+
+**Time series.** The same file takes a Prometheus and an InfluxDB server from a new connection through browsing, a preview, a live view and an import to a second version. Each is skipped without its address. Nothing is written to either server.
+
+| Variable | Value |
+|---|---|
+| `PLATFORM_LIVE_PROMETHEUS_URL` | Address of a Prometheus server that keeps the metric `up`, as one that scrapes anything does. The project's public demo, `https://prometheus.demo.prometheus.io`, needs no credentials |
+| `PLATFORM_LIVE_PROMETHEUS_USERNAME`, `PLATFORM_LIVE_PROMETHEUS_TOKEN` | Its credentials, when it asks for any: a token alone is sent as Bearer, with a user name as the password of Basic |
+| `PLATFORM_LIVE_INFLUXDB_URL`, `PLATFORM_LIVE_INFLUXDB_DATABASE` | Address of an InfluxDB server (1.8, 2.x or 3 Core) and a database, or bucket, of it. The measurement whose name sorts first needs a field of numbers written to in the last hour |
+| `PLATFORM_LIVE_INFLUXDB_TOKEN` | Its token, when it asks for one |
+| `PLATFORM_LIVE_INFLUXDB_PRIVATE=1` | The InfluxDB server is a container on this machine: private hosts are allowed for that one test, so it says nothing about the host check |
+
+```bash
+PLATFORM_LIVE_CONNECTOR_TESTS=1 PLATFORM_LIVE_PROMETHEUS_URL=https://prometheus.demo.prometheus.io \
+  uv run pytest tests/test_live_connectors.py -k "prometheus or inwards" -s
 ```
 
 ### Migrations
@@ -291,7 +307,7 @@ The Platform records the row count, column names, size, and SHA-256. A file that
 
 ### Data connections
 
-The second way to bring data in: a project saves a connection to an external database, browses its tables, previews rows live, and imports one table or one `SELECT` statement as a dataset version. Kinds: `postgres` (Supabase included), `mysql` (MariaDB included) and `bigquery`, and two that read files with a user's Google account, `google_sheets` and `google_drive` ([below](#google-sheets-and-google-drive)).
+The second way to bring data in: a project saves a connection to an external database, browses its tables, previews rows live, and imports one table or one `SELECT` statement as a dataset version. Seven kinds: `postgres` (Supabase included), `mysql` (MariaDB included) and `bigquery`; two that read files with a user's Google account, `google_sheets` and `google_drive` ([below](#google-sheets-and-google-drive)); and two that read time series, `prometheus` and `influxdb` ([below](#time-series-prometheus-and-influxdb)).
 
 - **A run never queries the external database.** An import writes a CSV file checked the way an upload is, and the version records where it came from (`source_type`, `source`). Importing the same source again adds a version with what the source holds now.
 - **Creating a connection tests it.** Nothing is saved when the test fails; the answer is 422 `CONNECTION_FAILED` and `error.reason` says why (`auth_failed`, `tls_unavailable`, `host_not_allowed`, ...).
@@ -386,6 +402,25 @@ The result is then checked like any dataset file, so a tab with a header and no 
 | Testing | Only the accounts listed as test users, 100 at most | Access expires 7 days after it was given: the connection answers `access_revoked` and has to be reauthorized every week. |
 | In production, not verified | Any Google account, 100 in total over the life of the project | No 7-day expiry. Google shows an "unverified app" warning that the user has to click through. |
 | In production, verified | Any Google account | No warning. Verifying a restricted scope takes a security assessment by Google, which this project has not done. |
+
+#### Time series: Prometheus and InfluxDB
+
+Two kinds read the points of a metric over a span of time. They need no setting of their own: they are on wherever data connections are. What is read is chosen in a form, never written as a query, and a metric can be watched before it is imported.
+
+| Kind | Points at | `config` | `secret` | `table` | Columns |
+|---|---|---|---|---|---|
+| `prometheus` | A Prometheus server, or one with the same HTTP API (VictoriaMetrics, Thanos, Mimir, Grafana Cloud) | `url` | `token` alone (Bearer), or `username` and `token` (Basic); neither for a server without credentials | Each metric | `time`, `value` and each label |
+| `influxdb` | InfluxDB 1.8, 2.x or 3 Core, read with InfluxQL | `url`, and `database` (on 2.x and 3: the bucket) | 2.x/3: `token`; authenticated 1.8: `username` and `password` (Basic auth) | Each measurement | `time`, each field and each tag |
+
+- **The address** is `http(s)://host[:port][/base-path]`, the part in front of `/api/v1` or `/query`. One with a user name, a password, a query or a fragment is refused with 422 `VALIDATION_ERROR` before anything is tried or recorded. The server is spoken to at the address the host check accepted, a redirect is never followed (`unreachable`), and over `https` the certificate must be one a public authority signed for that name. `http` is accepted; credentials then travel in the clear.
+- **Browsing.** `default` is the only schema. `GET .../columns` says what each column is in `role`: `time`, `field` or `tag` (`null` for every other kind).
+- **A source** is `{"type": "timeseries", "name", "fields", "tags", "start", "end", "bucket", "aggregate"}`, and the only type these kinds read; the other kinds refuse it (`unsupported_source`). `fields` is empty for Prometheus, whose one value is the column `value`, and names at least one field for InfluxDB. `bucket` is one of `1m`, `5m`, `15m`, `1h`, `6h`, `1d`, `1w` and `aggregate` one of `mean`, `sum`, `min`, `max`, `count`; both, or, for InfluxDB only, neither, which reads the points as they were written. `increase`, for Prometheus only, is how much a counter grew in each bucket: an estimate, so not a whole number.
+- **The table** has `time` first, then the tags, then the fields. `time` is the start of the bucket, in UTC; buckets are counted from midnight UTC and weeks from Monday, so both kinds give the same rows for the same points. A bucket without a point has no row. NaN and the infinities are empty values.
+- **Live.** `POST .../live` with `{"name", "fields", "tags", "aggregate", "last"}` returns the buckets of the last `15m`, `1h`, `6h` or `24h` that have ended (buckets of `15s`, `1m`, `5m`, `15m`), at most 2000 rows, and stores nothing. A client polls it; each call counts against the read budget and holds a slot. It is audited once in 10 minutes for each user, connection and metric.
+- **A version** imported this way keeps the whole form in `source.source`, which is all there is to say about its span and its bucket.
+- **Limits.** Prometheus refuses a span of more than 11 000 buckets (`too_many_points`). An answer of more than 16 MiB is refused (`source_too_large`), never cut. A span the server no longer keeps is an empty table, which cannot be imported (`INVALID_DATASET`).
+
+Checked on 2026-10-08 against the Prometheus project's public demo (3.13.0) and against InfluxDB 1.8.10, 2.7.12 and 3 Core 3.12.0 in containers. Not checked against a real server: Prometheus credentials, a base path, the servers that share its API, and InfluxDB over HTTPS.
 
 ### Project files
 
@@ -701,9 +736,9 @@ The `q` parameter matches a substring, case-insensitively, and needs at least 3 
 | `GET` `PATCH` | `/projects/{id}/datasets/{dataset_id}` | Read; rename or describe |
 | `GET` `POST` | `/projects/{id}/datasets/{dataset_id}/versions` | List versions; upload a new version |
 | `GET` | `/projects/{id}/datasets/{dataset_id}/versions/{version_id}/download` | Download a version's file |
-| `POST` | `/projects/{id}/datasets/from-connection` | Import a table or a `SELECT` through a data connection as a new dataset |
+| `POST` | `/projects/{id}/datasets/from-connection` | Import a table, a `SELECT` or a time series through a data connection as a new dataset |
 | `POST` | `/projects/{id}/datasets/{dataset_id}/versions/from-connection` | Import it again as the next version |
-| `GET` `POST` | `/projects/{id}/connections` | List data connections (`q`); test and save a new one (`kind`: `postgres`, `mysql`, `bigquery`, `google_sheets`, `google_drive`) |
+| `GET` `POST` | `/projects/{id}/connections` | List data connections (`q`); test and save a new one (`kind`: `postgres`, `mysql`, `bigquery`, `google_sheets`, `google_drive`, `prometheus`, `influxdb`) |
 | `GET` | `/projects/{id}/connections/google/start` | Browser navigation: to Google, to give read access to Drive |
 | `GET` | `/connections/google/callback` | Where Google sends the browser back; redirects to the frontend with `google_grant` or `error` |
 | `POST` | `/projects/{id}/connections/{connection_id}/reauthorize` | Give a Google connection a fresh access to the same Google account |
@@ -712,7 +747,8 @@ The `q` parameter matches a substring, case-insensitively, and needs at least 3 
 | `GET` | `/projects/{id}/connections/{connection_id}/schemas` | Schemas the database user can read (BigQuery: datasets; Google: the spreadsheet, or the files of the folder) |
 | `GET` | `/projects/{id}/connections/{connection_id}/tables` | Tables and views of one `schema`, at most 500 (`search`); Google: the tabs of one file |
 | `GET` | `/projects/{id}/connections/{connection_id}/columns` | Column names and types of one `table` |
-| `POST` | `/projects/{id}/connections/{connection_id}/preview` | First rows of a table or a `SELECT`, as text |
+| `POST` | `/projects/{id}/connections/{connection_id}/preview` | First rows of a table, a `SELECT` or a time series, as text |
+| `POST` | `/projects/{id}/connections/{connection_id}/live` | `prometheus` and `influxdb`: the latest points of a metric, for a chart that polls |
 
 ### Project files and research context
 
@@ -799,7 +835,7 @@ Ignore the 15-second keep-alive comment: it rechecks the session but does not ex
 
 ### Handoff documents
 
-Step-by-step integration notes with real responses are kept in `docs/` (local, not tracked in Git): `frontend-api-handoff.md`, `notifications-handoff.md` and `frontend-api-handoff-3-data-connections.md`.
+Step-by-step integration notes with real responses are kept in `docs/` (local, not tracked in Git): `frontend-api-handoff.md`, `notifications-handoff.md`, `frontend-api-handoff-3-data-connections.md` and `frontend-api-handoff-5-time-series-connections.md`.
 
 ## Configuration
 
@@ -936,7 +972,7 @@ Switching the store does not move files. Rows written under one store point at k
 
 **Data connections**
 
-- Data connections reach hosts that users choose. Names are resolved once and the address checked: loopback, private, link-local (cloud metadata included) and IPv4-in-IPv6 transition ranges are refused, in staging as in production, and the connection is made to the checked address.
+- Data connections reach hosts that users choose. Names are resolved once and the address checked: loopback, private, link-local (cloud metadata included) and IPv4-in-IPv6 transition ranges are refused, in staging as in production, and the connection is made to the checked address. The `prometheus` and `influxdb` kinds speak HTTP to that address and never follow a redirect, which could lead back inside.
 - The limits on data connections (slots, per-user rates) are counted per API process, like the sign-in limit. Run one replica, or expect them to multiply by the number of workers.
 - TLS to an external database defaults to `require`: encrypted, certificate not checked, which also works with self-signed and private-CA servers. `verify-full` checks the certificate against public authorities and the host name; `disable` is for servers without TLS and sends the password and the rows in the clear.
 - An import keeps its request open for up to 300 seconds. A reverse proxy with a shorter read timeout cuts the response while the import still completes.
