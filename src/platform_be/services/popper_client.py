@@ -4,10 +4,9 @@ Every path and field name of the outbound contract lives in ``HttpPopperClient``
 """
 
 import asyncio
-import json
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import IO, Any, Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
 import httpx
@@ -48,15 +47,11 @@ class PopperClient(Protocol):
         self,
         *,
         platform_run_id: UUID,
-        topic: str | None = None,
-        domains: list[str] | None = None,
+        topic: str,
+        domains: list[str],
         review_mode: str = "copilot",
         budget_usd: Decimal = Decimal("5.00"),
         callback_url: str,
-        research_markdown: str | None = None,
-        dataset: IO[bytes] | None = None,
-        dataset_filename: str | None = None,
-        auto_review: bool = False,
     ) -> str:
         """Start a run and return Popper's id for it.
 
@@ -179,45 +174,21 @@ class HttpPopperClient:
         self,
         *,
         platform_run_id: UUID,
-        topic: str | None = None,
-        domains: list[str] | None = None,
+        topic: str,
+        domains: list[str],
         review_mode: str = "copilot",
         budget_usd: Decimal = Decimal("5.00"),
         callback_url: str,
-        research_markdown: str | None = None,
-        dataset: IO[bytes] | None = None,
-        dataset_filename: str | None = None,
-        auto_review: bool = False,
     ) -> str:
-        if topic is not None:
-            payload = {
-                "platform_run_id": str(platform_run_id),
-                "topic": topic,
-                "domains": domains or [],
-                "review_mode": review_mode,
-                "budget_usd": str(budget_usd),
-                "callback_url": callback_url,
-            }
-            response = await self._request("POST", "/runs", json=payload)
-            if response.status_code >= 400:
-                raise PopperRejected(_error_message(response))
-            return _run_state(self._json(response)).popper_run_id
-
-        config = {
+        payload = {
             "platform_run_id": str(platform_run_id),
+            "topic": topic,
+            "domains": domains,
+            "review_mode": review_mode,
             "budget_usd": str(budget_usd),
-            "auto": auto_review,
             "callback_url": callback_url,
         }
-        files: dict[str, Any] = {
-            "config": ("config.json", json.dumps(config).encode("utf-8"), "application/json"),
-        }
-        if research_markdown is not None:
-            files["research"] = ("research.md", research_markdown.encode("utf-8"), "text/markdown")
-        if dataset is not None and dataset_filename:
-            files["data"] = (dataset_filename, dataset, "text/csv")
-
-        response = await self._request("POST", "/runs", files=files)
+        response = await self._request("POST", "/runs", json=payload)
         if response.status_code >= 400:
             raise PopperRejected(_error_message(response))
         return _run_state(self._json(response)).popper_run_id
