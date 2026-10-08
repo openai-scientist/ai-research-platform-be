@@ -81,8 +81,7 @@ def create_app(
         title=settings.app_name,
         version="0.1.0",
         description=(
-            "Identity, projects, datasets, research context, runs, and review APIs "
-            "for the AI Research Platform."
+            "Identity, projects, datasets, runs, and review APIs for the AI Research Platform."
         ),
         debug=settings.debug,
         lifespan=lifespan,

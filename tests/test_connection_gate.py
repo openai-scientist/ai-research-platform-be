@@ -140,3 +140,58 @@ async def test_the_share_of_one_project_or_user_comes_from_the_settings() -> Non
                 with pytest.raises(APIError):
                     async with gate.slot(uuid4(), user):
                         pass
+
+
+def test_a_live_view_is_put_on_record_once_in_ten_minutes(monkeypatch) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(gate_module.time, "monotonic", lambda: now[0])
+    gate = ConnectionGate()
+    alice, bob, metrics, other = uuid4(), uuid4(), uuid4(), uuid4()
+
+    assert gate.first_view_in_window(alice, metrics, "latency")
+    for _ in range(9):
+        now[0] += 5
+        assert not gate.first_view_in_window(alice, metrics, "latency")
+    # Another metric, another connection and another user are each on record themselves.
+    assert gate.first_view_in_window(alice, metrics, "errors")
+    assert gate.first_view_in_window(alice, other, "latency")
+    assert gate.first_view_in_window(bob, metrics, "latency")
+
+    # Ten minutes after the one on record, not after the last call.
+    now[0] = 1000.0 + 599
+    assert not gate.first_view_in_window(alice, metrics, "latency")
+    now[0] += 1
+    assert gate.first_view_in_window(alice, metrics, "latency")
+    assert not gate.first_view_in_window(alice, metrics, "latency")
+
+
+def test_a_view_that_was_not_recorded_after_all_is_the_next_one() -> None:
+    gate = ConnectionGate()
+    alice, metrics = uuid4(), uuid4()
+
+    assert gate.first_view_in_window(alice, metrics, "latency")
+    gate.forget_view(alice, metrics, "latency")
+    gate.forget_view(alice, metrics, "never seen")
+
+    assert gate.first_view_in_window(alice, metrics, "latency")
+
+
+def test_the_table_of_live_views_stays_bounded(monkeypatch) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(gate_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(gate_module, "_MAX_TRACKED_USERS", 3)
+    gate = ConnectionGate()
+    alice, metrics = uuid4(), uuid4()
+
+    for name in ("a", "b", "c"):
+        now[0] += 1
+        assert gate.first_view_in_window(alice, metrics, name)
+    # Seen again, which does not put it on record again.
+    assert not gate.first_view_in_window(alice, metrics, "a")
+    now[0] += 1
+    assert gate.first_view_in_window(alice, metrics, "d")
+
+    # The one longest on record made room, and is recorded again when it comes back.
+    assert [name for _, _, name in gate._live_views] == ["b", "c", "d"]
+    assert gate.first_view_in_window(alice, metrics, "a")
+    assert len(gate._live_views) == 3

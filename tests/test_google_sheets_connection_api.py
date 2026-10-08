@@ -173,7 +173,7 @@ async def test_a_spreadsheet_is_connected_browsed_and_previewed(google_harness: 
         ]
         columns = await client.get(f"{url}/columns", params={"schema": TITLE, "table": "Answers"})
         assert columns.json()["data"] == [
-            {"name": name, "type": "text"} for name in ["student", "school", "score"]
+            {"name": name, "type": "text", "role": None} for name in ["student", "school", "score"]
         ]
         missing = await client.get(f"{url}/columns", params={"schema": TITLE, "table": "Gone"})
         assert failure(missing) == (422, "SOURCE_INVALID", "source_not_found")
@@ -181,7 +181,10 @@ async def test_a_spreadsheet_is_connected_browsed_and_previewed(google_harness: 
         shown = await preview(client, session, url, TAB)
         assert shown.status_code == 200, shown.text
         assert shown.json()["data"] == {
-            "columns": [{"name": name, "type": "text"} for name in ["student", "school", "score"]],
+            "columns": [
+                {"name": name, "type": "text", "role": None}
+                for name in ["student", "school", "score"]
+            ],
             "rows": [["An", "A", "7.5"], ["Binh", "B, north", "8"], ["Chi", None, "6.25"]],
             "truncated": False,
         }

@@ -30,7 +30,7 @@ _PENDING_REVIEW = text("submitted_at IS NULL")
 
 
 class ResearchContext(Base):
-    """One saved version of a project's research brief. Saving again adds a version."""
+    """Archived research context retained for historical runs; no write API is exposed."""
 
     __tablename__ = "research_contexts"
     __table_args__ = (

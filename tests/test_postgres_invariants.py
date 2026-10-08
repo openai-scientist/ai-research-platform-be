@@ -839,8 +839,6 @@ async def test_a_real_table_is_imported_and_a_run_starts_from_it(
     from platform_be.services.connectors import build_connector_factory
     from tests.test_dataset_imports_api import import_dataset, import_version
     from tests.test_postgres_connector import sample_schema
-    from tests.test_research_context_api import save_context
-    from tests.test_runs_api import start_run
 
     harness = postgres_harness
     url = make_url(os.environ["PLATFORM_POSTGRES_TEST_URL"])
@@ -921,12 +919,6 @@ async def test_a_real_table_is_imported_and_a_run_starts_from_it(
         assert nothing.json()["error"]["code"] == "INVALID_DATASET"
         versions = (await client.get(f"{base}/{dataset['id']}/versions")).json()["data"]
         assert [item["version_number"] for item in versions] == [2, 1]
-
-        saved = await save_context(client, session, project["id"], front_matter=None)
-        assert saved.status_code == 201, saved.text
-        run = await start_run(client, session, project["id"], second["id"])
-        assert run.status_code == 201, run.text
-        assert harness.popper.started[0]["dataset"] == again.content
 
 
 @pytest.mark.asyncio

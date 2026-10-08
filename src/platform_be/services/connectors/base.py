@@ -1,9 +1,18 @@
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, Protocol
+from datetime import UTC, datetime
+from typing import Annotated, Any, Literal, Protocol, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import (
+    AfterValidator,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 
 # Fixed text per reason. Driver messages are never forwarded: they can echo credentials,
 # hostnames and server banners.
@@ -21,9 +30,13 @@ REASON_MESSAGES = {
     "scan_limit_exceeded": "The query would scan more data than this server allows",
     "access_revoked": "Google no longer accepts the stored access. Reauthorize the connection",
     "rate_limited": "Google is limiting requests for this account. Try again shortly",
-    "unsupported_source": "This kind of connection reads tables only, not queries",
+    "unsupported_source": "This kind of connection cannot read that kind of source",
     "source_malformed": ("The first row must name every column that holds values, each name once"),
     "source_too_large": "The file is larger than a dataset may be",
+    "too_many_points": (
+        "The span holds more buckets than the server answers at once. "
+        "Choose a larger bucket or a shorter span"
+    ),
 }
 
 # A NUL byte is not valid in a PostgreSQL parameter and would make the driver raise.
@@ -52,13 +65,87 @@ class QuerySource(BaseModel, extra="forbid"):
     ]
 
 
-Source = Annotated[TableSource | QuerySource, Field(discriminator="type")]
+# The buckets a form can choose.
+FormBucket = Literal["1m", "5m", "15m", "1h", "6h", "1d", "1w"]
+# The buckets a connector reads: those, and the finer one a live view of the last minutes has.
+Bucket = Literal["15s", "1m", "5m", "15m", "1h", "6h", "1d", "1w"]
+# `increase` is in the list for every kind; a connector that cannot compute it refuses it.
+Aggregate = Literal["mean", "sum", "min", "max", "count", "increase"]
+
+
+def _in_utc(moment: datetime) -> datetime:
+    try:
+        return moment.astimezone(UTC)
+    except OverflowError:
+        # The first or last day there is, in a zone that puts it past the end in UTC.
+        raise ValueError("the time is out of range") from None
+
+
+# Kept in UTC, so what is stored and audited does not depend on the zone it was sent in.
+Moment = Annotated[AwareDatetime, AfterValidator(_in_utc)]
+
+
+# The values to read, where a measurement has several; each becomes a column.
+FieldNames = Annotated[list[Identifier], Field(max_length=20)]
+# The labels that tell one series from another; each becomes a column.
+TagNames = Annotated[list[Identifier], Field(max_length=10)]
+
+
+def check_series_names(fields: list[str], tags: list[str]) -> None:
+    """Raise ValueError unless the fields and tags can each be a column beside `time`."""
+    names = fields + tags
+    if len(set(names)) != len(names):
+        raise ValueError("fields and tags must not repeat a name")
+    if "time" in names:
+        raise ValueError("time is the column of the timestamps and cannot be asked for")
+
+
+class TimeSeriesSource(BaseModel, extra="forbid"):
+    """The points of one metric or measurement over a span of time, as a connector reads it.
+
+    Nothing here is query text: a connector turns the names into its own language, quoting
+    or checking each one.
+    """
+
+    type: Literal["timeseries"]
+    name: Identifier
+    fields: FieldNames = Field(default_factory=list)
+    tags: TagNames = Field(default_factory=list)
+    start: Moment
+    end: Moment
+    # Without a bucket the points are read as they were written.
+    bucket: Bucket | None = None
+    aggregate: Aggregate | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
+        if self.start >= self.end:
+            raise ValueError("start must be before end")
+        if (self.bucket is None) != (self.aggregate is None):
+            raise ValueError("bucket and aggregate are given together or not at all")
+        check_series_names(self.fields, self.tags)
+        return self
+
+
+class TimeSeriesForm(TimeSeriesSource):
+    """The points of one metric or measurement over a span of time, chosen from a form."""
+
+    bucket: FormBucket | None = None
+
+
+AnySource = TableSource | QuerySource | TimeSeriesSource
+# What a request can ask for.
+Source = Annotated[TableSource | QuerySource | TimeSeriesForm, Field(discriminator="type")]
+
+TIME_SERIES_KINDS = frozenset({"prometheus", "influxdb"})
 
 
 @dataclass(frozen=True)
 class Column:
     name: str
     type: str
+    # What the column is in a time series: "time", "field" or "tag". None anywhere else.
+    role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +176,16 @@ class ConnectorError(Exception):
         super().__init__(self.message)
 
 
+def ensure_source_supported(kind: str, source: AnySource) -> None:
+    """Refuse a source the kind of connection cannot read, before any connector sees it.
+
+    A time series connection reads time series and nothing else, and no other kind reads
+    them. A kind that reads tables but not queries says so itself.
+    """
+    if (kind in TIME_SERIES_KINDS) != isinstance(source, TimeSeriesSource):
+        raise ConnectorError("unsupported_source")
+
+
 class Connector(Protocol):
     """Every method opens its own connection, and raises ConnectorError when anything fails.
 
@@ -109,7 +206,7 @@ class Connector(Protocol):
         """The columns of one table in their order, read from metadata only."""
 
     def open_rows(
-        self, source: TableSource | QuerySource, *, max_rows: int | None
+        self, source: AnySource, *, max_rows: int | None
     ) -> AbstractAsyncContextManager[RowStream]:
         """Read a source without writing to it, stopping after `max_rows` when given.
 

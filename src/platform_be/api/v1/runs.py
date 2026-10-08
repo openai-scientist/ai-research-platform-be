@@ -7,11 +7,10 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from platform_be.api.v1.research_contexts import latest_research_context
 from platform_be.auth.sessions import (
     Principal,
     get_principal,
@@ -23,7 +22,7 @@ from platform_be.core.config import Settings
 from platform_be.core.errors import APIError
 from platform_be.core.responses import ApiResponse, ErrorResponse, ok, paginated
 from platform_be.db.session import get_db
-from platform_be.models.dataset import Dataset, DatasetVersion
+from platform_be.models.dataset import DatasetVersion
 from platform_be.models.research import (
     ACTIVE_RUN_STATUSES,
     FINISHED_RUN_STATUSES,
@@ -38,7 +37,7 @@ from platform_be.services.access import (
     require_project_access,
 )
 from platform_be.services.audit import record_audit
-from platform_be.services.file_store import FileStore, get_file_store, spool
+from platform_be.services.file_store import FileStore, get_file_store
 from platform_be.services.popper_client import (
     PopperClient,
     PopperNotFound,
@@ -48,7 +47,6 @@ from platform_be.services.popper_client import (
     get_popper_client,
 )
 from platform_be.services.project_status import refresh_project_status
-from platform_be.services.research_markdown import render_research_markdown
 from platform_be.services.run_event_stream import RunEventHub, run_events_changed
 from platform_be.services.runs import (
     apply_run_status,
@@ -78,9 +76,9 @@ KEEP_ALIVE_SECONDS = 15
 
 
 class RunCreate(BaseModel):
-    # Modern topic-to-hypothesis fields
-    topic: str | None = Field(
-        default=None,
+    model_config = ConfigDict(extra="forbid")
+
+    topic: str = Field(
         min_length=12,
         max_length=2000,
         description="Core research question or topic",
@@ -93,22 +91,11 @@ class RunCreate(BaseModel):
         default="copilot",
         description="copilot requires review at gates; auto proceeds autonomously",
     )
-    # Legacy fields
-    dataset_version_id: UUID | None = None
-    research_context_version: int | None = Field(
-        default=None,
-        ge=1,
-        le=2_147_483_647,
-        description="Defaults to the newest research context.",
-    )
     budget_usd: Decimal | None = Field(
         default=None,
         max_digits=10,
         decimal_places=2,
         description="Spending cap for this run. Defaults to the server's standard budget.",
-    )
-    auto_review: bool = Field(
-        default=False, description="Let Popper continue without a person reviewing the frame."
     )
 
 
@@ -218,14 +205,6 @@ def _ensure_not_dispatching(run: ResearchRun, settings: Settings) -> None:
         )
 
 
-def _unknown_columns(context: ResearchContext, version: DatasetVersion) -> list[str]:
-    variables = (context.front_matter or {}).get("variables")
-    if not isinstance(variables, dict):
-        return []
-    columns = set(version.column_names)
-    return [name for name in variables if name not in columns]
-
-
 @router.get(
     "",
     response_model=ApiResponse[list[RunItem]],
@@ -268,8 +247,7 @@ async def list_runs(
     status_code=201,
     summary="Start a run",
     description=(
-        "Starts a research run. Accepts topic and domains (Topic-to-Hypothesis flow) "
-        "or legacy dataset version and research context. Answers 202 with a queued run "
+        "Starts a topic-to-hypothesis research run. Answers 202 with a queued run "
         "when Popper did not confirm in time."
     ),
     responses={
@@ -284,7 +262,6 @@ async def create_run(
     response: Response,
     principal: Principal = Depends(require_active_csrf),
     db: AsyncSession = Depends(get_db),
-    store: FileStore = Depends(get_file_store),
     popper: PopperClient | None = Depends(get_popper_client),
 ) -> ApiResponse[RunItem]:
     settings: Settings = request.app.state.settings
@@ -313,138 +290,28 @@ async def create_run(
     if active is not None:
         raise APIError(409, "RUN_ACTIVE", "This project already has a run in progress")
 
-    is_topic_flow = bool(body.topic and body.topic.strip())
+    topic = body.topic.strip()
+    if len(topic) < 12:
+        raise APIError(422, "VALIDATION_ERROR", "Topic must be at least 12 characters")
+    domains = [d.strip() for d in body.domains if d and d.strip()]
+    seen_domains: set[str] = set()
+    cleaned_domains: list[str] = []
+    for d in domains:
+        if d.lower() not in seen_domains:
+            seen_domains.add(d.lower())
+            cleaned_domains.append(d)
+    if not cleaned_domains:
+        raise APIError(422, "VALIDATION_ERROR", "At least one research domain is required")
 
-    if is_topic_flow:
-        topic = body.topic.strip()
-        if len(topic) < 12:
-            raise APIError(422, "VALIDATION_ERROR", "Topic must be at least 12 characters")
-        domains = [d.strip() for d in body.domains if d and d.strip()]
-        seen_domains: set[str] = set()
-        cleaned_domains: list[str] = []
-        for d in domains:
-            if d.lower() not in seen_domains:
-                seen_domains.add(d.lower())
-                cleaned_domains.append(d)
-        if not cleaned_domains:
-            raise APIError(422, "VALIDATION_ERROR", "At least one research domain is required")
-
-        auto_review = body.review_mode == "auto"
-        run = ResearchRun(
-            project_id=project_id,
-            topic=topic,
-            domains=cleaned_domains,
-            review_mode=body.review_mode,
-            created_by_user_id=principal.user.id,
-            status="queued",
-            auto_review=auto_review,
-            budget_usd=budget,
-        )
-        db.add(run)
-        await db.flush()
-        record_audit(
-            db,
-            actor_user_id=principal.user.id,
-            action="run.created",
-            resource_type="run",
-            resource_id=run.id,
-            project_id=project_id,
-            request_id=request_id,
-            details={
-                "topic": topic,
-                "domains": cleaned_domains,
-                "review_mode": body.review_mode,
-                "budget_usd": str(budget),
-            },
-        )
-        await refresh_project_status(db, project)
-        await db.commit()
-
-        failure: APIError | None = None
-        popper_run_id: str | None = None
-        callback_url = (
-            f"{settings.public_base_url.rstrip('/')}{settings.api_prefix.rstrip('/')}"
-            f"/internal/popper/runs/{run.id}"
-        )
-        try:
-            popper_run_id = await popper.start_run(
-                platform_run_id=run.id,
-                topic=topic,
-                domains=cleaned_domains,
-                review_mode=body.review_mode,
-                budget_usd=budget,
-                callback_url=callback_url,
-            )
-        except PopperUncertain:
-            response.status_code = 202
-            return ok(await _item(db, run), "Popper has not confirmed the run yet")
-        except PopperUnavailable:
-            failure = APIError(502, "POPPER_UNAVAILABLE", "Popper could not be reached")
-        except PopperRejected as exc:
-            failure = APIError(422, "POPPER_REJECTED", str(exc))
-        except Exception:
-            logger.exception("could not send run %s to Popper", run.id)
-            failure = APIError(500, "RUN_START_FAILED", "The run could not be sent to Popper")
-
-        await lock_project_scope(db, project_id)
-        run = await get_run(db, project_id, run.id, lock=True)
-        if failure is not None:
-            await apply_run_status(
-                db, run, "failed", message=failure.message, request_id=request_id
-            )
-            await db.commit()
-            raise failure
-        run.popper_run_id = popper_run_id
-        if run.status == "queued":
-            await apply_run_status(
-                db, run, "running", actor_user_id=principal.user.id, request_id=request_id
-            )
-        return ok(await _item(db, run), "Run started")
-
-    # Legacy dataset & research context flow
-    if body.dataset_version_id is None:
-        raise APIError(
-            422, "VALIDATION_ERROR", "Either topic or dataset_version_id must be provided"
-        )
-    version = await db.scalar(
-        select(DatasetVersion)
-        .join(Dataset, Dataset.id == DatasetVersion.dataset_id)
-        .where(DatasetVersion.id == body.dataset_version_id, Dataset.project_id == project_id)
-    )
-    if version is None:
-        raise APIError(404, "NOT_FOUND", "Dataset version was not found")
-    if body.research_context_version is None:
-        context = await latest_research_context(db, project_id)
-        if context is None:
-            raise APIError(
-                422, "RESEARCH_CONTEXT_REQUIRED", "Save a research context before starting a run"
-            )
-    else:
-        context = await db.scalar(
-            select(ResearchContext).where(
-                ResearchContext.project_id == project_id,
-                ResearchContext.version_number == body.research_context_version,
-            )
-        )
-        if context is None:
-            raise APIError(404, "NOT_FOUND", "Research context version was not found")
-
-    unknown = _unknown_columns(context, version)
-    if unknown:
-        raise APIError(
-            422,
-            "UNKNOWN_COLUMNS",
-            "The research context names variables the dataset does not have: "
-            + ", ".join(unknown[:20]),
-        )
-
+    auto_review = body.review_mode == "auto"
     run = ResearchRun(
         project_id=project_id,
-        dataset_version_id=version.id,
-        research_context_id=context.id,
+        topic=topic,
+        domains=cleaned_domains,
+        review_mode=body.review_mode,
         created_by_user_id=principal.user.id,
         status="queued",
-        auto_review=body.auto_review,
+        auto_review=auto_review,
         budget_usd=budget,
     )
     db.add(run)
@@ -458,55 +325,48 @@ async def create_run(
         project_id=project_id,
         request_id=request_id,
         details={
-            "dataset_version_id": str(version.id),
-            "research_context_version": context.version_number,
+            "topic": topic,
+            "domains": cleaned_domains,
+            "review_mode": body.review_mode,
             "budget_usd": str(budget),
-            "auto_review": body.auto_review,
         },
     )
     await refresh_project_status(db, project)
     await db.commit()
 
-    legacy_failure: APIError | None = None
-    legacy_popper_run_id: str | None = None
-    dataset_file = None
+    failure: APIError | None = None
+    popper_run_id: str | None = None
+    callback_url = (
+        f"{settings.public_base_url.rstrip('/')}{settings.api_prefix.rstrip('/')}"
+        f"/internal/popper/runs/{run.id}"
+    )
     try:
-        dataset_file = await spool(store, version.storage_key)
-        legacy_popper_run_id = await popper.start_run(
+        popper_run_id = await popper.start_run(
             platform_run_id=run.id,
-            research_markdown=render_research_markdown(context.body, context.front_matter),
-            dataset=dataset_file,
-            dataset_filename=version.original_filename,
+            topic=topic,
+            domains=cleaned_domains,
+            review_mode=body.review_mode,
             budget_usd=budget,
-            auto_review=body.auto_review,
-            callback_url=(
-                f"{settings.public_base_url.rstrip('/')}{settings.api_prefix.rstrip('/')}"
-                f"/internal/popper/runs/{run.id}"
-            ),
+            callback_url=callback_url,
         )
     except PopperUncertain:
         response.status_code = 202
         return ok(await _item(db, run), "Popper has not confirmed the run yet")
     except PopperUnavailable:
-        legacy_failure = APIError(502, "POPPER_UNAVAILABLE", "Popper could not be reached")
+        failure = APIError(502, "POPPER_UNAVAILABLE", "Popper could not be reached")
     except PopperRejected as exc:
-        legacy_failure = APIError(422, "POPPER_REJECTED", str(exc))
+        failure = APIError(422, "POPPER_REJECTED", str(exc))
     except Exception:
         logger.exception("could not send run %s to Popper", run.id)
-        legacy_failure = APIError(500, "RUN_START_FAILED", "The run could not be sent to Popper")
-    finally:
-        if dataset_file is not None:
-            dataset_file.close()
+        failure = APIError(500, "RUN_START_FAILED", "The run could not be sent to Popper")
 
     await lock_project_scope(db, project_id)
     run = await get_run(db, project_id, run.id, lock=True)
-    if legacy_failure is not None:
-        await apply_run_status(
-            db, run, "failed", message=legacy_failure.message, request_id=request_id
-        )
+    if failure is not None:
+        await apply_run_status(db, run, "failed", message=failure.message, request_id=request_id)
         await db.commit()
-        raise legacy_failure
-    run.popper_run_id = legacy_popper_run_id
+        raise failure
+    run.popper_run_id = popper_run_id
     if run.status == "queued":
         await apply_run_status(
             db, run, "running", actor_user_id=principal.user.id, request_id=request_id

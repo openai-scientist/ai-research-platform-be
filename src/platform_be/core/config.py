@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     # own: this API's /connections/google/callback. Off unless it, the client, app_url and
     # connection_secret_key are all set.
     google_oauth_connections_redirect_uri: str | None = None
+    # Public browser key and Cloud project number for the Google Drive file picker.
+    google_picker_api_key: SecretStr | None = None
+    google_picker_app_id: str | None = Field(default=None, pattern=r"^\d+$")
     # How long an admin waits before sending a user's sign-in details again.
     invite_resend_cooldown_seconds: int = Field(default=60, ge=0, le=3600)
     # How long a project invitation can be accepted after it was last sent.
@@ -138,6 +141,8 @@ class Settings(BaseSettings):
         "google_oauth_client_secret",
         "google_oauth_redirect_uri",
         "google_oauth_connections_redirect_uri",
+        "google_picker_api_key",
+        "google_picker_app_id",
         "default_admin_email",
         "default_admin_password",
         "connection_secret_key",

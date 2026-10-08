@@ -8,8 +8,15 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Query, Request
-from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
+from fastapi import APIRouter, Depends, Query, Request, Response
+from pydantic import (
+    BaseModel,
+    Field,
+    StringConstraints,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,7 +39,19 @@ from platform_be.services.connectors import (
     ConnectorFactory,
     get_connector_factory,
 )
-from platform_be.services.connectors.base import Identifier, QuerySource, Source, TableSource
+from platform_be.services.connectors.base import (
+    Aggregate,
+    AnySource,
+    Column,
+    FieldNames,
+    Identifier,
+    QuerySource,
+    Source,
+    TagNames,
+    TimeSeriesSource,
+    check_series_names,
+    ensure_source_supported,
+)
 from platform_be.services.connectors.bigquery import (
     LOCATION_PATTERN,
     PROJECT_ID_PATTERN,
@@ -45,8 +64,12 @@ from platform_be.services.connectors.google_sheets import (
     GoogleSheetsConnector,
     parse_spreadsheet_id,
 )
+from platform_be.services.connectors.http_source import parse_server_url
 from platform_be.services.connectors.network_guard import is_host
+from platform_be.services.connectors.timeseries import LiveWindow, live_source
 from platform_be.services.connectors.values import approximate_size, to_text
+from platform_be.services.google_drive_oauth import GoogleAccessRevoked
+from platform_be.services.google_oauth import GoogleOAuthError
 from platform_be.services.secret_box import SecretBox, SecretBoxError, get_secret_box
 
 router = APIRouter(prefix="/projects/{project_id}/connections", tags=["data connections"])
@@ -78,6 +101,8 @@ MAX_TABLES = 500
 PREVIEW_CELL_CHARS = 500
 # A preview of very wide rows stops early, however few rows that leaves.
 PREVIEW_SIZE = 2 * 1024 * 1024
+# A live view is at most 96 points a series: this many rows is some twenty series.
+LIVE_MAX_ROWS = 2000
 
 # A NUL byte is not valid in a PostgreSQL parameter and would make the driver raise.
 ConfigText = Annotated[str, StringConstraints(min_length=1, max_length=253, pattern=r"^[^\x00]+$")]
@@ -249,12 +274,126 @@ class CreateGoogleDriveConnection(BaseModel, extra="forbid"):
     )
 
 
+class _HttpServerConfig(BaseModel, extra="forbid"):
+    """A server spoken to over HTTP, by the address of its API."""
+
+    url: Annotated[str, StringConstraints(min_length=1, max_length=2048)] = Field(
+        description=(
+            "`http(s)://host[:port][/base-path]`: the address in front of the path of the "
+            "API (`/api/v1` for Prometheus, `/query` for InfluxDB). Without a user name, a "
+            "password, a query or a fragment."
+        )
+    )
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        # Refused here, before anything is audited: an address can carry a password.
+        return parse_server_url(value).url
+
+    # Saved with the address, never taken from the request: what is resolved, checked and
+    # audited is the host the address itself names.
+    @computed_field
+    @property
+    def host(self) -> str:
+        return parse_server_url(self.url).host
+
+    @computed_field
+    @property
+    def port(self) -> int:
+        return parse_server_url(self.url).port
+
+
+class PrometheusConfig(_HttpServerConfig):
+    pass
+
+
+# Printable ASCII without a space: nothing else can be sent in a header.
+HeaderToken = Annotated[str, StringConstraints(max_length=4096, pattern=r"^[\x21-\x7e]*$")]
+InfluxUsername = Annotated[
+    str, StringConstraints(max_length=255, pattern=r"^[\x20-\x39\x3b-\x7e]*$")
+]
+InfluxPassword = Annotated[str, StringConstraints(max_length=4096, pattern=r"^[\x20-\x7e]*$")]
+
+
+class PrometheusSecret(BaseModel, extra="forbid"):
+    # A user name is printable ASCII too, and has no colon, which is what ends it in Basic
+    # authentication.
+    username: Annotated[
+        str, StringConstraints(max_length=255, pattern=r"^[\x20-\x39\x3b-\x7e]*$")
+    ] = Field(default="", description="With a user name, `token` is sent as its password.")
+    token: HeaderToken = Field(
+        default="", description="Alone, it is sent as a Bearer token. Empty for no credentials."
+    )
+
+
+class CreatePrometheusConnection(BaseModel, extra="forbid"):
+    """Prometheus, or a server with the same HTTP API (VictoriaMetrics, Thanos, Mimir).
+
+    `default` is the only schema, each metric is a table and each of its labels a column. It
+    reads `timeseries` sources only, always with a `bucket`. The saved `config` holds `url`,
+    `host` and `port`.
+    """
+
+    name: ConnectionName
+    kind: Literal["prometheus"]
+    config: PrometheusConfig
+    secret: PrometheusSecret = Field(default_factory=PrometheusSecret)
+
+
+class InfluxConfig(_HttpServerConfig):
+    database: Annotated[
+        str, StringConstraints(min_length=1, max_length=255, pattern=r"^[^\x00-\x1f\x7f]+$")
+    ] = Field(description="The database (1.x), or the name of the bucket (2.x and 3).")
+
+
+class InfluxSecret(BaseModel, extra="forbid"):
+    token: HeaderToken = Field(
+        default="",
+        description="For InfluxDB 2.x and 3, sent as `Authorization: Token …`.",
+    )
+    username: InfluxUsername = Field(
+        default="", description="For an authenticated InfluxDB 1.8 server; give with `password`."
+    )
+    password: InfluxPassword = Field(
+        default="", description="For an authenticated InfluxDB 1.8 server; give with `username`."
+    )
+
+    @model_validator(mode="after")
+    def _one_auth_method(self) -> "InfluxSecret":
+        has_username = bool(self.username)
+        has_password = bool(self.password)
+        if has_username != has_password:
+            raise ValueError("username and password must be given together")
+        if self.token and has_username:
+            raise ValueError("choose a token or username and password")
+        return self
+
+
+class CreateInfluxConnection(BaseModel, extra="forbid"):
+    """InfluxDB 1.8, 2.x or 3 Core, read with InfluxQL.
+
+    `default` is the only schema, each measurement of the database is a table, and each of
+    its fields and tags a column. It reads `timeseries` sources only, always with at least
+    one of `fields`. Use `secret.username` and `secret.password` together for authenticated
+    InfluxDB 1.8, or `secret.token` for InfluxDB 2.x and 3. The saved `config` holds `url`,
+    `database`, `host` and `port`.
+    """
+
+    name: ConnectionName
+    kind: Literal["influxdb"]
+    config: InfluxConfig
+    secret: InfluxSecret = Field(default_factory=InfluxSecret)
+
+
 CreateConnection = Annotated[
     CreatePostgresConnection
     | CreateMysqlConnection
     | CreateBigQueryConnection
     | CreateGoogleSheetsConnection
-    | CreateGoogleDriveConnection,
+    | CreateGoogleDriveConnection
+    | CreatePrometheusConnection
+    | CreateInfluxConnection,
     Field(discriminator="kind"),
 ]
 
@@ -307,6 +446,14 @@ class TableItem(BaseModel):
 class ColumnItem(BaseModel):
     name: str
     type: str = Field(description="The type as the database names it.")
+    role: Literal["time", "field", "tag"] | None = Field(
+        default=None,
+        description="What the column is in a time series. Null for every other connection.",
+    )
+
+    @classmethod
+    def of(cls, column: Column) -> "ColumnItem":
+        return cls(name=column.name, type=column.type, role=column.role)
 
 
 class PreviewRequest(BaseModel, extra="forbid"):
@@ -319,6 +466,44 @@ class PreviewData(BaseModel):
         description=f"Values as text; one longer than {PREVIEW_CELL_CHARS} characters is cut."
     )
     truncated: bool = Field(description="The source has more rows than were returned.")
+
+
+class LiveRequest(BaseModel, extra="forbid"):
+    name: Identifier = Field(description="The metric or the measurement.")
+    fields: FieldNames = Field(
+        default_factory=list, description="As in a `timeseries` source: empty for Prometheus."
+    )
+    tags: TagNames = Field(default_factory=list)
+    aggregate: Aggregate
+    last: LiveWindow = Field(
+        description=(
+            "How far back to look. The bucket follows from it: `15s` for `15m`, `1m` for "
+            "`1h`, `5m` for `6h` and `15m` for `24h`."
+        )
+    )
+
+    @model_validator(mode="after")
+    def _distinct_names(self) -> "LiveRequest":
+        check_series_names(self.fields, self.tags)
+        return self
+
+
+class LiveData(BaseModel):
+    columns: list[ColumnItem]
+    rows: list[list[str | None]] = Field(
+        description="Values as text, ordered by `time` and then by the tags."
+    )
+    start: datetime = Field(description="The start of the first bucket, in UTC.")
+    end: datetime = Field(
+        description="The end of the last bucket: the last one that had ended when asked."
+    )
+    bucket: str
+    truncated: bool = Field(
+        description=(
+            f"There were more than {LIVE_MAX_ROWS} rows and the latest are missing. "
+            "Ask for fewer tags."
+        )
+    )
 
 
 def _require_box(box: SecretBox | None) -> SecretBox:
@@ -437,13 +622,49 @@ def _read_failed(error: ConnectorError) -> APIError:
         "unsupported_source",
         "source_malformed",
         "source_too_large",
+        "too_many_points",
     )
     code = "SOURCE_INVALID" if about_source else "CONNECTION_FAILED"
     return APIError(422, code, error.message, reason=error.reason)
 
 
-def source_audit_details(source: TableSource | QuerySource) -> dict[str, Any]:
+def require_supported_source(kind: str, source: AnySource) -> None:
+    """Refuse a source this kind of connection cannot read: 422, and nothing is audited."""
+    try:
+        ensure_source_supported(kind, source)
+    except ConnectorError as exc:
+        raise _read_failed(exc) from None
+    if kind == "prometheus" and isinstance(source, TimeSeriesSource) and source.fields:
+        # A mistake in the form, not something about the server.
+        raise APIError(
+            422,
+            "VALIDATION_ERROR",
+            "A Prometheus metric has one value, in the column `value`: leave `fields` empty",
+        )
+    if kind == "influxdb" and isinstance(source, TimeSeriesSource) and not source.fields:
+        raise APIError(
+            422,
+            "VALIDATION_ERROR",
+            "An InfluxDB measurement is read by its fields: name at least one in `fields`",
+        )
+
+
+def _utc_text(moment: datetime) -> str:
+    return moment.isoformat().replace("+00:00", "Z")
+
+
+def source_audit_details(source: AnySource) -> dict[str, Any]:
     """What an audit event records about a source that was read."""
+    if isinstance(source, TimeSeriesSource):
+        # The name of a metric is not sensitive the way the text of a query can be.
+        return {
+            "source_type": "timeseries",
+            "name": source.name,
+            "start": _utc_text(source.start),
+            "end": _utc_text(source.end),
+            "bucket": source.bucket,
+            "aggregate": source.aggregate,
+        }
     if isinstance(source, QuerySource):
         # Not the text: SQL can carry sensitive constants.
         return {
@@ -577,6 +798,81 @@ async def _use_grant(
         raise _grant_invalid()
 
 
+class GooglePickerRequest(BaseModel, extra="forbid"):
+    grant_id: UUID
+
+
+class GooglePickerCredentials(BaseModel):
+    access_token: str = Field(repr=False)
+    api_key: str = Field(repr=False)
+    app_id: str
+
+
+@router.post(
+    "/google/picker",
+    response_model=ApiResponse[GooglePickerCredentials],
+    summary="Open Google Picker using the account that authorized this grant",
+    description=(
+        "Returns a short-lived access token for the browser's Google Picker. Requires CSRF, "
+        "contributor access and an unused grant owned by this user and project. Does not spend "
+        "the grant: use it to create the connection after choosing a spreadsheet or folder. "
+        "Never persist or log this response. Refresh tokens and client secrets are not returned."
+    ),
+    responses={
+        **PROBE_ERRORS,
+        422: {"model": ErrorResponse, "description": "Invalid or revoked Google grant"},
+        502: {"model": ErrorResponse, "description": "Google could not issue an access token"},
+    },
+)
+async def google_picker_credentials(
+    project_id: UUID,
+    body: GooglePickerRequest,
+    request: Request,
+    response: Response,
+    principal: Principal = Depends(require_active_csrf),
+    db: AsyncSession = Depends(get_db),
+    box: SecretBox | None = Depends(get_secret_box),
+    gate: ConnectionGate = Depends(get_connection_gate),
+) -> ApiResponse[GooglePickerCredentials]:
+    response.headers["Cache-Control"] = "no-store"
+    project, _ = await require_project_access(db, principal, project_id, contribute=True)
+    ensure_writable_project(project)
+    box = _require_box(box)
+    settings = request.app.state.settings
+    if not (settings.google_picker_api_key and settings.google_picker_app_id):
+        raise APIError(
+            503,
+            "GOOGLE_PICKER_NOT_CONFIGURED",
+            "Google Drive file selection is not configured here.",
+        )
+    gate.check_rate(principal.user.id)
+    access = await _google_access(request, db, box, principal, project_id, body.grant_id)
+    await db.commit()
+    try:
+        async with gate.slot(project_id, principal.user.id):
+            token = await request.app.state.google_drive_oauth.access_token(
+                access.secret["refresh_token"]
+            )
+    except GoogleAccessRevoked:
+        raise _grant_invalid() from None
+    except GoogleOAuthError:
+        raise APIError(
+            502, "GOOGLE_PICKER_UNAVAILABLE", "Google Drive could not be reached. Please try again."
+        ) from None
+    # Access or grant ownership may have changed while Google was being contacted.
+    project, _ = await require_project_access(db, principal, project_id, contribute=True)
+    ensure_writable_project(project)
+    await _google_access(request, db, box, principal, project_id, body.grant_id)
+    await db.commit()
+    return ok(
+        GooglePickerCredentials(
+            access_token=token,
+            api_key=settings.google_picker_api_key.get_secret_value(),
+            app_id=settings.google_picker_app_id,
+        )
+    )
+
+
 def _audit_failed_test(
     db: AsyncSession,
     request: Request,
@@ -637,7 +933,10 @@ async def list_connections(
     "",
     response_model=ApiResponse[ConnectionItem],
     status_code=201,
-    summary="Connect the project to an external database, a Google spreadsheet or a Drive folder",
+    summary=(
+        "Connect the project to an external database, a Google spreadsheet, a Drive folder, "
+        "a Prometheus server or an InfluxDB server"
+    ),
     description=(
         "Connects once to check the details; nothing is saved when that fails (422 "
         "`CONNECTION_FAILED`, with `error.reason`). Project Manager or Researcher only. "
@@ -648,7 +947,13 @@ async def list_connections(
         "contribute then reads that one spreadsheet, or the files directly in that one "
         "folder, as the Google account that gave access. A grant that is not this user's, "
         "not for this project, expired or already used answers 422 `GOOGLE_GRANT_INVALID`; "
-        "one whose connection failed can be tried again with another address."
+        "one whose connection failed can be tried again with another address. For "
+        "`prometheus` and `influxdb`, `secret` may be left out when the server asks for no "
+        "credentials; an address inside a private network is refused (reason "
+        "`host_not_allowed`). An `influxdb` server that does not list the `database` "
+        "answers with reason `permission_denied`. For authenticated InfluxDB 1.8, give "
+        "`secret.username` and `secret.password`; for InfluxDB 2.x and 3, give "
+        "`secret.token`."
     ),
     responses={
         **PROBE_ERRORS,
@@ -687,7 +992,7 @@ async def create_connection(
         secret = access.secret
     else:
         config = body.config.model_dump()
-        secret = body.secret.model_dump()
+        secret = body.secret.model_dump(exclude_defaults=isinstance(body.secret, InfluxSecret))
     connection_id = uuid4()
     request_id = getattr(request.state, "request_id", None)
     # Hand the session back before talking to a server the user chose: it may never answer.
@@ -1101,17 +1406,18 @@ async def list_columns(
         request, db, gate, factory, project_id, principal.user.id, saved
     ) as connector:
         columns = await connector.list_columns(schema, table)
-    return ok([ColumnItem(name=column.name, type=column.type) for column in columns])
+    return ok([ColumnItem.of(column) for column in columns])
 
 
 @router.post(
     "/{connection_id}/preview",
     response_model=ApiResponse[PreviewData],
-    summary="Preview the rows of a table or of a SELECT statement",
+    summary="Preview the rows of a table, a SELECT statement or a time series",
     description=(
-        "Runs live inside a read-only transaction and returns the first rows; nothing is "
-        "stored. One statement per call. When the database rejects a query, its own message "
-        "is returned (422 `SOURCE_INVALID`, reason `query_failed`). Every preview is audited, "
+        "Reads live and returns the first rows; nothing is stored. SQL sources run inside a "
+        "read-only transaction; a time series source is a form, not query text. One source "
+        "per call. When the database rejects a query, its own message is returned (422 "
+        "`SOURCE_INVALID`, reason `query_failed`). Every preview is audited, "
         "with a hash of the SQL rather than its text. On BigQuery a table is read without a "
         "query, at no cost; a query is checked first, and one that would scan more than the "
         "server allows is refused (reason `scan_limit_exceeded`)."
@@ -1131,6 +1437,7 @@ async def preview_source(
 ) -> ApiResponse[PreviewData]:
     saved = await saved_connection(db, principal, project_id, connection_id, box, gate)
     source = body.source
+    require_supported_source(saved.kind, source)
     # Committed before the query runs, so one that fails or never returns is on record too.
     record_audit(
         db,
@@ -1158,5 +1465,84 @@ async def preview_source(
                 break
             rows.append([_preview_cell(value) for value in row])
             size += approximate_size(row)
-        columns = [ColumnItem(name=column.name, type=column.type) for column in stream.columns]
+        columns = [ColumnItem.of(column) for column in stream.columns]
     return ok(PreviewData(columns=columns, rows=rows, truncated=truncated))
+
+
+@router.post(
+    "/{connection_id}/live",
+    response_model=ApiResponse[LiveData],
+    summary="Read the latest points of a metric or measurement, for a chart that follows it",
+    description=(
+        "For `prometheus` and `influxdb` connections; any other kind answers 422 "
+        "`SOURCE_INVALID` with reason `unsupported_source`. Returns one value per bucket for "
+        "the span that ends now, read live; nothing is stored. Call it again to follow the "
+        "metric: every call counts against the same budget as the other reads and holds a "
+        "slot while it runs, so wait for one answer before asking for the next, and stop "
+        "while the page is hidden or an import is running. The bucket still being filled is "
+        "left out. Viewing is audited once in 10 minutes for each user, connection and "
+        "metric, not on every call."
+    ),
+    responses=READ_ERRORS,
+)
+async def live_source_points(
+    project_id: UUID,
+    connection_id: UUID,
+    body: LiveRequest,
+    request: Request,
+    principal: Principal = Depends(require_active_csrf),
+    db: AsyncSession = Depends(get_db),
+    box: SecretBox | None = Depends(get_secret_box),
+    gate: ConnectionGate = Depends(get_connection_gate),
+    factory: ConnectorFactory = Depends(get_connector_factory),
+) -> ApiResponse[LiveData]:
+    saved = await saved_connection(db, principal, project_id, connection_id, box, gate)
+    source = live_source(
+        body.name, body.fields, body.tags, body.aggregate, body.last, now=datetime.now(UTC)
+    )
+    require_supported_source(saved.kind, source)
+
+    viewer = (principal.user.id, connection_id, body.name)
+    rows: list[list[str | None]] = []
+    truncated = False
+    async with reading(
+        request, db, gate, factory, project_id, principal.user.id, saved
+    ) as connector:
+        # Once a slot is held and the connector is built, so a call that got no further
+        # than that leaves nothing behind, and before the points are asked for, so a read
+        # the server fails or never answers is on record too.
+        if gate.first_view_in_window(*viewer):
+            record_audit(
+                db,
+                actor_user_id=principal.user.id,
+                action="connection.live_viewed",
+                resource_type="data_connection",
+                resource_id=connection_id,
+                project_id=project_id,
+                request_id=getattr(request.state, "request_id", None),
+                details={"name": body.name, "last": body.last, "aggregate": body.aggregate},
+            )
+            try:
+                await db.commit()
+            except BaseException:
+                # Not on record after all: the next call is the one to record.
+                gate.forget_view(*viewer)
+                raise
+        # One row more than is returned tells whether there were more.
+        async with connector.open_rows(source, max_rows=LIVE_MAX_ROWS + 1) as stream:
+            async for row in stream.rows:
+                if len(rows) == LIVE_MAX_ROWS:
+                    truncated = True
+                    break
+                rows.append([to_text(value) for value in row])
+            columns = [ColumnItem.of(column) for column in stream.columns]
+    return ok(
+        LiveData(
+            columns=columns,
+            rows=rows,
+            start=source.start,
+            end=source.end,
+            bucket=source.bucket,
+            truncated=truncated,
+        )
+    )
