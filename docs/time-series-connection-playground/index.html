@@ -1,0 +1,1371 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Trang thử kết nối Prometheus và InfluxDB với API của AI Research Platform."
+    />
+    <title>Time-series Connection Lab</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&family=Bricolage+Grotesque:opsz,wght@12..96,500..800&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        color-scheme: light;
+        --canvas: oklch(96% 0.012 250);
+        --paper: oklch(99.5% 0.004 250);
+        --ink: oklch(22% 0.028 250);
+        --muted: oklch(46% 0.025 250);
+        --line: oklch(22% 0.028 250);
+        --soft-line: oklch(82% 0.018 250);
+        --green: oklch(79% 0.18 142);
+        --green-ink: oklch(24% 0.07 145);
+        --amber: oklch(78% 0.15 78);
+        --red: oklch(53% 0.2 27);
+        --white: oklch(100% 0 0);
+        --shadow: 4px 4px 0 var(--ink);
+        --display: "Bricolage Grotesque", "Be Vietnam Pro", sans-serif;
+        --body: "Be Vietnam Pro", sans-serif;
+        --space-1: 0.5rem;
+        --space-2: 0.75rem;
+        --space-3: 1rem;
+        --space-4: 1.5rem;
+        --space-5: 2rem;
+        --space-6: 3rem;
+        --radius: 0;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        min-width: 320px;
+        margin: 0;
+        color: var(--ink);
+        background: var(--canvas);
+        font-family: var(--body);
+        font-size: 1rem;
+        line-height: 1.5;
+      }
+
+      button, input, select { font: inherit; }
+      button, select { cursor: pointer; }
+      button:disabled, select:disabled { cursor: not-allowed; }
+
+      :focus-visible {
+        outline: 2px solid oklch(58% 0.18 245);
+        outline-offset: 4px;
+      }
+
+      .shell {
+        width: min(1440px, 100% - 3rem);
+        margin-inline: auto;
+      }
+
+      .topbar {
+        min-height: 56px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-3);
+        border-bottom: 2px solid var(--line);
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        font-weight: 700;
+      }
+
+      .brand-mark {
+        display: grid;
+        width: 32px;
+        height: 32px;
+        place-items: center;
+        border: 2px solid var(--line);
+        background: var(--green);
+        font-family: var(--display);
+        font-size: 1.25rem;
+        font-weight: 700;
+      }
+
+      .topbar-note {
+        color: var(--muted);
+        font-size: 0.875rem;
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(208px, 0.42fr);
+        align-items: end;
+        gap: var(--space-5);
+        padding-block: var(--space-6) var(--space-5);
+      }
+
+      h1, h2, h3, p { margin-top: 0; }
+
+      h1 {
+        max-width: 15ch;
+        margin-bottom: var(--space-2);
+        font-family: var(--display);
+        font-size: clamp(3rem, 5vw, 4.5rem);
+        font-weight: 700;
+        line-height: 0.96;
+        letter-spacing: -0.02em;
+        text-wrap: balance;
+      }
+
+      .hero-copy {
+        max-width: 64ch;
+        margin-bottom: 0;
+        color: var(--muted);
+      }
+
+      .signal {
+        width: 100%;
+        max-width: 328px;
+        justify-self: end;
+        align-self: center;
+      }
+
+      .signal svg { display: block; width: 100%; height: auto; }
+      .signal .grid-line { stroke: var(--soft-line); stroke-width: 1; }
+      .signal .trace { stroke: var(--ink); stroke-width: 3; fill: none; }
+      .signal .pulse { fill: var(--green); stroke: var(--ink); stroke-width: 2; }
+
+      .notice {
+        display: flex;
+        align-items: flex-start;
+        gap: var(--space-2);
+        margin-bottom: var(--space-4);
+        padding: var(--space-2) var(--space-3);
+        border: 2px solid var(--line);
+        background: var(--amber);
+        color: var(--ink);
+      }
+
+      .notice strong { white-space: nowrap; }
+
+      .security-warning {
+        display: grid;
+        gap: var(--space-2);
+        margin-top: var(--space-2);
+        padding: var(--space-2) var(--space-3);
+        border: 2px solid var(--line);
+        background: var(--amber);
+      }
+
+      .security-warning p { margin: 0; }
+      .security-check { display: flex; align-items: flex-start; gap: var(--space-2); min-height: 44px; font-weight: 600; }
+      .security-check input { width: 20px; min-height: 20px; height: 20px; flex: 0 0 20px; margin-top: 4px; accent-color: var(--green-ink); }
+
+      .workspace {
+        display: grid;
+        grid-template-columns: minmax(340px, 0.82fr) minmax(0, 1.18fr);
+        align-items: start;
+        gap: var(--space-4);
+        padding-bottom: var(--space-6);
+      }
+
+      .panel {
+        min-width: 0;
+        border: 2px solid var(--line);
+        background: var(--paper);
+        box-shadow: var(--shadow);
+      }
+
+      .panel-head {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: var(--space-3);
+        padding: var(--space-4);
+        border-bottom: 2px solid var(--line);
+      }
+
+      .panel-head h2 {
+        margin-bottom: 0;
+        font-family: var(--display);
+        font-size: 2rem;
+        line-height: 1;
+      }
+
+      .panel-body { padding: var(--space-4); }
+
+      .stepper {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        padding: var(--space-3) var(--space-4);
+        border-bottom: 2px solid var(--line);
+        background: oklch(94% 0.012 250);
+      }
+
+      .step {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: var(--space-1);
+        min-width: 0;
+        color: var(--muted);
+        font-size: 0.875rem;
+        font-weight: 600;
+      }
+
+      .step:not(:last-child)::after {
+        height: 2px;
+        flex: 1;
+        margin-inline: var(--space-1);
+        background: var(--soft-line);
+        content: "";
+      }
+
+      .step-number {
+        display: grid;
+        width: 28px;
+        height: 28px;
+        flex: 0 0 28px;
+        place-items: center;
+        border: 2px solid currentColor;
+        font-size: 0.75rem;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .step[data-state="active"] { color: var(--ink); }
+      .step[data-state="active"] .step-number,
+      .step[data-state="done"] .step-number {
+        border-color: var(--ink);
+        background: var(--green);
+        color: var(--ink);
+      }
+
+      .field { display: grid; gap: var(--space-1); margin-bottom: var(--space-3); }
+      .spaced-field { margin-top: var(--space-3); }
+      .field label, legend { font-weight: 700; }
+      .hint { margin: 0; color: var(--muted); font-size: 0.875rem; }
+
+      input, select {
+        width: 100%;
+        min-height: 44px;
+        padding: 0.75rem;
+        border: 2px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--white);
+        color: var(--ink);
+      }
+
+      input::placeholder { color: oklch(43% 0.02 250); opacity: 1; }
+      input:disabled, select:disabled { background: oklch(92% 0.01 250); color: var(--muted); }
+
+      .connection-kind {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: var(--space-1);
+        margin-bottom: var(--space-4);
+        padding: 4px;
+        border: 2px solid var(--line);
+        background: var(--canvas);
+      }
+
+      .kind-option { position: relative; }
+      .kind-option input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+      .kind-option span {
+        display: grid;
+        min-height: 44px;
+        place-items: center;
+        padding-inline: var(--space-1);
+        border: 2px solid transparent;
+        font-weight: 700;
+        text-align: center;
+      }
+
+      .kind-option input:checked + span {
+        border-color: var(--line);
+        background: var(--green);
+        color: var(--ink);
+      }
+
+      .kind-option input:focus-visible + span {
+        outline: 2px solid oklch(58% 0.18 245);
+        outline-offset: 4px;
+      }
+
+      .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2); }
+      .auth-fields { padding-top: var(--space-1); }
+      .hidden { display: none !important; }
+      .visually-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
+      .button-row { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; }
+      .spaced-button-row { margin-top: var(--space-3); }
+
+      .button {
+        min-height: 48px;
+        padding: 0.75rem 1rem;
+        border: 2px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--paper);
+        color: var(--ink);
+        font-weight: 700;
+        transition: background-color 160ms ease, color 160ms ease, transform 160ms ease;
+      }
+
+      .button:hover:not(:disabled) { background: oklch(93% 0.02 250); }
+      .button:active:not(:disabled) { transform: translate(2px, 2px); }
+      .button:disabled { opacity: 0.58; }
+      .button-primary { background: var(--green); }
+      .button-primary:hover:not(:disabled) { background: oklch(74% 0.17 142); }
+      .button-danger { background: var(--paper); color: var(--red); }
+
+      .status {
+        min-height: 24px;
+        margin: var(--space-2) 0 0;
+        color: var(--muted);
+        font-size: 0.9375rem;
+      }
+
+      .status[data-tone="success"] { color: var(--green-ink); font-weight: 700; }
+      .status[data-tone="error"] { color: var(--red); font-weight: 700; }
+
+      .browse-tools { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-2); }
+      .browse-tools .field { margin: 0; }
+
+      fieldset {
+        min-width: 0;
+        margin: var(--space-3) 0 0;
+        padding: var(--space-2);
+        border: 2px solid var(--soft-line);
+      }
+
+      legend { padding-inline: 0.5rem; }
+
+      .check-list {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: var(--space-1) var(--space-2);
+        max-height: 176px;
+        overflow: auto;
+      }
+
+      .check-item {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        min-width: 0;
+        min-height: 36px;
+        font-weight: 500;
+        overflow-wrap: anywhere;
+      }
+
+      .check-item input { width: 20px; min-height: 20px; height: 20px; flex: 0 0 20px; accent-color: var(--green-ink); }
+      .check-item code { font-family: var(--body); font-size: 0.9375rem; }
+
+      .preview-options { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2); margin-top: var(--space-3); }
+
+      .toggle-line {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        min-height: 44px;
+        margin-top: var(--space-2);
+      }
+
+      .toggle-line input { width: 20px; min-height: 20px; height: 20px; accent-color: var(--green-ink); }
+
+      .result-head {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-2);
+        margin-top: var(--space-4);
+      }
+
+      .result-head h3 {
+        margin: 0;
+        font-family: var(--display);
+        font-size: 1.5rem;
+      }
+
+      .result-count {
+        padding: 0.25rem 0.5rem;
+        border: 2px solid var(--line);
+        background: var(--green);
+        font-size: 0.8125rem;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .table-wrap {
+        max-height: 340px;
+        margin-top: var(--space-2);
+        overflow: auto;
+        border: 2px solid var(--line);
+      }
+
+      table { width: 100%; border-collapse: collapse; background: var(--white); font-size: 0.875rem; }
+      th, td { padding: 0.75rem; border-bottom: 1px solid var(--soft-line); text-align: left; vertical-align: top; }
+      th { position: sticky; top: 0; z-index: 1; background: var(--ink); color: var(--white); font-weight: 700; }
+      tbody tr:nth-child(even) { background: oklch(96% 0.008 250); }
+      td { overflow-wrap: anywhere; }
+
+      .response-details { margin-top: var(--space-3); border-top: 2px solid var(--soft-line); }
+      .response-details summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; font-weight: 700; }
+      pre {
+        max-height: 260px;
+        margin: 0 0 var(--space-3);
+        padding: var(--space-2);
+        overflow: auto;
+        background: oklch(24% 0.028 250);
+        color: oklch(96% 0.01 250);
+        font-size: 0.8125rem;
+        line-height: 1.55;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      .event-list { display: grid; gap: var(--space-1); margin: var(--space-3) 0 0; padding: 0; list-style: none; }
+      .event-list li { display: grid; grid-template-columns: 56px minmax(0, 1fr) auto; gap: var(--space-1); align-items: baseline; padding-bottom: var(--space-1); border-bottom: 1px solid var(--soft-line); font-size: 0.8125rem; }
+      .event-method { font-weight: 700; }
+      .event-path { min-width: 0; overflow-wrap: anywhere; color: var(--muted); }
+      .event-code { font-variant-numeric: tabular-nums; font-weight: 700; }
+
+      .empty-state {
+        display: grid;
+        min-height: 220px;
+        place-content: center;
+        gap: var(--space-1);
+        padding: var(--space-4);
+        border: 2px dashed var(--soft-line);
+        color: var(--muted);
+        text-align: center;
+      }
+
+      .empty-state strong { color: var(--ink); font-family: var(--display); font-size: 1.5rem; }
+      .footnote { max-width: 80ch; margin: 0 auto; padding: 0 var(--space-3) var(--space-5); color: var(--muted); font-size: 0.875rem; text-align: center; }
+
+      @media (max-width: 900px) {
+        .hero { grid-template-columns: minmax(0, 1fr) 224px; }
+        .workspace { grid-template-columns: minmax(0, 1fr); }
+      }
+
+      @media (max-width: 600px) {
+        .shell { width: min(100% - 1.5rem, 1440px); }
+        .topbar { min-height: 52px; }
+        .topbar-note { max-width: 128px; text-align: right; }
+        .hero { grid-template-columns: 1fr; gap: var(--space-3); padding-block: var(--space-5) var(--space-4); }
+        h1 { font-size: clamp(2.75rem, 13vw, 3.5rem); }
+        .signal { width: 168px; justify-self: start; }
+        .notice { display: grid; gap: 0.125rem; }
+        .workspace { gap: var(--space-3); }
+        .panel-head, .panel-body { padding: var(--space-3); }
+        .stepper { padding-inline: var(--space-2); }
+        .step { gap: var(--space-1); font-size: 0.75rem; }
+        .step:not(:last-child)::after { margin-inline: 0.25rem; }
+        .step-number { width: 24px; height: 24px; flex-basis: 24px; }
+        .two-col, .preview-options { grid-template-columns: 1fr; gap: 0; }
+        .check-list { grid-template-columns: 1fr; }
+        .button-row .button { width: 100%; }
+        .browse-tools { grid-template-columns: 1fr; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">TS</span>
+          <span>Connection Lab</span>
+        </div>
+        <span class="topbar-note">AI Research Platform · API playground</span>
+      </header>
+
+      <main>
+        <section class="hero" aria-labelledby="page-title">
+          <div>
+            <h1 id="page-title">Kết nối thử dữ liệu chuỗi thời gian</h1>
+            <p class="hero-copy">Tạo kết nối, duyệt metric hoặc measurement, rồi xem dữ liệu trả về từ API ngay tại đây.</p>
+          </div>
+          <div class="signal" aria-hidden="true">
+            <svg viewBox="0 0 320 100" role="img">
+              <path class="grid-line" d="M0 20H320M0 50H320M0 80H320M40 0V100M100 0V100M160 0V100M220 0V100M280 0V100" />
+              <path class="trace" d="M4 55H55L70 54L78 18L88 83L99 43L108 55H156L170 54L181 31L190 69L202 51L211 55H258L270 54L279 12L288 89L299 48L309 55H318" />
+              <circle class="pulse" cx="279" cy="12" r="6" />
+            </svg>
+          </div>
+        </section>
+
+        <aside class="notice" role="note">
+          <strong>Lưu ý:</strong>
+          <span>Tạo kết nối sẽ lưu connector vào project. Preview chỉ đọc và không tạo dataset. Sau khi thử, có thể xóa kết nối ngay tại đây.</span>
+        </aside>
+
+        <section class="workspace" aria-label="Khu vực thử kết nối">
+          <article class="panel" aria-labelledby="connect-title">
+            <header class="panel-head">
+              <div>
+                <h2 id="connect-title">Nguồn dữ liệu</h2>
+              </div>
+            </header>
+            <div class="panel-body">
+              <fieldset class="connection-kind" aria-label="Loại nguồn">
+                <legend class="visually-hidden">Loại nguồn dữ liệu</legend>
+                <label class="kind-option">
+                  <input type="radio" name="kind" value="prometheus" checked />
+                  <span>Prometheus</span>
+                </label>
+                <label class="kind-option">
+                  <input type="radio" name="kind" value="influxdb" />
+                  <span>InfluxDB</span>
+                </label>
+              </fieldset>
+
+              <div class="field">
+                <label for="api-base">API base URL</label>
+                <input id="api-base" type="url" value="http://localhost:8080/api/v1" autocomplete="url" />
+                <p class="hint">Bao gồm prefix `/api/v1`. Cookie phiên được gửi kèm tự động.</p>
+                <div class="security-warning hidden" id="remote-api-warning" role="note">
+                  <p><strong>API bên ngoài máy này.</strong> Chỉ tiếp tục nếu đây là backend bạn tin cậy. API này sẽ nhận request tạo kết nối và secret.</p>
+                  <label class="security-check" for="trust-api-host">
+                    <input id="trust-api-host" type="checkbox" />
+                    <span>Tôi xác nhận tin cậy API base URL này.</span>
+                  </label>
+                </div>
+              </div>
+              <div class="field">
+                <label for="project-id">Project ID</label>
+                <input id="project-id" type="text" placeholder="UUID của project" autocomplete="off" spellcheck="false" />
+                <p class="hint">Phiên đăng nhập cần có quyền Project Manager hoặc Researcher để tạo kết nối.</p>
+              </div>
+              <div class="field">
+                <label for="connection-name">Tên kết nối</label>
+                <input id="connection-name" type="text" value="Prometheus demo" maxlength="120" />
+              </div>
+              <div class="field">
+                <label for="source-url">URL nguồn</label>
+                <input id="source-url" type="url" value="https://prometheus.demo.prometheus.io" autocomplete="url" />
+                <p class="hint" id="url-hint">Dùng URL gốc, không thêm `/api/v1`. Demo public không cần xác thực.</p>
+                <div class="security-warning hidden" id="http-source-warning" role="note">
+                  <p><strong>Nguồn dùng HTTP, không mã hóa.</strong> Token hoặc username/password sẽ đi từ backend tới nguồn qua kết nối không mã hóa. Chỉ dùng trên mạng bạn tin cậy.</p>
+                  <label class="security-check" for="trust-http-source">
+                    <input id="trust-http-source" type="checkbox" />
+                    <span>Tôi hiểu rủi ro và vẫn muốn gửi thông tin xác thực qua HTTP.</span>
+                  </label>
+                </div>
+              </div>
+
+              <div id="influx-database" class="field hidden">
+                <label for="database">Database / bucket</label>
+                <input id="database" type="text" value="bench" maxlength="255" autocomplete="off" />
+              </div>
+
+              <div id="prometheus-auth" class="auth-fields">
+                <div class="two-col">
+                  <div class="field">
+                    <label for="prom-user">Username <span class="hint">(tuỳ chọn)</span></label>
+                    <input id="prom-user" type="text" autocomplete="username" />
+                  </div>
+                  <div class="field">
+                    <label for="prom-token">Token / password</label>
+                    <input id="prom-token" type="password" autocomplete="new-password" />
+                  </div>
+                </div>
+                <p class="hint">Để trống cả hai với demo Prometheus public. Token được xóa khỏi ô nhập sau khi tạo kết nối thành công.</p>
+              </div>
+
+              <div id="influx-auth" class="auth-fields hidden">
+                <div class="field">
+                  <label for="influx-token">Token</label>
+                  <input id="influx-token" type="password" autocomplete="new-password" />
+                </div>
+                <div class="two-col">
+                  <div class="field">
+                    <label for="influx-user">Username (InfluxDB 1.8)</label>
+                    <input id="influx-user" type="text" autocomplete="username" />
+                  </div>
+                  <div class="field">
+                    <label for="influx-password">Password</label>
+                    <input id="influx-password" type="password" autocomplete="new-password" />
+                  </div>
+                </div>
+                <p class="hint">Dùng token cho InfluxDB 2/3 hoặc username/password cho InfluxDB 1.8.</p>
+              </div>
+
+              <div class="button-row">
+                <button class="button button-primary" id="connect-button" type="button">Tạo và kiểm tra kết nối</button>
+                <button class="button button-danger hidden" id="delete-button" type="button">Xóa kết nối vừa tạo</button>
+              </div>
+              <p class="status" id="connect-status" role="status" aria-live="polite">Đăng nhập trên frontend trước, rồi nhập Project ID để bắt đầu.</p>
+            </div>
+          </article>
+
+          <article class="panel" aria-labelledby="browse-title">
+            <div class="stepper" aria-label="Các bước">
+              <div class="step" id="step-connect" data-state="active"><span class="step-number">01</span><span>Kết nối</span></div>
+              <div class="step" id="step-browse" data-state="idle"><span class="step-number">02</span><span>Duyệt</span></div>
+              <div class="step" id="step-preview" data-state="idle"><span class="step-number">03</span><span>Preview</span></div>
+            </div>
+            <div class="panel-head">
+              <div>
+                <h2 id="browse-title">Metric / measurement</h2>
+              </div>
+            </div>
+            <div class="panel-body">
+              <div id="browse-empty" class="empty-state">
+                <strong>Đang chờ kết nối</strong>
+                <span>Sau khi tạo kết nối, danh sách nguồn sẽ xuất hiện tại đây.</span>
+              </div>
+
+              <div id="browse-content" class="hidden">
+                <div class="browse-tools">
+                  <div class="field">
+                    <label for="table-search">Tìm metric / measurement</label>
+                    <input id="table-search" type="search" value="up" placeholder="Ví dụ: up, latency" />
+                  </div>
+                  <button class="button" id="load-tables-button" type="button">Tải danh sách</button>
+                </div>
+                <div class="field spaced-field">
+                  <label for="table-select">Nguồn</label>
+                  <select id="table-select" disabled><option value="">Chưa tải danh sách</option></select>
+                </div>
+
+                <div id="column-picker" class="hidden">
+                  <fieldset id="fields-group">
+                    <legend>Fields <span class="hint">(chọn ít nhất một với InfluxDB)</span></legend>
+                    <div class="check-list" id="fields-list"></div>
+                  </fieldset>
+                  <fieldset>
+                    <legend>Tags · tách series theo nhãn</legend>
+                    <div class="check-list" id="tags-list"></div>
+                  </fieldset>
+
+                  <div class="preview-options">
+                    <div class="field">
+                      <label for="range-start">Từ</label>
+                      <input id="range-start" type="datetime-local" />
+                    </div>
+                    <div class="field">
+                      <label for="range-end">Đến</label>
+                      <input id="range-end" type="datetime-local" />
+                    </div>
+                    <div class="field" id="bucket-field">
+                      <label for="bucket">Khoảng gom dữ liệu</label>
+                      <select id="bucket">
+                        <option value="1m">1 phút</option>
+                        <option value="5m" selected>5 phút</option>
+                        <option value="15m">15 phút</option>
+                        <option value="1h">1 giờ</option>
+                        <option value="6h">6 giờ</option>
+                        <option value="1d">1 ngày</option>
+                        <option value="1w">1 tuần</option>
+                      </select>
+                    </div>
+                    <div class="field" id="aggregate-field">
+                      <label for="aggregate">Phép tổng hợp</label>
+                      <select id="aggregate"></select>
+                    </div>
+                  </div>
+                  <label id="raw-toggle-wrap" class="toggle-line hidden">
+                    <input id="raw-toggle" type="checkbox" />
+                    <span>Đọc điểm thô, không gom bucket</span>
+                  </label>
+                  <div class="button-row spaced-button-row">
+                    <button class="button button-primary" id="preview-button" type="button">Tải preview</button>
+                  </div>
+                  <p class="status" id="browse-status" role="status" aria-live="polite"></p>
+                </div>
+              </div>
+
+              <section id="result-section" class="hidden" aria-labelledby="result-title">
+                <div class="result-head">
+                  <h3 id="result-title">Dữ liệu trả về</h3>
+                  <span class="result-count" id="result-count"></span>
+                </div>
+                <p class="status" id="preview-status" role="status" aria-live="polite"></p>
+                <div class="table-wrap" id="result-table-wrap"></div>
+                <details class="response-details">
+                  <summary>Xem JSON response</summary>
+                  <pre id="response-json"></pre>
+                </details>
+              </section>
+
+              <section aria-labelledby="activity-title">
+                <div class="result-head">
+                  <h3 id="activity-title">API activity</h3>
+                </div>
+                <ol class="event-list" id="event-list" aria-live="polite">
+                  <li><span class="event-method">Chờ</span><span class="event-path">Chưa có request</span><span class="event-code">Chờ</span></li>
+                </ol>
+              </section>
+            </div>
+          </article>
+        </section>
+      </main>
+
+      <footer class="footnote">
+        Chạy <code>python3 -m http.server 5173</code> từ thư mục chứa file hoặc mở bằng VS Code Live Server ở cổng <code>5500</code>. Dùng origin <code>http://localhost:5173</code>, <code>http://127.0.0.1:5173</code>, <code>http://localhost:5500</code> hoặc <code>http://127.0.0.1:5500</code> (không mở bằng <code>file://</code>). Frontend, trang này và API phải cùng hostname (<code>localhost</code> hoặc <code>127.0.0.1</code>) để cookie đăng nhập được gửi đúng. Đăng nhập frontend trong cùng trình duyệt trước. CORS dev mặc định cho phép các origin trên. Chỉ dùng dữ liệu thử và token có quyền đọc. Trang không ghi secret vào localStorage.
+      </footer>
+    </div>
+
+    <script>
+      (() => {
+        const $ = (selector) => document.querySelector(selector);
+        const state = { kind: "prometheus", csrf: "", csrfBase: "", connectionId: "", columns: [], tables: [], columnsForTable: "", browseRequestVersion: 0, previewRequestVersion: 0, deleting: false };
+        const apiBase = $("#api-base");
+        if (window.location.hostname === "127.0.0.1") apiBase.value = "http://127.0.0.1:8080/api/v1";
+        const connectStatus = $("#connect-status");
+        const browseStatus = $("#browse-status");
+        const previewStatus = $("#preview-status");
+        const eventList = $("#event-list");
+        const aggregate = $("#aggregate");
+
+        const localDateTime = (date) => {
+          const shifted = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+          return shifted.toISOString().slice(0, 16);
+        };
+        const now = new Date();
+        $("#range-end").value = localDateTime(now);
+        $("#range-start").value = localDateTime(new Date(now.getTime() - 60 * 60 * 1000));
+
+        function setStatus(element, message, tone = "") {
+          element.textContent = message;
+          element.dataset.tone = tone;
+        }
+
+        function setStep(active, completed = []) {
+          ["connect", "browse", "preview"].forEach((name) => {
+            const step = $(`#step-${name}`);
+            step.dataset.state = completed.includes(name) ? "done" : name === active ? "active" : "idle";
+          });
+        }
+
+        function baseUrl() {
+          return apiBase.value.trim().replace(/\/+$/, "");
+        }
+
+        function validatePlaygroundOrigin() {
+          const supportedOrigins = [
+            "http://localhost:5173", "http://127.0.0.1:5173",
+            "http://localhost:5500", "http://127.0.0.1:5500",
+          ];
+          if (!supportedOrigins.includes(window.location.origin)) {
+            throw new Error(`Trang đang mở từ origin “${window.location.origin}”. Dùng http://localhost:5173, http://127.0.0.1:5173, http://localhost:5500 hoặc http://127.0.0.1:5500; không mở file:// hay cổng khác.`);
+          }
+        }
+
+        function validateLocalHostnameConsistency() {
+          const pageHost = window.location.hostname;
+          const apiHost = parseApiBase().hostname;
+          const loopbackHosts = new Set(["localhost", "127.0.0.1"]);
+          if (loopbackHosts.has(pageHost) && loopbackHosts.has(apiHost) && pageHost !== apiHost) {
+            throw new Error(`Trang đang dùng “${pageHost}” nhưng API dùng “${apiHost}”. Dùng cùng hostname cho frontend, trang playground và API để phiên đăng nhập/cookie hoạt động.`);
+          }
+        }
+
+        function parseApiBase() {
+          try { return new URL(baseUrl()); }
+          catch { throw new Error("Nhập API base URL hợp lệ, gồm cả http:// hoặc https://."); }
+        }
+
+        function isLocalHost(hostname) {
+          return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(hostname.toLowerCase());
+        }
+
+        function updateApiDestinationWarning() {
+          let remote = false;
+          try { remote = !isLocalHost(parseApiBase().hostname); }
+          catch { /* The create action reports malformed URLs. */ }
+          $("#remote-api-warning").classList.toggle("hidden", !remote);
+          if (!remote) $("#trust-api-host").checked = false;
+        }
+
+        function validateApiDestination() {
+          const destination = parseApiBase();
+          if (!["http:", "https:"].includes(destination.protocol) || destination.username || destination.password || destination.search || destination.hash) {
+            throw new Error("API base URL chỉ được có scheme, host, port và đường dẫn; không kèm user/password, query hoặc fragment.");
+          }
+          const local = isLocalHost(destination.hostname);
+          if (!local && destination.protocol !== "https:") {
+            throw new Error("API base URL bên ngoài máy này phải dùng HTTPS.");
+          }
+          if (!local && !$("#trust-api-host").checked) {
+            throw new Error("Xác nhận tin cậy API base URL trước khi gửi request.");
+          }
+        }
+
+        function updateSourceTransportWarning() {
+          let sourceUsesHttp = false;
+          try { sourceUsesHttp = new URL($("#source-url").value.trim()).protocol === "http:"; }
+          catch { /* The backend reports malformed source URLs on submit. */ }
+          const hasCredentials = state.kind === "prometheus"
+            ? Boolean($("#prom-user").value.trim() || $("#prom-token").value)
+            : Boolean($("#influx-token").value || $("#influx-user").value.trim() || $("#influx-password").value);
+          const shouldWarn = sourceUsesHttp && hasCredentials;
+          $("#http-source-warning").classList.toggle("hidden", !shouldWarn);
+          if (!shouldWarn) $("#trust-http-source").checked = false;
+        }
+
+        function recordEvent(method, path, status) {
+          const empty = eventList.querySelector("li");
+          if (eventList.children.length === 1 && empty?.querySelector(".event-path")?.textContent === "Chưa có request") {
+            eventList.replaceChildren();
+          }
+          const item = document.createElement("li");
+          const methodText = document.createElement("span");
+          methodText.className = "event-method";
+          methodText.textContent = method;
+          const pathText = document.createElement("span");
+          pathText.className = "event-path";
+          pathText.textContent = path;
+          const codeText = document.createElement("span");
+          codeText.className = "event-code";
+          codeText.textContent = String(status);
+          item.append(methodText, pathText, codeText);
+          eventList.prepend(item);
+          while (eventList.children.length > 8) eventList.lastElementChild.remove();
+        }
+
+        async function api(path, options = {}) {
+          const method = options.method || "GET";
+          const headers = { Accept: "application/json" };
+          const init = { method, headers, credentials: "include", cache: "no-store" };
+          if (options.body !== undefined) {
+            headers["Content-Type"] = "application/json";
+            headers["X-CSRF-Token"] = state.csrf;
+            init.body = JSON.stringify(options.body);
+          } else if (options.csrf) {
+            headers["X-CSRF-Token"] = state.csrf;
+          }
+
+          let response;
+          try {
+            response = await fetch(`${baseUrl()}${path}`, init);
+          } catch (cause) {
+            recordEvent(method, path, "CORS / network");
+            let apiOrigin = "API base URL đã nhập";
+            try { apiOrigin = new URL(baseUrl()).origin; }
+            catch { /* Keep a safe label if the URL is incomplete. */ }
+            const error = new Error(`Không gọi được API ${apiOrigin} từ origin “${window.location.origin}”. Mở trang qua localhost/127.0.0.1 ở cổng 5173 hoặc Live Server cổng 5500 (không dùng file://), đăng nhập frontend cùng hostname, rồi kiểm tra backend và CORS_ALLOWED_ORIGINS.`);
+            error.cause = cause;
+            throw error;
+          }
+          let payload;
+          const raw = await response.text();
+          try { payload = raw ? JSON.parse(raw) : null; }
+          catch { payload = { raw }; }
+          recordEvent(method, path, response.status);
+          if (!response.ok) {
+            const error = new Error(payload?.message || payload?.detail || `API trả HTTP ${response.status}`);
+            error.code = payload?.error?.code;
+            error.reason = payload?.error?.reason;
+            error.status = response.status;
+            error.payload = payload;
+            throw error;
+          }
+          return payload?.data;
+        }
+
+        async function ensureCsrf() {
+          const requestBase = baseUrl();
+          if (state.csrf && state.csrfBase === requestBase) return state.csrf;
+          const data = await api("/auth/csrf-token");
+          if (requestBase !== baseUrl()) throw new Error("API base URL vừa đổi; hãy thử lại để lấy CSRF token từ server đang chọn.");
+          state.csrf = data?.csrf_token || "";
+          state.csrfBase = requestBase;
+          if (!state.csrf) throw new Error("API không trả CSRF token. Hãy đăng nhập lại trên frontend.");
+          return state.csrf;
+        }
+
+        function setBusy(button, busy, busyText) {
+          if (busy) {
+            button.dataset.label = button.textContent;
+            button.textContent = busyText;
+          } else if (button.dataset.label) {
+            button.textContent = button.dataset.label;
+            delete button.dataset.label;
+          }
+          button.disabled = busy;
+        }
+
+        function restoreBusyLabel(button) {
+          if (!button.dataset.label) return;
+          button.textContent = button.dataset.label;
+          delete button.dataset.label;
+        }
+
+        function connectionBody() {
+          const name = $("#connection-name").value.trim();
+          const url = $("#source-url").value.trim();
+          if (!name) throw new Error("Nhập tên kết nối.");
+          if (!url) throw new Error("Nhập URL nguồn.");
+          let sourceUrl;
+          try { sourceUrl = new URL(url); }
+          catch { throw new Error("Nhập URL nguồn hợp lệ, gồm cả http:// hoặc https://."); }
+          if (!["http:", "https:"].includes(sourceUrl.protocol) || sourceUrl.username || sourceUrl.password || sourceUrl.search || sourceUrl.hash) {
+            throw new Error("URL nguồn không được có user/password, query hoặc fragment.");
+          }
+          const body = { name, kind: state.kind, config: { url } };
+
+          if (state.kind === "prometheus") {
+            const username = $("#prom-user").value.trim();
+            const token = $("#prom-token").value;
+            if (username || token) body.secret = { username, token };
+          } else {
+            const database = $("#database").value.trim();
+            if (!database) throw new Error("Nhập database hoặc bucket của InfluxDB.");
+            body.config.database = database;
+            const token = $("#influx-token").value;
+            const username = $("#influx-user").value.trim();
+            const password = $("#influx-password").value;
+            if (token && (username || password)) throw new Error("Chỉ chọn token hoặc cặp username/password.");
+            if ((username && !password) || (!username && password)) throw new Error("InfluxDB 1.8 cần cả username và password.");
+            if (token || username) body.secret = token ? { token } : { username, password };
+          }
+          if (body.secret && sourceUrl.protocol === "http:" && !$("#trust-http-source").checked) {
+            throw new Error("Nguồn dùng HTTP với thông tin xác thực. Đọc cảnh báo và xác nhận trước khi tiếp tục.");
+          }
+          return body;
+        }
+
+        function projectConnectionsPath() {
+          const id = $("#project-id").value.trim();
+          if (!id) throw new Error("Nhập Project ID.");
+          return `/projects/${encodeURIComponent(id)}/connections`;
+        }
+
+        function setConnectionLocked(locked) {
+          ["api-base", "project-id", "connection-name", "source-url", "database", "prom-user", "prom-token", "influx-token", "influx-user", "influx-password"].forEach((id) => {
+            $("#" + id).disabled = locked;
+          });
+          document.querySelectorAll('input[name="kind"]').forEach((input) => { input.disabled = locked; });
+          $("#connect-button").disabled = locked;
+        }
+
+        function setKind(kind) {
+          if (state.connectionId) return;
+          state.browseRequestVersion += 1;
+          state.kind = kind;
+          const isProm = kind === "prometheus";
+          $("#connection-name").value = isProm ? "Prometheus demo" : "InfluxDB dev";
+          $("#source-url").value = isProm ? "https://prometheus.demo.prometheus.io" : "http://localhost:8181";
+          $("#url-hint").textContent = isProm
+            ? "Dùng URL gốc, không thêm `/api/v1`. Demo public không cần xác thực."
+            : "Dùng URL server mà backend truy cập được; không thêm `/query`. Backend chặn IP private theo mặc định; chỉ bật CONNECTION_ALLOW_PRIVATE_HOSTS trong môi trường dev khi cần.";
+          $("#prometheus-auth").classList.toggle("hidden", !isProm);
+          $("#influx-auth").classList.toggle("hidden", isProm);
+          $("#influx-database").classList.toggle("hidden", isProm);
+          $("#fields-group").classList.toggle("hidden", isProm);
+          $("#raw-toggle-wrap").classList.toggle("hidden", isProm);
+          $("#table-search").value = isProm ? "up" : "";
+          $("#raw-toggle").checked = false;
+          $("#bucket").disabled = false;
+          aggregate.disabled = false;
+          state.columns = [];
+          state.tables = [];
+          state.columnsForTable = "";
+          $("#column-picker").classList.add("hidden");
+          $("#result-section").classList.add("hidden");
+          $("#prom-user").value = "";
+          $("#prom-token").value = "";
+          $("#influx-token").value = "";
+          $("#influx-user").value = "";
+          $("#influx-password").value = "";
+          $("#trust-http-source").checked = false;
+          updateSourceTransportWarning();
+          $("#browse-content").classList.toggle("hidden", !state.connectionId);
+          $("#browse-empty").classList.toggle("hidden", Boolean(state.connectionId));
+          renderAggregateOptions();
+        }
+
+        function renderAggregateOptions() {
+          const options = ["mean", "sum", "min", "max", "count"];
+          if (state.kind === "prometheus") options.push("increase");
+          const current = aggregate.value;
+          aggregate.replaceChildren(...options.map((value) => {
+            const option = document.createElement("option");
+            option.value = value;
+            option.textContent = value;
+            return option;
+          }));
+          aggregate.value = options.includes(current) ? current : "mean";
+          updateAggregateForFields();
+        }
+
+        function updateAggregateForFields() {
+          if (state.kind !== "influxdb") return;
+          const selected = [...document.querySelectorAll('input[name="field-name"]:checked')].map((input) => input.value);
+          const selectedTypes = selected.map((name) => state.columns.find((column) => column.name === name)?.type);
+          const hasNonNumeric = selectedTypes.some((type) => !["float", "integer", "unsigned"].includes(type));
+          [...aggregate.options].forEach((option) => {
+            option.disabled = hasNonNumeric && option.value !== "count";
+          });
+          if (hasNonNumeric && aggregate.value !== "count") aggregate.value = "count";
+        }
+
+        function renderChecks(container, columns, role, inputName, defaults = []) {
+          container.replaceChildren();
+          const matches = columns.filter((column) => column.role === role);
+          if (!matches.length) {
+            const note = document.createElement("p");
+            note.className = "hint";
+            note.textContent = "Không có cột phù hợp trong response /columns.";
+            container.append(note);
+            return;
+          }
+          matches.forEach((column) => {
+            const label = document.createElement("label");
+            label.className = "check-item";
+            const input = document.createElement("input");
+            input.type = "checkbox";
+            input.name = inputName;
+            input.value = column.name;
+            input.checked = defaults.includes(column.name);
+            input.addEventListener("change", updateAggregateForFields);
+            const code = document.createElement("code");
+            code.textContent = column.name;
+            label.append(input, code);
+            container.append(label);
+          });
+        }
+
+        async function loadTables() {
+          if (!state.connectionId) throw new Error("Tạo kết nối trước khi duyệt nguồn.");
+          const requestVersion = ++state.browseRequestVersion;
+          const connectionId = state.connectionId;
+          const button = $("#load-tables-button");
+          const select = $("#table-select");
+          state.columnsForTable = "";
+          select.disabled = true;
+          $("#table-search").disabled = true;
+          $("#preview-button").disabled = true;
+          $("#column-picker").classList.add("hidden");
+          setBusy(button, true, "Đang tải…");
+          setStatus(browseStatus, "Đang lấy danh sách từ nguồn…");
+          try {
+            const params = new URLSearchParams({ schema: "default" });
+            const search = $("#table-search").value.trim();
+            if (search) params.set("search", search);
+            const data = await api(`${projectConnectionsPath()}/${connectionId}/tables?${params}`);
+            if (requestVersion !== state.browseRequestVersion || connectionId !== state.connectionId) return;
+            state.tables = Array.isArray(data) ? data : [];
+            select.replaceChildren();
+            if (!state.tables.length) {
+              const option = document.createElement("option");
+              option.value = "";
+              option.textContent = "Không tìm thấy metric / measurement";
+              select.append(option);
+              select.disabled = true;
+              $("#column-picker").classList.add("hidden");
+              setStatus(browseStatus, "Không có kết quả. Thử đổi nội dung tìm kiếm.", "error");
+              return;
+            }
+            state.tables.forEach((table) => {
+              const option = document.createElement("option");
+              option.value = table.name;
+              option.textContent = table.name;
+              select.append(option);
+            });
+            select.disabled = false;
+            const preferred = state.tables.find((table) => table.name === (state.kind === "prometheus" ? "up" : "latency"));
+            if (preferred) select.value = preferred.name;
+            setStatus(browseStatus, `${state.tables.length} nguồn trong kết quả tìm kiếm.`, "success");
+            await loadColumns(requestVersion);
+          } finally {
+            if (requestVersion === state.browseRequestVersion && connectionId === state.connectionId && !state.deleting) {
+              setBusy(button, false);
+              $("#table-search").disabled = false;
+            }
+          }
+        }
+
+        async function loadColumns(requestVersion = ++state.browseRequestVersion) {
+          const select = $("#table-select");
+          const name = select.value;
+          if (!name) return;
+          const connectionId = state.connectionId;
+          state.columnsForTable = "";
+          select.disabled = true;
+          $("#preview-button").disabled = true;
+          $("#column-picker").classList.add("hidden");
+          setStatus(browseStatus, "Đang lấy fields và tags…");
+          const params = new URLSearchParams({ schema: "default", table: name });
+          try {
+            const data = await api(`${projectConnectionsPath()}/${connectionId}/columns?${params}`);
+            if (requestVersion !== state.browseRequestVersion || connectionId !== state.connectionId || name !== select.value) return;
+            state.columns = Array.isArray(data) ? data : [];
+            state.columnsForTable = name;
+            const firstField = state.columns.find((column) => column.role === "field")?.name;
+            const preferredTag = state.columns.some((column) => column.name === "job" && column.role === "tag")
+              ? "job"
+              : state.columns.find((column) => column.role === "tag")?.name;
+            renderChecks($("#fields-list"), state.columns, "field", "field-name", firstField ? [firstField] : []);
+            renderChecks($("#tags-list"), state.columns, "tag", "tag-name", preferredTag ? [preferredTag] : []);
+            $("#column-picker").classList.remove("hidden");
+            renderAggregateOptions();
+            setStatus(browseStatus, `Đã tải ${state.columns.length} cột từ “${name}”.`, "success");
+          } finally {
+            if (requestVersion === state.browseRequestVersion && connectionId === state.connectionId) {
+              select.disabled = false;
+              $("#preview-button").disabled = !state.columnsForTable;
+            }
+          }
+        }
+
+        function setBrowseControlsLocked(locked) {
+          const raw = state.kind === "influxdb" && $("#raw-toggle").checked;
+          $("#table-select").disabled = locked || !state.columnsForTable;
+          $("#table-search").disabled = locked || !state.connectionId;
+          $("#load-tables-button").disabled = locked || !state.connectionId;
+          $("#preview-button").disabled = locked || !state.connectionId || !state.columnsForTable;
+          $("#range-start").disabled = locked;
+          $("#range-end").disabled = locked;
+          $("#bucket").disabled = locked || raw;
+          aggregate.disabled = locked || raw;
+          $("#raw-toggle").disabled = locked;
+          document.querySelectorAll("#fields-list input, #tags-list input").forEach((input) => { input.disabled = locked; });
+        }
+
+        function setPreviewControlsLocked(locked) {
+          setBrowseControlsLocked(locked);
+          $("#delete-button").disabled = locked || state.deleting;
+        }
+
+        function selectedNames(inputName) {
+          return [...document.querySelectorAll(`input[name="${inputName}"]:checked`)].map((input) => input.value);
+        }
+
+        function renderPreview(data) {
+          const columns = data?.columns || [];
+          const rows = data?.rows || [];
+          const table = document.createElement("table");
+          const head = document.createElement("thead");
+          const headerRow = document.createElement("tr");
+          columns.forEach((column) => {
+            const th = document.createElement("th");
+            th.scope = "col";
+            th.textContent = column.name;
+            headerRow.append(th);
+          });
+          head.append(headerRow);
+          const body = document.createElement("tbody");
+          rows.forEach((row) => {
+            const tr = document.createElement("tr");
+            row.forEach((value) => {
+              const td = document.createElement("td");
+              td.textContent = value === null || value === undefined ? "null" : String(value);
+              tr.append(td);
+            });
+            body.append(tr);
+          });
+          table.append(head, body);
+          const wrap = $("#result-table-wrap");
+          wrap.replaceChildren();
+          if (!rows.length) {
+            const empty = document.createElement("div");
+            empty.className = "empty-state";
+            empty.textContent = "Nguồn không có điểm trong khoảng thời gian đã chọn.";
+            wrap.append(empty);
+          } else {
+            wrap.append(table);
+          }
+          $("#result-count").textContent = `${rows.length} dòng${data?.truncated ? " · còn dữ liệu" : ""}`;
+          $("#response-json").textContent = JSON.stringify(data, null, 2);
+          $("#result-section").classList.remove("hidden");
+        }
+
+        async function preview() {
+          if (state.deleting) throw new Error("Đang xóa kết nối; đợi thao tác hoàn tất rồi thử lại.");
+          if (!state.connectionId) throw new Error("Tạo kết nối trước khi tải preview.");
+          const connectionId = state.connectionId;
+          const requestVersion = ++state.previewRequestVersion;
+          const name = $("#table-select").value;
+          if (!name) throw new Error("Chọn metric hoặc measurement.");
+          if (state.columnsForTable !== name) throw new Error("Đợi tải xong fields và tags của nguồn đang chọn rồi thử lại.");
+          const fields = state.kind === "prometheus" ? [] : selectedNames("field-name");
+          if (state.kind === "influxdb" && !fields.length) throw new Error("Chọn ít nhất một field.");
+          if (fields.length > 20) throw new Error("Chọn tối đa 20 fields.");
+          const tags = selectedNames("tag-name");
+          if (tags.length > 10) throw new Error("Chọn tối đa 10 tags.");
+          const startDate = new Date($("#range-start").value);
+          const endDate = new Date($("#range-end").value);
+          if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime()) || startDate >= endDate) {
+            throw new Error("Khoảng thời gian không hợp lệ. Thời điểm bắt đầu phải trước thời điểm kết thúc.");
+          }
+          const raw = state.kind === "influxdb" && $("#raw-toggle").checked;
+          const source = {
+            type: "timeseries",
+            name,
+            fields,
+            tags,
+            start: startDate.toISOString(),
+            end: endDate.toISOString(),
+            bucket: raw ? null : $("#bucket").value,
+            aggregate: raw ? null : aggregate.value,
+          };
+          const button = $("#preview-button");
+          setBusy(button, true, "Đang đọc dữ liệu…");
+          setPreviewControlsLocked(true);
+          setStatus(previewStatus, "Đang gọi API preview…");
+          setStep("preview", ["connect", "browse"]);
+          try {
+            const data = await api(`${projectConnectionsPath()}/${encodeURIComponent(connectionId)}/preview`, { method: "POST", body: { source } });
+            if (requestVersion !== state.previewRequestVersion || connectionId !== state.connectionId || state.deleting) return;
+            renderPreview(data);
+            setStatus(previewStatus, data?.truncated ? "Preview giới hạn số dòng; nguồn vẫn còn dữ liệu." : "Preview hoàn tất.", "success");
+          } catch (error) {
+            if (requestVersion !== state.previewRequestVersion || connectionId !== state.connectionId || state.deleting) return;
+            setStatus(previewStatus, describeError(error), "error");
+            throw error;
+          } finally {
+            if (requestVersion === state.previewRequestVersion && connectionId === state.connectionId && !state.deleting) {
+              setBusy(button, false);
+              setPreviewControlsLocked(false);
+            }
+          }
+        }
+
+        function describeError(error) {
+          const parts = [error.message];
+          if (error.code) parts.push(`Mã: ${error.code}${error.reason ? ` (${error.reason})` : ""}`);
+          if (error.status === 401) parts.push("Hãy đăng nhập trên frontend và thử lại.");
+          if (error.status === 403) parts.push("Kiểm tra quyền project, CSRF và CORS origin của trang.");
+          return parts.join(" · ");
+        }
+
+        $("#connect-button").addEventListener("click", async () => {
+          const button = $("#connect-button");
+          setBusy(button, true, "Đang kiểm tra nguồn…");
+          setStatus(connectStatus, "Đang kiểm tra phiên đăng nhập và kết nối nguồn…");
+          try {
+            validatePlaygroundOrigin();
+            validateApiDestination();
+            validateLocalHostnameConsistency();
+            const body = connectionBody();
+            await ensureCsrf();
+            const data = await api(`${projectConnectionsPath()}`, { method: "POST", body });
+            state.connectionId = data.id;
+            setConnectionLocked(true);
+            $("#delete-button").classList.remove("hidden");
+            $("#browse-empty").classList.add("hidden");
+            $("#browse-content").classList.remove("hidden");
+            $("#result-section").classList.add("hidden");
+            setStep("browse", ["connect"]);
+            setStatus(connectStatus, `Kết nối thành công: ${data.name} · ID ${data.id}`, "success");
+            $("#prom-token").value = "";
+            $("#prom-user").value = "";
+            $("#influx-token").value = "";
+            $("#influx-user").value = "";
+            $("#influx-password").value = "";
+            $("#trust-http-source").checked = false;
+            updateSourceTransportWarning();
+            await loadTables();
+          } catch (error) {
+            const prefix = state.connectionId ? "Kết nối đã được lưu nhưng bước duyệt nguồn gặp lỗi. " : "";
+            setStatus(connectStatus, prefix + describeError(error), "error");
+          } finally {
+            setBusy(button, false);
+            if (state.connectionId) button.disabled = true;
+          }
+        });
+
+        $("#load-tables-button").addEventListener("click", async () => {
+          try { await loadTables(); }
+          catch (error) { setStatus(browseStatus, describeError(error), "error"); }
+        });
+
+        $("#table-select").addEventListener("change", async () => {
+          $("#result-section").classList.add("hidden");
+          try { await loadColumns(); }
+          catch (error) { setStatus(browseStatus, describeError(error), "error"); }
+        });
+
+        $("#preview-button").addEventListener("click", async () => {
+          try { await preview(); }
+          catch (error) { setStatus(previewStatus, describeError(error), "error"); }
+        });
+
+        $("#delete-button").addEventListener("click", async () => {
+          if (!state.connectionId) return;
+          if (!window.confirm("Xóa kết nối vừa tạo khỏi project? Dữ liệu dataset đã import (nếu có) không bị xóa.")) return;
+          const button = $("#delete-button");
+          const connectionId = state.connectionId;
+          state.deleting = true;
+          state.previewRequestVersion += 1;
+          state.browseRequestVersion += 1;
+          restoreBusyLabel($("#load-tables-button"));
+          setBrowseControlsLocked(true);
+          setBusy(button, true, "Đang xóa…");
+          try {
+            await ensureCsrf();
+            await api(`${projectConnectionsPath()}/${encodeURIComponent(connectionId)}`, { method: "DELETE", csrf: true });
+            state.browseRequestVersion += 1;
+            state.previewRequestVersion += 1;
+            state.connectionId = "";
+            state.columns = [];
+            state.tables = [];
+            state.columnsForTable = "";
+            setConnectionLocked(false);
+            $("#delete-button").classList.add("hidden");
+            $("#browse-content").classList.add("hidden");
+            $("#browse-empty").classList.remove("hidden");
+            $("#column-picker").classList.add("hidden");
+            $("#result-section").classList.add("hidden");
+            $("#table-search").disabled = false;
+            setStatus(connectStatus, "Đã xóa kết nối khỏi project.", "success");
+            setStep("connect");
+          } catch (error) {
+            setStatus(connectStatus, describeError(error), "error");
+          } finally {
+            state.deleting = false;
+            setBusy(button, false);
+            if (state.connectionId) setBrowseControlsLocked(false);
+          }
+        });
+
+        document.querySelectorAll('input[name="kind"]').forEach((input) => {
+          input.addEventListener("change", () => {
+            if (input.checked) setKind(input.value);
+          });
+        });
+        apiBase.addEventListener("input", () => {
+          state.csrf = "";
+          state.csrfBase = "";
+          $("#trust-api-host").checked = false;
+          updateApiDestinationWarning();
+        });
+        ["source-url", "prom-user", "prom-token", "influx-token", "influx-user", "influx-password"].forEach((id) => {
+          $("#" + id).addEventListener("input", () => {
+            $("#trust-http-source").checked = false;
+            updateSourceTransportWarning();
+          });
+        });
+        $("#raw-toggle").addEventListener("change", (event) => {
+          const raw = event.target.checked;
+          $("#bucket").disabled = raw;
+          aggregate.disabled = raw;
+        });
+
+        renderAggregateOptions();
+        updateApiDestinationWarning();
+        updateSourceTransportWarning();
+      })();
+    </script>
+  </body>
+</html>

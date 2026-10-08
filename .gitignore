@@ -5,7 +5,8 @@ Thumbs.db
 # Local logs
 *.log
 /plans/
-/docs/
+/docs/*
+!/docs/time-series-connection-playground/
 .[e]nv
 .[e]nv.*
 !.[e]nv.example
