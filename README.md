@@ -384,7 +384,36 @@ The result is then checked like any dataset file, so a tab with a header and no 
 - Folders inside the folder: only files directly in it are listed, at most 1000.
 - `.xls`, Google Docs, PDF and every other type: they are not listed.
 - Shared drives: requests are sent in the form Drive needs for them, but this was not tested against one, so it is not promised.
-- Choosing files with Google Picker, syncing on a schedule, and a token per member.
+- Syncing on a schedule and a token per member.
+
+**Choosing a source with Google Picker.** After Google consent, the frontend calls
+`POST /api/v1/projects/{id}/connections/google/picker` with `{"grant_id":"..."}` and its
+CSRF header. The response's `data` contains `access_token`, `api_key`, and `app_id` for
+Google's browser picker. The token belongs to the account that authorized the grant.
+This endpoint requires contributor access to a writable project and a valid, unused
+grant belonging to that user and project. It returns `Cache-Control: no-store`, never
+returns a refresh token or client secret, and does not spend the grant. The frontend
+must keep the response in memory only and dispose the picker on selection/cancellation.
+Select a spreadsheet for Google Sheets or a folder for Google Drive, then create the
+connection with the selected ID and the same grant. It uses the existing connection
+request rate and concurrency limits. A missing picker configuration returns
+`503 GOOGLE_PICKER_NOT_CONFIGURED`; revoked or invalid grants return
+`422 GOOGLE_GRANT_INVALID`; a Google token failure returns `502 GOOGLE_PICKER_UNAVAILABLE`.
+
+Enable **Google Picker API** in the OAuth client's Google Cloud project and set:
+
+```dotenv
+GOOGLE_PICKER_API_KEY=<browser API key>
+GOOGLE_PICKER_APP_ID=<Cloud project number>
+```
+
+The app ID is the numeric **project number**, not the project ID. Restrict the browser
+key to **Google Picker API**, with Website restrictions allowing the frontend origin
+(for local use, `http://localhost:3000/*`) and `https://docs.google.com/*`.
+Restart the backend after changing these settings. With the local Docker stack, run
+`task up` to rebuild/recreate the API with the new environment; `task restart` alone
+does not reload environment variables. See the
+[Google Picker setup guide](https://developers.google.com/workspace/drive/picker/guides/web-picker).
 
 <a id="google-cloud-setup-for-connections"></a>
 **Google Cloud setup.** In the project that holds the OAuth client of [sign-in with Google](#sign-in-with-google) (the same client is used; sign-in itself does not have to be on):
@@ -736,6 +765,7 @@ The `q` parameter matches a substring, case-insensitively, and needs at least 3 
 | `POST` | `/projects/{id}/datasets/{dataset_id}/versions/from-connection` | Import it again as the next version |
 | `GET` `POST` | `/projects/{id}/connections` | List data connections (`q`); test and save a new one (`kind`: `postgres`, `mysql`, `bigquery`, `google_sheets`, `google_drive`, `prometheus`, `influxdb`) |
 | `GET` | `/projects/{id}/connections/google/start` | Browser navigation: to Google, to give read access to Drive |
+| `POST` | `/projects/{id}/connections/google/picker` | Short-lived Google Picker credentials for the user's project grant; requires CSRF |
 | `GET` | `/connections/google/callback` | Where Google sends the browser back; redirects to the frontend with `google_grant` or `error` |
 | `POST` | `/projects/{id}/connections/{connection_id}/reauthorize` | Give a Google connection a fresh access to the same Google account |
 | `GET` `PATCH` `DELETE` | `/projects/{id}/connections/{connection_id}` | Read; rename; delete with its stored credentials |

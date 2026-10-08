@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import (
     BaseModel,
     Field,
@@ -68,6 +68,8 @@ from platform_be.services.connectors.http_source import parse_server_url
 from platform_be.services.connectors.network_guard import is_host
 from platform_be.services.connectors.timeseries import LiveWindow, live_source
 from platform_be.services.connectors.values import approximate_size, to_text
+from platform_be.services.google_drive_oauth import GoogleAccessRevoked
+from platform_be.services.google_oauth import GoogleOAuthError
 from platform_be.services.secret_box import SecretBox, SecretBoxError, get_secret_box
 
 router = APIRouter(prefix="/projects/{project_id}/connections", tags=["data connections"])
@@ -794,6 +796,81 @@ async def _use_grant(
     )
     if used.rowcount != 1:
         raise _grant_invalid()
+
+
+class GooglePickerRequest(BaseModel, extra="forbid"):
+    grant_id: UUID
+
+
+class GooglePickerCredentials(BaseModel):
+    access_token: str = Field(repr=False)
+    api_key: str = Field(repr=False)
+    app_id: str
+
+
+@router.post(
+    "/google/picker",
+    response_model=ApiResponse[GooglePickerCredentials],
+    summary="Open Google Picker using the account that authorized this grant",
+    description=(
+        "Returns a short-lived access token for the browser's Google Picker. Requires CSRF, "
+        "contributor access and an unused grant owned by this user and project. Does not spend "
+        "the grant: use it to create the connection after choosing a spreadsheet or folder. "
+        "Never persist or log this response. Refresh tokens and client secrets are not returned."
+    ),
+    responses={
+        **PROBE_ERRORS,
+        422: {"model": ErrorResponse, "description": "Invalid or revoked Google grant"},
+        502: {"model": ErrorResponse, "description": "Google could not issue an access token"},
+    },
+)
+async def google_picker_credentials(
+    project_id: UUID,
+    body: GooglePickerRequest,
+    request: Request,
+    response: Response,
+    principal: Principal = Depends(require_active_csrf),
+    db: AsyncSession = Depends(get_db),
+    box: SecretBox | None = Depends(get_secret_box),
+    gate: ConnectionGate = Depends(get_connection_gate),
+) -> ApiResponse[GooglePickerCredentials]:
+    response.headers["Cache-Control"] = "no-store"
+    project, _ = await require_project_access(db, principal, project_id, contribute=True)
+    ensure_writable_project(project)
+    box = _require_box(box)
+    settings = request.app.state.settings
+    if not (settings.google_picker_api_key and settings.google_picker_app_id):
+        raise APIError(
+            503,
+            "GOOGLE_PICKER_NOT_CONFIGURED",
+            "Google Drive file selection is not configured here.",
+        )
+    gate.check_rate(principal.user.id)
+    access = await _google_access(request, db, box, principal, project_id, body.grant_id)
+    await db.commit()
+    try:
+        async with gate.slot(project_id, principal.user.id):
+            token = await request.app.state.google_drive_oauth.access_token(
+                access.secret["refresh_token"]
+            )
+    except GoogleAccessRevoked:
+        raise _grant_invalid() from None
+    except GoogleOAuthError:
+        raise APIError(
+            502, "GOOGLE_PICKER_UNAVAILABLE", "Google Drive could not be reached. Please try again."
+        ) from None
+    # Access or grant ownership may have changed while Google was being contacted.
+    project, _ = await require_project_access(db, principal, project_id, contribute=True)
+    ensure_writable_project(project)
+    await _google_access(request, db, box, principal, project_id, body.grant_id)
+    await db.commit()
+    return ok(
+        GooglePickerCredentials(
+            access_token=token,
+            api_key=settings.google_picker_api_key.get_secret_value(),
+            app_id=settings.google_picker_app_id,
+        )
+    )
 
 
 def _audit_failed_test(
