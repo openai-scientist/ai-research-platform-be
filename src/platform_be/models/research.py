@@ -23,9 +23,9 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from platform_be.db.base import Base
 
-ACTIVE_RUN_STATUSES = ("queued", "running", "awaiting_review")
+ACTIVE_RUN_STATUSES = ("queued", "running", "paused", "awaiting_review")
 FINISHED_RUN_STATUSES = ("completed", "budget_exceeded", "failed")
-_ACTIVE_RUN = text("status IN ('queued', 'running', 'awaiting_review')")
+_ACTIVE_RUN = text("status IN ('queued', 'running', 'paused', 'awaiting_review')")
 _PENDING_REVIEW = text("submitted_at IS NULL")
 
 
@@ -53,12 +53,12 @@ class ResearchContext(Base):
 
 
 class ResearchRun(Base):
-    """One execution of Popper on a fixed dataset version and research context version."""
+    """One execution of Popper on a fixed dataset version or research topic."""
 
     __tablename__ = "research_runs"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('queued', 'running', 'awaiting_review', 'completed', "
+            "status IN ('queued', 'running', 'paused', 'awaiting_review', 'completed', "
             "'budget_exceeded', 'failed')",
             name="ck_research_runs_status",
         ),
@@ -77,15 +77,22 @@ class ResearchRun(Base):
     project_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False
     )
-    dataset_version_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("dataset_versions.id", ondelete="RESTRICT"), nullable=False
+    dataset_version_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("dataset_versions.id", ondelete="RESTRICT"), nullable=True
     )
-    research_context_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("research_contexts.id", ondelete="RESTRICT"), nullable=False
+    research_context_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("research_contexts.id", ondelete="RESTRICT"), nullable=True
     )
     created_by_user_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
+    # Topic-to-hypothesis additions
+    topic: Mapped[str | None] = mapped_column(Text, nullable=True)
+    domains: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    review_mode: Mapped[str | None] = mapped_column(String(20), nullable=True, default="copilot")
+    last_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_source_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued")
     auto_review: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     budget_usd: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
@@ -101,6 +108,68 @@ class ResearchRun(Base):
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
         onupdate=lambda: datetime.now(UTC),
+    )
+
+
+class RunEvent(Base):
+    """One immutable event in the stream of a research run."""
+
+    __tablename__ = "run_events"
+    __table_args__ = (
+        CheckConstraint("seq >= 1", name="ck_run_events_seq"),
+        Index("ix_run_events_run_id_seq", "run_id", "seq"),
+        Index(
+            "run_events_source_seq",
+            "run_id",
+            "source_seq",
+            unique=True,
+            postgresql_where=text("source_seq IS NOT NULL"),
+        ),
+    )
+
+    run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("research_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    type: Mapped[str] = mapped_column(String(48), nullable=False)
+    stage_key: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    actor: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+
+
+class RunGate(Base):
+    """A human-in-the-loop review gate opened during a research run."""
+
+    __tablename__ = "run_gates"
+    __table_args__ = (
+        Index(
+            "uq_run_gates_open",
+            "run_id",
+            unique=True,
+            postgresql_where=text("answer IS NULL"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("research_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    gate_key: Mapped[str] = mapped_column(String(32), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    spec: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    opened_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    answer: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    answered_by_user_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
     )
 
 
