@@ -40,6 +40,7 @@ class PopperRunState:
     message: str | None = None
     review: dict[str, Any] | None = None
     review_sequence: int | None = None
+    last_source_seq: int | None = None
 
 
 class PopperClient(Protocol):
@@ -47,12 +48,15 @@ class PopperClient(Protocol):
         self,
         *,
         platform_run_id: UUID,
-        research_markdown: str,
-        dataset: IO[bytes],
-        dataset_filename: str,
-        budget_usd: Decimal,
-        auto_review: bool,
+        topic: str | None = None,
+        domains: list[str] | None = None,
+        review_mode: str = "copilot",
+        budget_usd: Decimal = Decimal("5.00"),
         callback_url: str,
+        research_markdown: str | None = None,
+        dataset: IO[bytes] | None = None,
+        dataset_filename: str | None = None,
+        auto_review: bool = False,
     ) -> str:
         """Start a run and return Popper's id for it.
 
@@ -67,6 +71,25 @@ class PopperClient(Protocol):
         self, popper_run_id: str, *, review_sequence: int, decision: dict[str, Any]
     ) -> None:
         """Send a frame review decision. Repeating a sequence must have no further effect."""
+
+    async def fetch_events(
+        self, popper_run_id: str, *, after_source_seq: int = 0, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        """Fetch missed events from Popper for synchronization."""
+
+    async def answer_gate(
+        self, popper_run_id: str, *, gate_id: str, decision: dict[str, Any]
+    ) -> None:
+        """Send a human decision for a screen review gate."""
+
+    async def pause(self, popper_run_id: str) -> None:
+        """Pause a run at the next safe checkpoint."""
+
+    async def resume(self, popper_run_id: str) -> None:
+        """Resume a paused run."""
+
+    async def cancel(self, popper_run_id: str) -> None:
+        """Cancel and terminate a running job."""
 
 
 def _error_message(response: httpx.Response) -> str:
@@ -93,6 +116,7 @@ def _run_state(body: Any) -> PopperRunState:
         raise PopperUncertain("Popper returned an unreadable cost")
     review = body.get("review")
     sequence = body.get("review_sequence")
+    last_source_seq = body.get("last_source_seq")
     return PopperRunState(
         popper_run_id=str(body["popper_run_id"]),
         status=str(body["status"]),
@@ -101,6 +125,9 @@ def _run_state(body: Any) -> PopperRunState:
         review=review if isinstance(review, dict) else None,
         review_sequence=(
             sequence if type(sequence) is int and 0 < sequence < 2_147_483_648 else None
+        ),
+        last_source_seq=(
+            last_source_seq if type(last_source_seq) is int and last_source_seq >= 0 else None
         ),
     )
 
@@ -152,28 +179,45 @@ class HttpPopperClient:
         self,
         *,
         platform_run_id: UUID,
-        research_markdown: str,
-        dataset: IO[bytes],
-        dataset_filename: str,
-        budget_usd: Decimal,
-        auto_review: bool,
+        topic: str | None = None,
+        domains: list[str] | None = None,
+        review_mode: str = "copilot",
+        budget_usd: Decimal = Decimal("5.00"),
         callback_url: str,
+        research_markdown: str | None = None,
+        dataset: IO[bytes] | None = None,
+        dataset_filename: str | None = None,
+        auto_review: bool = False,
     ) -> str:
+        if topic is not None:
+            payload = {
+                "platform_run_id": str(platform_run_id),
+                "topic": topic,
+                "domains": domains or [],
+                "review_mode": review_mode,
+                "budget_usd": str(budget_usd),
+                "callback_url": callback_url,
+            }
+            response = await self._request("POST", "/runs", json=payload)
+            if response.status_code >= 400:
+                raise PopperRejected(_error_message(response))
+            return _run_state(self._json(response)).popper_run_id
+
         config = {
             "platform_run_id": str(platform_run_id),
             "budget_usd": str(budget_usd),
             "auto": auto_review,
             "callback_url": callback_url,
         }
-        response = await self._request(
-            "POST",
-            "/runs",
-            files={
-                "research": ("research.md", research_markdown.encode("utf-8"), "text/markdown"),
-                "data": (dataset_filename, dataset, "text/csv"),
-                "config": ("config.json", json.dumps(config).encode("utf-8"), "application/json"),
-            },
-        )
+        files: dict[str, Any] = {
+            "config": ("config.json", json.dumps(config).encode("utf-8"), "application/json"),
+        }
+        if research_markdown is not None:
+            files["research"] = ("research.md", research_markdown.encode("utf-8"), "text/markdown")
+        if dataset is not None and dataset_filename:
+            files["data"] = (dataset_filename, dataset, "text/csv")
+
+        response = await self._request("POST", "/runs", files=files)
         if response.status_code >= 400:
             raise PopperRejected(_error_message(response))
         return _run_state(self._json(response)).popper_run_id
@@ -209,6 +253,55 @@ class HttpPopperClient:
             raise PopperNotFound(popper_run_id)
         if response.status_code >= 400:
             raise PopperRejected(_error_message(response))
+
+    async def fetch_events(
+        self, popper_run_id: str, *, after_source_seq: int = 0, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        response = await self._request(
+            "GET",
+            f"/runs/{popper_run_id}/events",
+            params={"after_source_seq": after_source_seq, "limit": limit},
+        )
+        if response.status_code == 404:
+            raise PopperNotFound(popper_run_id)
+        if response.status_code >= 400:
+            raise PopperUncertain(_error_message(response))
+        body = self._json(response)
+        return body.get("events", []) if isinstance(body, dict) else []
+
+    async def answer_gate(
+        self, popper_run_id: str, *, gate_id: str, decision: dict[str, Any]
+    ) -> None:
+        response = await self._request(
+            "POST",
+            f"/runs/{popper_run_id}/gates/{gate_id}",
+            json=decision,
+        )
+        if response.status_code == 404:
+            raise PopperNotFound(popper_run_id)
+        if response.status_code >= 400:
+            raise PopperRejected(_error_message(response))
+
+    async def pause(self, popper_run_id: str) -> None:
+        response = await self._request("POST", f"/runs/{popper_run_id}/pause")
+        if response.status_code == 404:
+            raise PopperNotFound(popper_run_id)
+        if response.status_code >= 400:
+            raise PopperUncertain(_error_message(response))
+
+    async def resume(self, popper_run_id: str) -> None:
+        response = await self._request("POST", f"/runs/{popper_run_id}/resume")
+        if response.status_code == 404:
+            raise PopperNotFound(popper_run_id)
+        if response.status_code >= 400:
+            raise PopperUncertain(_error_message(response))
+
+    async def cancel(self, popper_run_id: str) -> None:
+        response = await self._request("POST", f"/runs/{popper_run_id}/cancel")
+        if response.status_code == 404:
+            raise PopperNotFound(popper_run_id)
+        if response.status_code >= 400:
+            raise PopperUncertain(_error_message(response))
 
 
 def build_popper_client(settings: Settings) -> PopperClient | None:
