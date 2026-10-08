@@ -20,7 +20,10 @@ class Settings(BaseSettings):
     debug: bool = False
     api_prefix: str = "/api/v1"
     database_url: str = "postgresql+asyncpg://platform:platform@localhost:5432/platform"
-    cors_allowed_origins: str = "http://localhost:3000,http://localhost:5173"
+    cors_allowed_origins: str = (
+        "http://localhost:3000,http://localhost:5173,http://localhost:5500,"
+        "http://127.0.0.1:3000,http://127.0.0.1:5173,http://127.0.0.1:5500"
+    )
     session_cookie_name: str = "platform_session"
     session_signing_secret: SecretStr = SecretStr("local-only-session-secret-change-me-32")
     cookie_secure: bool = False
