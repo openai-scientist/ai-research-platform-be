@@ -24,8 +24,8 @@ The research itself is done by **Popper**, a separate service. The Platform send
 
 - **Accounts and sessions**: email and password sign-up with an emailed 6-digit code, sign-in with Google, cookie sessions with CSRF protection, password reset, profile pictures, accounts created by an admin.
 - **Projects and members**: five fixed roles, invitations by email that expire after 24 hours, archive and restore, no hard delete.
-- **Research inputs**: versioned CSV datasets (uploaded, or imported through a data connection to PostgreSQL, MySQL, BigQuery, a Google spreadsheet, a Google Drive folder, Prometheus or InfluxDB), project files, a versioned research context.
-- **Runs**: one run at a time per project, sent to Popper with a spending cap; frame review; result files.
+- **Research inputs**: versioned CSV datasets (uploaded, or imported through a data connection to PostgreSQL, MySQL, BigQuery, a Google spreadsheet, a Google Drive folder, Prometheus or InfluxDB), project files, a research topic and domains.
+- **Runs**: topic-to-hypothesis runs, one at a time per project, sent to Popper with a spending cap; frame review; result files.
 - **Collaboration**: comments on runs and result files, notifications over SSE, an audit log of every change.
 
 ## Tech stack
@@ -144,7 +144,7 @@ docker stop connector-test-mysql
 PLATFORM_BIGQUERY_TEST_SERVICE_ACCOUNT=/path/to/key.json uv run pytest tests/test_bigquery_connector.py
 ```
 
-**Public databases.** `tests/test_live_connectors.py` takes the whole flow, from a new connection to a run, through Rfam (MySQL), RNAcentral (PostgreSQL, password on its [help page](https://rnacentral.org/help/public-database)) and, with the key file above, BigQuery. CI never runs it.
+**Public databases.** `tests/test_live_connectors.py` checks connections, browsing, preview and dataset import against Rfam (MySQL), RNAcentral (PostgreSQL, password on its [help page](https://rnacentral.org/help/public-database)) and, with the key file above, BigQuery. CI never runs it.
 
 ```bash
 PLATFORM_LIVE_CONNECTOR_TESTS=1 PLATFORM_LIVE_RNACENTRAL_PASSWORD=... uv run pytest tests/test_live_connectors.py -s
@@ -203,10 +203,9 @@ Invite members by email              registered users only; role: project_manage
    ↓
 The invited user accepts             within 24 hours; no access to the project before that
    ↓
-Upload a dataset (CSV), or import    project: draft → data_ready
-one through a data connection
+Add project data (optional): upload a CSV or import one through a data connection
    ↓
-Write the research context           every save is a new version
+Choose a research topic and domains; a run does not require a dataset
    ↓
 Start a run                          project: researching    run: queued → running
    ↓
@@ -215,7 +214,8 @@ Popper asks for a frame review       project: needs_review   run: awaiting_revie
 A Project Manager or Researcher decides: approve / edit / reject
    ↓                                 project: researching    run: running   (may repeat)
 Popper delivers the result files and finishes
-   ↓                                 project: data_ready     run: completed | budget_exceeded | failed
+   ↓                                 project: data_ready if it has datasets, otherwise draft
+                                     run: completed | budget_exceeded | failed
 Members read the results, download files, comment
    ↓
 Start another run, or the Project Manager marks the project completed
@@ -246,7 +246,7 @@ Derived from what the project contains; it is never set by hand, except `complet
 ### Rules that always hold
 
 - A project works on **one run at a time** (`RUN_ACTIVE`).
-- **Nothing is overwritten.** A new dataset file is a new version, saving the research context adds a version, and result files cannot be replaced. A run always points at the exact versions it used.
+- **Nothing is overwritten.** A new dataset file is a new version, and result files cannot be replaced. Historical runs retain the dataset and research-context references they were created with.
 - **There is no hard delete.** A project is archived (read-only, restorable); removing a member revokes the membership; a deleted comment keeps its place with the text erased.
 - A project always keeps one active Project Manager: the last one cannot be demoted or removed (`LAST_PROJECT_MANAGER`).
 - Suspending a user is refused while they are the only Project Manager of any project, also one they work in alone. Give the project another manager first.
@@ -263,7 +263,7 @@ There are five fixed roles. A role alone decides access: there is no permission 
 | `user` | Platform | The role of every new account, self-registered or created by an admin. Signs in, creates projects, can be added to projects. It is not stored: an account without the Platform Admin role is a `user`. |
 | `platform_admin` | Platform | System tasks: suspend users, grant Platform Admin, see and manage every project, read the global audit log and the cost report. |
 | `project_manager` | Project | Given to whoever creates the project. Edits project details, manages members, archives, completes, reads the project audit log, and everything a Researcher does. |
-| `researcher` | Project | Uploads datasets, writes the research context, starts runs, decides frame reviews, comments. |
+| `researcher` | Project | Uploads datasets, starts runs, decides frame reviews, comments. |
 | `reviewer` | Project | Reads everything in the project and comments. Changes nothing else. |
 
 Someone who is not a member gets `404` for everything in a project, so its existence is not revealed. A member whose role is too low gets `403 ROLE_REQUIRED`.
@@ -285,13 +285,12 @@ Someone who is not a member gets `404` for everything in a project, so its exist
 
 | Action | Platform Admin | Project Manager | Researcher | Reviewer |
 |---|:-:|:-:|:-:|:-:|
-| Read datasets, research context, runs, reviews, result files, comments | ✓ | ✓ | ✓ | ✓ |
+| Read datasets, runs, reviews, result files, comments | ✓ | ✓ | ✓ | ✓ |
 | Download dataset and result files | ✓ | ✓ | ✓ | ✓ |
 | Upload a dataset or a new version; rename a dataset | ✓ | ✓ | ✓ | 403 |
 | Upload or delete a project file | ✓ | ✓ | ✓ | 403 |
 | List data connections (never their credentials) | ✓ | ✓ | ✓ | ✓ |
 | Create, rename, delete or test a data connection; browse and preview through it; import from it | ✓ | ✓ | ✓ | 403 |
-| Save the research context | ✓ | ✓ | ✓ | 403 |
 | Start or sync a run; decide a frame review | ✓ | ✓ | ✓ | 403 |
 | Abandon a run | ✓ | ✓ | 403 | 403 |
 | Comment; edit own comment | ✓ | ✓ | ✓ | ✓ |
@@ -424,19 +423,16 @@ Checked on 2026-10-08 against the Prometheus project's public demo (3.13.0) and 
 
 ### Project files
 
-Documents attached to a project: PDF, CSV and Excel (`.xlsx`, `.xls`), up to 50 MiB each by default (`PROJECT_FILE_MAX_UPLOAD_BYTES`). They are reference material for the members and are never sent to Popper; data for a run is uploaded as a dataset.
+Documents attached to a project: PDF, CSV and Excel (`.xlsx`, `.xls`), up to 50 MiB each by default (`PROJECT_FILE_MAX_UPLOAD_BYTES`). They are reference material for members and are never sent to Popper. Datasets are versioned project data; topic runs are started independently with a topic and domains.
 
 The type comes from the file name, not from the content type the browser sends, and the first bytes must match it: a renamed file is refused with `INVALID_FILE`. Files are downloaded as attachments, never rendered by the API.
 
-### Research context
-
-A Markdown body plus optional structured fields: `domain`, `objectives`, `variables`, `design`, `assumptions`, `constraints`, `concepts`, `notes`. Together they become the `research.md` file Popper reads, with the structured fields as its YAML front matter.
-
-Send `base_version` when saving. If someone else saved first, the answer is `409 RESEARCH_CONTEXT_CONFLICT` instead of silently replacing their work.
-
 ### Runs
 
-`POST /projects/{id}/runs` fixes one dataset version and one research context version, checks that every variable the context names is a column of the dataset, and sends both to Popper with a spending cap (`RUN_DEFAULT_BUDGET_USD`, at most `RUN_MAX_BUDGET_USD`).
+`POST /projects/{id}/runs` starts a topic-to-hypothesis run. Supply a `topic`, at least one entry in `domains`, and an optional `review_mode` (`copilot` or `auto`). The server sends these inputs to Popper with a spending cap (`RUN_DEFAULT_BUDGET_USD`, at most `RUN_MAX_BUDGET_USD`).
+
+Run responses keep `research_context_id` and `research_context_version` for historical runs. New topic runs leave those fields null; saved context records remain in the database for history and are no longer readable or writable through an API.
+Requests using retired fields such as `dataset_version_id`, `research_context_version` or `auto_review` are rejected with `422 VALIDATION_ERROR`.
 
 When a run does not move:
 
@@ -750,15 +746,13 @@ The `q` parameter matches a substring, case-insensitively, and needs at least 3 
 | `POST` | `/projects/{id}/connections/{connection_id}/preview` | First rows of a table, a `SELECT` or a time series, as text |
 | `POST` | `/projects/{id}/connections/{connection_id}/live` | `prometheus` and `influxdb`: the latest points of a metric, for a chart that polls |
 
-### Project files and research context
+### Project files
 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` `POST` | `/projects/{id}/files` | List files (`q`, `kind`); upload a PDF, CSV or Excel file (multipart: `file`) |
 | `GET` | `/projects/{id}/files/{file_id}/download` | Download a file |
 | `DELETE` | `/projects/{id}/files/{file_id}` | Delete a file |
-| `GET` `PUT` | `/projects/{id}/research-context` | Newest research context; save a new version |
-| `GET` | `/projects/{id}/research-context/versions`, `/versions/{n}` | Version history; one version |
 
 ### Runs, review, and results
 
