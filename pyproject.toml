@@ -17,7 +17,6 @@ dependencies = [
     # 1.2.1 to 1.2.3 fail the first sign-in of a MySQL 8 account made without TLS.
     "pymysql>=1.1.1,<1.2.1",
     "python-multipart>=0.0.18,<1",
-    "pyyaml>=6,<7",
     "sqlalchemy[asyncio]>=2.0,<3",
     "uvicorn[standard]>=0.30,<1",
 ]
