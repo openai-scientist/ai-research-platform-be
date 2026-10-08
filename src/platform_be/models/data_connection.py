@@ -24,7 +24,8 @@ class DataConnection(Base):
     __tablename__ = "data_connections"
     __table_args__ = (
         CheckConstraint(
-            "kind IN ('postgres', 'mysql', 'bigquery', 'google_sheets', 'google_drive')",
+            "kind IN ('postgres', 'mysql', 'bigquery', 'google_sheets', 'google_drive', "
+            "'prometheus', 'influxdb')",
             name="ck_data_connections_kind",
         ),
         Index("ix_data_connections_project_created", "project_id", "created_at"),

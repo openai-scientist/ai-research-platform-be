@@ -16,10 +16,17 @@ from platform_be.services.connectors.base import Column, ConnectorError
 from platform_be.services.connectors.gate import ConnectionGate
 from tests.conftest import ORIGIN, Harness, login, mutation_headers
 from tests.fakes import FakeTable
-from tests.test_connection_browse_api import connected_project, external_database, failure
+from tests.test_connection_browse_api import (
+    SERIES,
+    connected_project,
+    external_database,
+    failure,
+)
 from tests.test_connections_api import audit_events, create_connection, wait_until
 from tests.test_datasets_api import CSV, upload_dataset
 from tests.test_projects_api import PROJECTS, add_member, create_project
+from tests.test_prometheus_connection_api import SERIES as PROMETHEUS_SERIES
+from tests.test_prometheus_connection_api import connected_prometheus, with_prometheus
 from tests.test_research_context_api import FRONT_MATTER, save_context
 from tests.test_runs_api import start_run
 
@@ -659,3 +666,132 @@ async def test_a_file_whose_storing_is_interrupted_is_taken_back_out(tmp_path) -
     with io.BytesIO(CSV) as handle, pytest.raises(asyncio.CancelledError):
         await dataset_ingest.store_csv(handle, store, "projects/p/datasets/d/v/original.csv")
     assert stored_files(tmp_path) == []
+
+
+async def test_a_database_connection_does_not_import_a_time_series(
+    harness: Harness, tmp_path
+) -> None:
+    async with harness.client() as client:
+        session, project, connection_id = await imported_project(harness, client)
+        created = await import_dataset(client, session, project["id"], connection_id)
+        assert created.status_code == 201, created.text
+        dataset_id = created.json()["data"]["id"]
+        built, files = len(harness.connectors.built), len(stored_files(tmp_path))
+
+        for refused in (
+            await import_dataset(
+                client, session, project["id"], connection_id, SERIES, name="Requests"
+            ),
+            await import_version(client, session, project["id"], dataset_id, connection_id, SERIES),
+        ):
+            assert failure(refused) == (422, "SOURCE_INVALID", "unsupported_source")
+
+    # Refused before anything was done: only the first import is on record.
+    assert len(harness.connectors.built) == built
+    assert len(stored_files(tmp_path)) == files
+    assert len(await audit_events(harness, "connection.import_started")) == 1
+    async with harness.factory() as db:
+        assert len(list(await db.scalars(select(Dataset)))) == 1
+        assert len(list(await db.scalars(select(DatasetVersion)))) == 1
+
+
+async def test_a_time_series_is_imported_with_the_whole_form_it_was_read_by(
+    harness: Harness,
+) -> None:
+    with_prometheus(harness)
+    # The same span, as a browser east of UTC sends it.
+    form = PROMETHEUS_SERIES | {
+        "start": "2026-10-01T07:00:00+07:00",
+        "end": "2026-10-01T10:00:00+07:00",
+    }
+    points = (
+        b"time,host,value\r\n"
+        b"2026-10-01T00:00:00Z,a,1.5\r\n"
+        b"2026-10-01T00:00:00Z,b,5\r\n"
+        b"2026-10-01T01:00:00Z,a,10\r\n"
+        b"2026-10-01T02:00:00Z,b,2.5\r\n"
+    )
+    async with harness.client() as client:
+        session, project, url = await connected_prometheus(harness, client)
+        connection_id = url.rsplit("/", 1)[1]
+
+        created = await import_dataset(
+            client, session, project["id"], connection_id, form, name="Latency"
+        )
+        assert created.status_code == 201, created.text
+        dataset = created.json()["data"]
+        first = dataset["latest_version"]
+        assert first["column_names"] == ["time", "host", "value"]
+        assert first["row_count"] == 4
+        assert first["original_filename"] == "latency.csv"
+        fetched_at = first["source"].pop("fetched_at")
+        # Every choice of the form, the times in UTC: enough to read the same span again.
+        assert first["source"] == {
+            "connection_id": connection_id,
+            "connection_name": "Metrics",
+            "connection_kind": "prometheus",
+            "source": PROMETHEUS_SERIES,
+        }
+        download = await client.get(
+            f"{PROJECTS}/{project['id']}/datasets/{dataset['id']}/versions/{first['id']}/download"
+        )
+        assert download.content == points
+
+        # Reading the stored source again gives the next version, fetched later.
+        second = await import_version(
+            client, session, project["id"], dataset["id"], connection_id, first["source"]["source"]
+        )
+        assert second.status_code == 201, second.text
+        second = second.json()["data"]
+        assert (second["version_number"], second["sha256"]) == (2, first["sha256"])
+        assert second["source"]["source"] == PROMETHEUS_SERIES
+        assert second["source"]["fetched_at"] > fetched_at
+
+    started = await audit_events(harness, "connection.import_started")
+    assert [event.details for event in started] == [
+        {
+            "source_type": "timeseries",
+            "name": "latency",
+            "start": "2026-10-01T00:00:00Z",
+            "end": "2026-10-01T03:00:00Z",
+            "bucket": "1h",
+            "aggregate": "mean",
+        }
+    ] * 2
+
+
+async def test_a_time_series_that_cannot_be_a_dataset_says_what_to_change_in_the_form(
+    harness: Harness, tmp_path
+) -> None:
+    with_prometheus(harness)
+    async with harness.client() as client:
+        session, project, url = await connected_prometheus(harness, client)
+        connection_id = url.rsplit("/", 1)[1]
+
+        async def attempt(**changes: object):
+            return await import_dataset(
+                client, session, project["id"], connection_id, PROMETHEUS_SERIES | changes
+            )
+
+        # A metric with no point in the span: the server may no longer keep that time.
+        empty = await attempt(name="http_requests_total", tags=[])
+        assert failure(empty) == (422, "INVALID_DATASET", None)
+        assert "no rows" in empty.json()["message"]
+
+        harness.settings.dataset_max_upload_bytes = 64
+        too_large = await attempt()
+        assert failure(too_large) == (413, "DATASET_TOO_LARGE", None)
+        # There is no SELECT statement to narrow a form with.
+        assert "larger bucket" in too_large.json()["message"]
+        assert "SELECT" not in too_large.json()["message"]
+        harness.settings.dataset_max_upload_bytes = 52_428_800
+
+        # The bucket of a live view is not one to import by.
+        assert failure(await attempt(bucket="15s")) == (422, "VALIDATION_ERROR", None)
+        for other in (TABLE, QUERY):
+            refused = await import_dataset(client, session, project["id"], connection_id, other)
+            assert failure(refused) == (422, "SOURCE_INVALID", "unsupported_source")
+
+        assert (await client.get(f"{PROJECTS}/{project['id']}/datasets")).json()["data"] == []
+    assert stored_files(tmp_path) == []
+    assert harness.app.state.connection_gate._active == 0

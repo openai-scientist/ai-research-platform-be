@@ -33,7 +33,7 @@ SHEET_ID = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
 FOLDER_NAME = "Survey data"
 NEW_REFRESH_TOKEN = "second-refresh-token-never-shown-either"
 SCORES_CSV = b'student,school,score\r\nAn,A,7.5\r\nBinh,"B, north",8\r\nChi,,6.25\r\n'
-COLUMNS = [{"name": name, "type": "text"} for name in ["student", "school", "score"]]
+COLUMNS = [{"name": name, "type": "text", "role": None} for name in ["student", "school", "score"]]
 
 
 def with_drive(harness: Harness) -> FakeGoogleDrive:
@@ -174,7 +174,7 @@ async def test_a_folder_is_connected_browsed_and_previewed(google_harness: Harne
         assert sheet.json()["data"]["rows"] == [["An", "A", "7.5"], ["Binh", None, "8"]]
         book = await preview(client, session, url, source("book.xlsx", "Second"))
         assert book.json()["data"] == {
-            "columns": [{"name": "only", "type": "text"}],
+            "columns": [{"name": "only", "type": "text", "role": None}],
             "rows": [["1"]],
             "truncated": False,
         }

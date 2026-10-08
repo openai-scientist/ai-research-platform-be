@@ -14,6 +14,7 @@ from platform_be.api.v1.connections import (
     READ_ERRORS,
     SavedConnection,
     reading,
+    require_supported_source,
     saved_connection,
     source_audit_details,
 )
@@ -30,7 +31,12 @@ from platform_be.services.access import (
 )
 from platform_be.services.audit import record_audit
 from platform_be.services.connectors import ConnectorFactory, get_connector_factory
-from platform_be.services.connectors.base import ConnectorError, QuerySource, Source
+from platform_be.services.connectors.base import (
+    ConnectorError,
+    QuerySource,
+    Source,
+    TimeSeriesSource,
+)
 from platform_be.services.connectors.csv_export import (
     CellTooLarge,
     EmptyResult,
@@ -104,6 +110,8 @@ class DatasetVersionItem(BaseModel):
             "For a version read from a data connection: `connection_id`, `connection_name`, "
             "`connection_kind`, the `source` that was read and `fetched_at`. They describe "
             "the connection as it was then; it may have been renamed or deleted since. "
+            "The `source` of a time series holds the whole form: the metric, the fields "
+            "and tags, `start` and `end` in UTC, the bucket and the aggregate. "
             "Null for an upload."
         )
     )
@@ -136,7 +144,12 @@ class DatasetPatch(BaseModel):
 
 class ImportVersion(BaseModel, extra="forbid"):
     connection_id: UUID
-    source: Source = Field(description="One table or view, or one SELECT statement.")
+    source: Source = Field(
+        description=(
+            "One table or view, one SELECT statement, or for a `prometheus` or `influxdb` "
+            "connection one metric or measurement over a span of time."
+        )
+    )
 
 
 class ImportDataset(ImportVersion):
@@ -273,7 +286,8 @@ async def _receive_csv(
 def _import_filename(source: Source) -> str:
     if isinstance(source, QuerySource):
         return "query.csv"
-    # Room is left for the extension: a table name can be longer than a file name may be.
+    # A table or a metric, by its name. Room is left for the extension: the name can be
+    # longer than a file name may be.
     return safe_filename(source.name, "table")[:196] + ".csv"
 
 
@@ -294,6 +308,9 @@ async def _fetch_csv(
     early, nothing has been stored yet.
     """
     settings = request.app.state.settings
+    require_supported_source(saved.kind, source)
+    # A form has no SELECT statement to narrow it with.
+    series = isinstance(source, TimeSeriesSource)
     # Committed before the query runs, so one that fails or never returns is on record too.
     record_audit(
         db,
@@ -341,14 +358,22 @@ async def _fetch_csv(
             413,
             "DATASET_TOO_LARGE",
             f"The rows take more than {settings.dataset_max_upload_bytes} bytes as CSV. "
-            "Import fewer rows or columns with a SELECT statement.",
+            + (
+                "Choose a larger bucket, a shorter span or fewer tags."
+                if series
+                else "Import fewer rows or columns with a SELECT statement."
+            ),
         ) from None
     except CellTooLarge as exc:
         raise APIError(
             422,
             "SOURCE_INVALID",
             f"A value in column {exc.column!r} is longer than {exc.limit} characters. "
-            "Leave the column out or shorten it in a SELECT statement.",
+            + (
+                "Leave the column out."
+                if series
+                else "Leave the column out or shorten it in a SELECT statement."
+            ),
             reason="cell_too_large",
         ) from None
     except BaseException:
@@ -367,7 +392,8 @@ def _import_source(
         "connection_id": str(connection_id),
         "connection_name": saved.name,
         "connection_kind": saved.kind,
-        "source": source.model_dump(by_alias=True),
+        # As JSON: the times of a time series are stored as text.
+        "source": source.model_dump(mode="json", by_alias=True),
         "fetched_at": fetched_at.isoformat().replace("+00:00", "Z"),
     }
     audit = {"connection_id": str(connection_id)}
@@ -508,7 +534,8 @@ async def create_dataset(
     status_code=201,
     summary="Import a new dataset from a data connection",
     description=(
-        "Reads one table or one SELECT statement through a saved connection and stores the "
+        "Reads one table, one SELECT statement or one time series through a saved connection "
+        "and stores the "
         "rows as version 1, a CSV file checked the way an upload is. The request stays open "
         "until the rows are in, which can take minutes: when it times out on the way, list "
         "the datasets before trying again, since the import may still have finished. "

@@ -10,6 +10,8 @@ from fastapi import Request
 from platform_be.core.errors import APIError
 
 _MAX_TRACKED_USERS = 4096
+# A live view asks again every few seconds; it is put on record once in this long.
+LIVE_VIEW_AUDIT_SECONDS = 600
 
 
 class _RateWindow:
@@ -64,6 +66,8 @@ class ConnectionGate:
         self._active = 0
         # Keyed by project and by user: neither one can take every slot of the process.
         self._active_by_owner: dict[UUID, int] = {}
+        # When the live view of a user, a connection and a metric was last put on record.
+        self._live_views: OrderedDict[tuple[UUID, UUID, str], float] = OrderedDict()
 
     def check_rate(self, user_id: UUID) -> None:
         """Count one attempt to reach a server: creating a connection or testing one."""
@@ -76,6 +80,28 @@ class ConnectionGate:
         connection cannot be pointed at new hosts the way an attempt can.
         """
         self._queries.check(user_id)
+
+    def first_view_in_window(self, user_id: UUID, connection_id: UUID, name: str) -> bool:
+        """Whether this live view is the one to put on record: the first of this user, this
+        connection and this metric, or the first since the last one on record grew old.
+
+        A view that is forgotten because the table is full is put on record once more.
+        """
+        key = (user_id, connection_id, name)
+        now = time.monotonic()
+        recorded = self._live_views.get(key)
+        if recorded is not None and now - recorded < LIVE_VIEW_AUDIT_SECONDS:
+            return False
+        # Put last again: the first of the table is the view longest on record.
+        self._live_views.pop(key, None)
+        self._live_views[key] = now
+        while len(self._live_views) > _MAX_TRACKED_USERS:
+            self._live_views.popitem(last=False)
+        return True
+
+    def forget_view(self, user_id: UUID, connection_id: UUID, name: str) -> None:
+        """Take back a view that could not be put on record after all: the next one is."""
+        self._live_views.pop((user_id, connection_id, name), None)
 
     @asynccontextmanager
     async def slot(self, project_id: UUID, user_id: UUID) -> AsyncIterator[None]:

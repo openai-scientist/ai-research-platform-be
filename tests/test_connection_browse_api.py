@@ -18,6 +18,16 @@ ORDERS = FakeTable(
     rows=[(n, f"note {n}", n % 2 == 0) for n in range(1, 151)],
 )
 TABLE = {"type": "table", "schema": "public", "name": "orders"}
+SERIES = {
+    "type": "timeseries",
+    "name": "orders",
+    "fields": ["id"],
+    "tags": [],
+    "start": "2026-10-01T00:00:00Z",
+    "end": "2026-10-02T00:00:00Z",
+    "bucket": "1h",
+    "aggregate": "mean",
+}
 
 
 def external_database(harness: Harness) -> None:
@@ -88,9 +98,9 @@ async def test_schemas_tables_and_columns_are_read_through_the_saved_connection(
         columns = await client.get(f"{url}/columns", params={"schema": "public", "table": "orders"})
         assert columns.status_code == 200, columns.text
         assert columns.json()["data"] == [
-            {"name": "id", "type": "integer"},
-            {"name": "note", "type": "text"},
-            {"name": "paid", "type": "boolean"},
+            {"name": "id", "type": "integer", "role": None},
+            {"name": "note", "type": "text", "role": None},
+            {"name": "paid", "type": "boolean", "role": None},
         ]
         missing = await client.get(f"{url}/columns", params={"schema": "public", "table": "gone"})
         assert failure(missing) == (422, "SOURCE_INVALID", "source_not_found")
@@ -117,9 +127,9 @@ async def test_a_preview_returns_the_first_rows_as_text_and_is_audited(harness: 
         assert first.status_code == 200, first.text
         data = first.json()["data"]
         assert data["columns"] == [
-            {"name": "id", "type": "integer"},
-            {"name": "note", "type": "text"},
-            {"name": "paid", "type": "boolean"},
+            {"name": "id", "type": "integer", "role": None},
+            {"name": "note", "type": "text", "role": None},
+            {"name": "paid", "type": "boolean", "role": None},
         ]
         assert len(data["rows"]) == 100
         assert data["rows"][:2] == [["1", "note 1", "false"], ["2", "note 2", "true"]]
@@ -139,7 +149,7 @@ async def test_a_preview_returns_the_first_rows_as_text_and_is_audited(harness: 
         queried = await preview(client, session, url, {"type": "query", "sql": f"  {sql}\n"})
         assert queried.status_code == 200, queried.text
         assert queried.json()["data"] == {
-            "columns": [{"name": "n", "type": "integer"}],
+            "columns": [{"name": "n", "type": "integer", "role": None}],
             "rows": [["1"]],
             "truncated": False,
         }
@@ -393,3 +403,52 @@ async def test_reads_share_the_slots_and_have_a_budget_of_their_own(harness: Har
 
     # None of these previews ran, so none is on record.
     assert await audit_events(harness, "connection.previewed") == []
+
+
+@pytest.mark.asyncio
+async def test_a_database_connection_does_not_preview_a_time_series(harness: Harness) -> None:
+    external_database(harness)
+    async with harness.client() as client:
+        session, _, url = await connected_project(harness, client)
+        built = len(harness.connectors.built)
+
+        refused = await preview(client, session, url, SERIES)
+        assert failure(refused) == (422, "SOURCE_INVALID", "unsupported_source")
+        # A form that does not hold together never gets as far as the kind of connection.
+        broken = await preview(client, session, url, SERIES | {"aggregate": None})
+        assert failure(broken) == (422, "VALIDATION_ERROR", None)
+
+    # Refused before anything was done: no server was contacted and nothing is on record.
+    assert len(harness.connectors.built) == built
+    assert harness.connectors.sources == []
+    assert await audit_events(harness, "connection.previewed") == []
+
+
+@pytest.mark.asyncio
+async def test_the_role_a_connector_gives_a_column_is_passed_on(harness: Harness) -> None:
+    harness.connectors.tables = {
+        ("default", "latency"): FakeTable(
+            columns=[
+                Column("time", "timestamp", "time"),
+                Column("host", "string", "tag"),
+                Column("value", "float", "field"),
+            ],
+            rows=[("2026-10-01T00:00:00Z", "a", 1.5)],
+        )
+    }
+    expected = [
+        {"name": "time", "type": "timestamp", "role": "time"},
+        {"name": "host", "type": "string", "role": "tag"},
+        {"name": "value", "type": "float", "role": "field"},
+    ]
+    async with harness.client() as client:
+        session, _, url = await connected_project(harness, client)
+
+        columns = await client.get(
+            f"{url}/columns", params={"schema": "default", "table": "latency"}
+        )
+        assert columns.json()["data"] == expected
+        shown = await preview(
+            client, session, url, {"type": "table", "schema": "default", "name": "latency"}
+        )
+        assert shown.json()["data"]["columns"] == expected

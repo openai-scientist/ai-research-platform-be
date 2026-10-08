@@ -10,6 +10,9 @@ from platform_be.services.connectors.base import Connector, ConnectorError
 from platform_be.services.connectors.bigquery import BigQueryConnector
 from platform_be.services.connectors.google_drive import GoogleDriveConnector
 from platform_be.services.connectors.google_sheets import GoogleSheetsConnector
+from platform_be.services.connectors.http_source import PinnedHttp, parse_server_url
+from platform_be.services.connectors.influxdb import InfluxConnector
+from platform_be.services.connectors.influxdb import authorization as influxdb_authorization
 from platform_be.services.connectors.mysql import MysqlConnector
 from platform_be.services.connectors.network_guard import (
     Resolver,
@@ -17,6 +20,8 @@ from platform_be.services.connectors.network_guard import (
     system_resolver,
 )
 from platform_be.services.connectors.postgres import PostgresConnector
+from platform_be.services.connectors.prometheus import PrometheusConnector
+from platform_be.services.connectors.prometheus import authorization as prometheus_authorization
 from platform_be.services.google_drive_oauth import GoogleDriveOAuth
 
 __all__ = [
@@ -45,12 +50,14 @@ class _DefaultConnectorFactory:
         executor: Executor,
         google_oauth: GoogleDriveOAuth | None,
         google_transport: httpx.AsyncBaseTransport | None,
+        http_transport: httpx.AsyncBaseTransport | None,
     ) -> None:
         self._settings = settings
         self._resolver = resolver
         self._executor = executor
         self._google_oauth = google_oauth
         self._google_transport = google_transport
+        self._http_transport = http_transport
 
     async def __call__(
         self, kind: str, config: dict[str, Any], secret: dict[str, Any]
@@ -123,6 +130,25 @@ class _DefaultConnectorFactory:
                     self._settings.connection_import_timeout_seconds,
                 ),
             )
+        if kind in ("prometheus", "influxdb"):
+            # Sent to the address just checked: the URL only says how to speak to it.
+            server = parse_server_url(config["url"])
+            http = PinnedHttp(
+                host,
+                scheme=server.scheme,
+                base_path=server.base_path,
+                authorization=(
+                    prometheus_authorization(secret)
+                    if kind == "prometheus"
+                    else influxdb_authorization(secret)
+                ),
+                connect_timeout=self._settings.connection_connect_timeout_seconds,
+                query_timeout=self._settings.connection_query_timeout_seconds,
+                transport=self._http_transport,
+            )
+            if kind == "prometheus":
+                return PrometheusConnector(http)
+            return InfluxConnector(http, config["database"])
         raise ValueError(f"Unsupported connection kind: {kind}")
 
 
@@ -144,9 +170,10 @@ def build_connector_factory(
     executor: Executor | None = None,
     google_oauth: GoogleDriveOAuth | None = None,
     google_transport: httpx.AsyncBaseTransport | None = None,
+    http_transport: httpx.AsyncBaseTransport | None = None,
 ) -> ConnectorFactory:
     """`google_oauth` is None while Google connections are off; `google_transport` stands in
-    for Google's API in tests."""
+    for Google's API in tests, and `http_transport` for the servers users point at."""
     if resolver is None:
         resolver = system_resolver(
             ThreadPoolExecutor(
@@ -160,6 +187,7 @@ def build_connector_factory(
         executor or build_connector_executor(settings),
         google_oauth,
         google_transport,
+        http_transport,
     )
 
 

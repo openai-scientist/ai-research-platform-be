@@ -7,6 +7,13 @@ real DNS answers too.
 The Google tests also need the PLATFORM_LIVE_GOOGLE_* variables: an OAuth client, a refresh
 token it was issued with the `drive.readonly` scope, and a spreadsheet and a folder that
 account can open. They only read.
+
+The time series tests need PLATFORM_LIVE_PROMETHEUS_URL and PLATFORM_LIVE_INFLUXDB_URL with
+PLATFORM_LIVE_INFLUXDB_DATABASE, and take the credentials of each from the variables beside
+them. The Prometheus server must keep the metric `up`, as one that scrapes anything does;
+the measurement of the InfluxDB database whose name sorts first needs a field of numbers
+written to in the last hour. PLATFORM_LIVE_INFLUXDB_PRIVATE=1 lets the InfluxDB server be a
+container on this machine: private hosts are then allowed for that test alone.
 """
 
 import json
@@ -24,6 +31,7 @@ from httpx import AsyncClient
 
 from platform_be.models.google_connection_grant import GoogleConnectionGrant
 from platform_be.services.connectors import build_connector_factory
+from platform_be.services.connectors.timeseries import time_text
 from platform_be.services.google_drive_oauth import build_google_drive_oauth
 from tests.conftest import (
     APP_URL,
@@ -52,6 +60,13 @@ GOOGLE_CLIENT_SECRET = os.environ.get("PLATFORM_LIVE_GOOGLE_CLIENT_SECRET")
 GOOGLE_REFRESH_TOKEN = os.environ.get("PLATFORM_LIVE_GOOGLE_REFRESH_TOKEN")
 GOOGLE_SPREADSHEET = os.environ.get("PLATFORM_LIVE_GOOGLE_SPREADSHEET")
 GOOGLE_FOLDER = os.environ.get("PLATFORM_LIVE_GOOGLE_FOLDER")
+PROMETHEUS_URL = os.environ.get("PLATFORM_LIVE_PROMETHEUS_URL")
+PROMETHEUS_USERNAME = os.environ.get("PLATFORM_LIVE_PROMETHEUS_USERNAME", "")
+PROMETHEUS_TOKEN = os.environ.get("PLATFORM_LIVE_PROMETHEUS_TOKEN", "")
+INFLUXDB_URL = os.environ.get("PLATFORM_LIVE_INFLUXDB_URL")
+INFLUXDB_DATABASE = os.environ.get("PLATFORM_LIVE_INFLUXDB_DATABASE")
+INFLUXDB_TOKEN = os.environ.get("PLATFORM_LIVE_INFLUXDB_TOKEN", "")
+INFLUXDB_PRIVATE = os.environ.get("PLATFORM_LIVE_INFLUXDB_PRIVATE") == "1"
 
 needs_google_client = pytest.mark.skipif(
     not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
@@ -102,11 +117,11 @@ class Steps:
         print(f"\n{self._label}: {json.dumps(self.seconds)}")
 
 
-async def connect(harness: Harness, client: AsyncClient, body: dict):
+async def connect(harness: Harness, client: AsyncClient, body: dict, *, private: bool = False):
     """A signed-in owner, their project and the answer to creating a connection in it."""
     if harness.app.state.connector_factory is harness.connectors:
         harness.app.state.connector_factory = build_connector_factory(harness.settings)
-    assert harness.settings.connection_allow_private_hosts is False
+    assert harness.settings.connection_allow_private_hosts is private
     session = await login(harness, client, uid="live", email="live@example.com")
     project = await create_project(client, session, name="Live sources")
     created = await client.post(
@@ -537,4 +552,242 @@ async def test_google_drive_from_connection_to_datasets(google_live: Harness) ->
             f"{url}/columns", params={"schema": "no file has this name", "table": "Sheet1"}
         )
         assert failure(missing) == (422, "SOURCE_INVALID", "source_not_found")
+    steps.show()
+
+
+def series_form(name: str, fields: list[str], tags: list[str], aggregate: str) -> dict:
+    """A form over the six hours that ended with the last five minutes."""
+    now = datetime.now(UTC)
+    end = now.replace(minute=now.minute - now.minute % 5, second=0, microsecond=0)
+    return {
+        "type": "timeseries",
+        "name": name,
+        "fields": fields,
+        "tags": tags,
+        "start": time_text(end - timedelta(hours=6)),
+        "end": time_text(end),
+        "bucket": "5m",
+        "aggregate": aggregate,
+    }
+
+
+async def browse_watch_and_import_series(
+    client: AsyncClient,
+    session: dict,
+    project: dict,
+    connection_id: str,
+    steps: Steps,
+    *,
+    name: str,
+    fields: list[str],
+    tags: list[str],
+) -> None:
+    """From listing the metrics to a second version of the dataset one of them became."""
+    url = f"{PROJECTS}/{project['id']}/connections/{connection_id}"
+    values = fields or ["value"]
+
+    schemas = await client.get(f"{url}/schemas")
+    assert schemas.status_code == 200, schemas.text
+    assert schemas.json()["data"] == ["default"]
+    steps.done("schemas")
+
+    tables = await client.get(f"{url}/tables", params={"schema": "default", "search": name})
+    assert tables.status_code == 200, tables.text
+    assert name in [item["name"] for item in tables.json()["data"]]
+    steps.done("tables")
+
+    listed = await client.get(f"{url}/columns", params={"schema": "default", "table": name})
+    assert listed.status_code == 200, listed.text
+    roles = {column["name"]: column["role"] for column in listed.json()["data"]}
+    assert roles["time"] == "time"
+    assert all(roles[value] == "field" for value in values)
+    assert all(roles[tag] == "tag" for tag in tags)
+    steps.done("columns")
+
+    source = series_form(name, fields, tags, "mean")
+    shown = await preview(client, session, url, source)
+    assert shown.status_code == 200, shown.text
+    data = shown.json()["data"]
+    assert [column["name"] for column in data["columns"]] == ["time", *tags, *values]
+    assert 0 < len(data["rows"]) <= 100
+    # Every timestamp is the start of a five minute bucket of the span, in UTC.
+    for row in data["rows"]:
+        at = datetime.fromisoformat(row[0])
+        assert row[0].endswith("Z") and source["start"] <= row[0] < source["end"]
+        assert (at.minute % 5, at.second, at.microsecond) == (0, 0, 0)
+    assert [row[: 1 + len(tags)] for row in data["rows"]] == sorted(
+        row[: 1 + len(tags)] for row in data["rows"]
+    )
+    steps.done("preview")
+
+    watched = await client.post(
+        f"{url}/live",
+        json={"name": name, "fields": fields, "tags": tags, "aggregate": "mean", "last": "1h"},
+        headers=mutation_headers(session["csrf_token"]),
+    )
+    assert watched.status_code == 200, watched.text
+    view = watched.json()["data"]
+    assert view["bucket"] == "1m" and view["truncated"] is False
+    assert [column["name"] for column in view["columns"]] == ["time", *tags, *values]
+    assert view["rows"]
+    assert all(view["start"] <= row[0] < view["end"] for row in view["rows"])
+    steps.seconds["live_rows"] = len(view["rows"])
+    steps.done("live")
+
+    imported = await import_dataset(
+        client, session, project["id"], connection_id, source, name="Live series"
+    )
+    assert imported.status_code == 201, imported.text
+    dataset = imported.json()["data"]
+    version = dataset["latest_version"]
+    assert version["column_names"] == ["time", *tags, *values]
+    assert version["row_count"] > 0
+    assert version["source_type"] == "connection"
+    assert version["source"]["source"] == source
+    steps.seconds["imported_rows"] = version["row_count"]
+    steps.done("import")
+
+    again = await import_version(
+        client, session, project["id"], dataset["id"], connection_id, source
+    )
+    assert again.status_code == 201, again.text
+    assert again.json()["data"]["version_number"] == 2
+    steps.done("import_again")
+
+    table = await preview(
+        client, session, url, {"type": "table", "schema": "default", "name": name}
+    )
+    assert failure(table) == (422, "SOURCE_INVALID", "unsupported_source")
+
+
+@pytest.mark.asyncio
+async def test_addresses_of_http_servers_that_point_inwards_are_refused(harness: Harness) -> None:
+    async with harness.client() as client:
+        # `localtest.me` is a public name whose address is 127.0.0.1.
+        for url in (
+            "http://127.0.0.1:9090",
+            "http://localhost:9090",
+            "http://169.254.169.254",
+            "http://localtest.me:9090",
+        ):
+            for body in (
+                {"name": "Inwards", "kind": "prometheus", "config": {"url": url}},
+                {"name": "Inwards", "kind": "influxdb", "config": {"url": url, "database": "db"}},
+            ):
+                _, _, created = await connect(harness, client, body)
+                assert failure(created) == (422, "CONNECTION_FAILED", "host_not_allowed"), body
+
+
+@pytest.mark.skipif(not PROMETHEUS_URL, reason="PLATFORM_LIVE_PROMETHEUS_URL is not set")
+@pytest.mark.asyncio
+async def test_prometheus_from_connection_to_dataset(harness: Harness) -> None:
+    secret = {"username": PROMETHEUS_USERNAME, "token": PROMETHEUS_TOKEN}
+    body = {"name": "Prometheus", "kind": "prometheus", "config": {"url": PROMETHEUS_URL}}
+    steps = Steps("Prometheus")
+    async with harness.client() as client:
+        if PROMETHEUS_URL.startswith("https://"):
+            # Over plain HTTP a server that only speaks TLS answers with a redirect to
+            # itself, which would succeed if it were followed.
+            plain = {**body, "config": {"url": "http://" + PROMETHEUS_URL.removeprefix("https://")}}
+            _, _, redirected = await connect(harness, client, plain | {"secret": secret})
+            assert failure(redirected) == (422, "CONNECTION_FAILED", "unreachable")
+            steps.done("refused_redirect")
+
+        session, project, created = await connect(harness, client, body | {"secret": secret})
+        assert created.status_code == 201, created.text
+        connection = created.json()["data"]
+        assert not PROMETHEUS_TOKEN or PROMETHEUS_TOKEN not in created.text
+        steps.done("create")
+
+        await browse_watch_and_import_series(
+            client, session, project, connection["id"], steps, name="up", fields=[], tags=["job"]
+        )
+
+        url = f"{PROJECTS}/{project['id']}/connections/{connection['id']}"
+        counters = await client.get(
+            f"{url}/tables", params={"schema": "default", "search": "_total"}
+        )
+        if counters.json()["data"]:
+            counter = counters.json()["data"][0]["name"]
+            grown = await preview(client, session, url, series_form(counter, [], [], "increase"))
+            assert grown.status_code == 200, grown.text
+            steps.seconds["increase_rows"] = {counter: len(grown.json()["data"]["rows"])}
+            steps.done("increase")
+
+        wide = series_form("up", [], [], "mean") | {"start": "2000-01-01T00:00:00Z", "bucket": "1m"}
+        refused = await preview(client, session, url, wide)
+        assert failure(refused) == (422, "SOURCE_INVALID", "too_many_points")
+    steps.show()
+
+
+@pytest_asyncio.fixture
+async def influxdb_live(tmp_path) -> AsyncIterator[Harness]:
+    async with open_harness(tmp_path, connection_allow_private_hosts=INFLUXDB_PRIVATE) as harness:
+        yield harness
+
+
+@pytest.mark.skipif(
+    not (INFLUXDB_URL and INFLUXDB_DATABASE),
+    reason="PLATFORM_LIVE_INFLUXDB_URL and PLATFORM_LIVE_INFLUXDB_DATABASE are not set",
+)
+@pytest.mark.asyncio
+async def test_influxdb_from_connection_to_dataset(influxdb_live: Harness) -> None:
+    harness = influxdb_live
+    body = {
+        "name": "InfluxDB",
+        "kind": "influxdb",
+        "config": {"url": INFLUXDB_URL, "database": INFLUXDB_DATABASE},
+        "secret": {"token": INFLUXDB_TOKEN},
+    }
+    steps = Steps("InfluxDB")
+    async with harness.client() as client:
+        nowhere = {**body, "config": {**body["config"], "database": "no-database-has-this-name"}}
+        _, _, missing = await connect(harness, client, nowhere, private=INFLUXDB_PRIVATE)
+        assert failure(missing) == (422, "CONNECTION_FAILED", "permission_denied")
+        steps.done("refused_unknown_database")
+
+        if INFLUXDB_TOKEN:
+            wrong = {**body, "secret": {"token": "not-the-token"}}
+            _, _, rejected = await connect(harness, client, wrong, private=INFLUXDB_PRIVATE)
+            assert failure(rejected) == (422, "CONNECTION_FAILED", "auth_failed")
+            steps.done("wrong_token")
+
+        session, project, created = await connect(harness, client, body, private=INFLUXDB_PRIVATE)
+        assert created.status_code == 201, created.text
+        connection = created.json()["data"]
+        assert not INFLUXDB_TOKEN or INFLUXDB_TOKEN not in created.text
+        steps.done("create")
+
+        # The measurement listed first, read by its first field of numbers and its first tag.
+        url = f"{PROJECTS}/{project['id']}/connections/{connection['id']}"
+        tables = await client.get(f"{url}/tables", params={"schema": "default"})
+        assert tables.status_code == 200, tables.text
+        assert tables.json()["data"]
+        name = tables.json()["data"][0]["name"]
+        listed = await client.get(f"{url}/columns", params={"schema": "default", "table": name})
+        assert listed.status_code == 200, listed.text
+        columns = listed.json()["data"]
+        numbers = [
+            column["name"]
+            for column in columns
+            if column["role"] == "field" and column["type"] in ("float", "integer")
+        ]
+        assert numbers, columns
+        tags = [column["name"] for column in columns if column["role"] == "tag"][:1]
+
+        await browse_watch_and_import_series(
+            client,
+            session,
+            project,
+            connection["id"],
+            steps,
+            name=name,
+            fields=numbers[:1],
+            tags=tags,
+        )
+
+        counter = await preview(
+            client, session, url, series_form(name, numbers[:1], [], "increase")
+        )
+        assert failure(counter) == (422, "SOURCE_INVALID", "unsupported_source")
     steps.show()
