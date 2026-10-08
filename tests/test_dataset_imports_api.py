@@ -27,8 +27,6 @@ from tests.test_datasets_api import CSV, upload_dataset
 from tests.test_projects_api import PROJECTS, add_member, create_project
 from tests.test_prometheus_connection_api import SERIES as PROMETHEUS_SERIES
 from tests.test_prometheus_connection_api import connected_prometheus, with_prometheus
-from tests.test_research_context_api import FRONT_MATTER, save_context
-from tests.test_runs_api import start_run
 
 SCORES = FakeTable(
     columns=[
@@ -88,7 +86,7 @@ async def import_version(
 
 
 @pytest.mark.asyncio
-async def test_an_import_becomes_a_dataset_version_a_run_can_use(harness: Harness) -> None:
+async def test_an_import_becomes_a_dataset_version_independent_of_runs(harness: Harness) -> None:
     async with harness.client() as client:
         session, project, connection_id = await imported_project(harness, client)
         base = f"{PROJECTS}/{project['id']}/datasets"
@@ -158,13 +156,6 @@ async def test_an_import_becomes_a_dataset_version_a_run_can_use(harness: Harnes
             (2, "connection"),
             (1, "connection"),
         ]
-
-        saved = await save_context(client, session, project["id"], front_matter=FRONT_MATTER)
-        assert saved.status_code == 201, saved.text
-        run = await start_run(client, session, project["id"], first["id"])
-        assert run.status_code == 201, run.text
-        assert harness.popper.started[0]["dataset"] == SCORES_CSV
-        assert harness.popper.started[0]["dataset_filename"] == "scores.csv"
 
         # Deleting the connection changes nothing about the versions read through it.
         deleted = await client.delete(

@@ -44,8 +44,6 @@ from tests.conftest import (
 from tests.test_connection_browse_api import failure, preview
 from tests.test_dataset_imports_api import import_dataset, import_version
 from tests.test_projects_api import PROJECTS, create_project
-from tests.test_research_context_api import save_context
-from tests.test_runs_api import start_run
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("PLATFORM_LIVE_CONNECTOR_TESTS") != "1",
@@ -190,22 +188,6 @@ async def browse_import_and_run(
     assert again.json()["data"]["version_number"] == 2
     steps.done("import_again")
 
-    saved = await save_context(
-        client,
-        session,
-        project["id"],
-        front_matter={
-            "domain": "Live source",
-            "objectives": ["Does the imported table reach a run?"],
-            "variables": {outcome: {"type": "continuous", "role": "outcome"}},
-        },
-    )
-    assert saved.status_code == 201, saved.text
-    run = await start_run(client, session, project["id"], version["id"])
-    assert run.status_code == 201, run.text
-    assert run.json()["data"]["dataset_version_number"] == 1
-    steps.done("run")
-
 
 @pytest.mark.asyncio
 async def test_addresses_that_real_dns_points_inwards_are_refused(harness: Harness) -> None:
@@ -335,20 +317,6 @@ async def test_bigquery_from_connection_to_run(harness: Harness) -> None:
         assert (version["row_count"], version["column_names"]) == (1000, ["word", "word_count"])
         steps.done("import")
 
-        saved = await save_context(
-            client,
-            session,
-            project["id"],
-            front_matter={
-                "domain": "Live source",
-                "objectives": ["Does the imported table reach a run?"],
-                "variables": {"word_count": {"type": "continuous", "role": "outcome"}},
-            },
-        )
-        assert saved.status_code == 201, saved.text
-        run = await start_run(client, session, project["id"], version["id"])
-        assert run.status_code == 201, run.text
-        steps.done("run")
     steps.show()
 
 

@@ -14,9 +14,8 @@ from platform_be.services.popper_client import (
     PopperUncertain,
 )
 from tests.conftest import CALLBACK_KEY, Harness, login, mutation_headers
-from tests.test_datasets_api import CSV, upload_dataset
+from tests.test_datasets_api import upload_dataset
 from tests.test_projects_api import PROJECTS, add_member, create_project
-from tests.test_research_context_api import FRONT_MATTER, save_context
 
 INTERNAL = "/api/v1/internal/popper/runs"
 SERVICE = {"X-Service-Key": CALLBACK_KEY}
@@ -31,18 +30,22 @@ REVIEW = {
 
 
 async def ready_project(client: AsyncClient, session: dict) -> tuple[dict, dict]:
-    """A project with one dataset version and a research context: ready to run."""
+    """A project with one dataset version, ready for a topic run."""
     project = await create_project(client, session)
     dataset = (await upload_dataset(client, session, project["id"])).json()["data"]
-    saved = await save_context(client, session, project["id"], front_matter=FRONT_MATTER)
-    assert saved.status_code == 201, saved.text
     return project, dataset["latest_version"]
 
 
-async def start_run(client: AsyncClient, session: dict, project_id: str, version_id: str, **more):
+async def start_run(client: AsyncClient, session: dict, project_id: str, _version_id: str, **more):
+    body = {
+        "topic": "Does study time affect exam performance?",
+        "domains": ["education"],
+        "review_mode": "copilot",
+        **more,
+    }
     return await client.post(
         f"{PROJECTS}/{project_id}/runs",
-        json={"dataset_version_id": version_id, **more},
+        json=body,
         headers=mutation_headers(session["csrf_token"]),
     )
 
@@ -78,13 +81,15 @@ async def test_run_goes_from_start_through_review_to_results(harness: Harness) -
         run = started.json()["data"]
         assert run["status"] == "running"
         assert run["budget_usd"] == "5.00"
-        assert run["dataset_version_number"] == 1
-        assert run["research_context_version"] == 1
+        assert run["dataset_version_number"] is None
+        assert run["research_context_id"] is None
+        assert run["research_context_version"] is None
         assert await project_status(client, project["id"]) == "researching"
 
         sent = harness.popper.started[0]
-        assert sent["dataset"] == CSV
-        assert sent["research_markdown"].startswith("---\ndomain:")
+        assert sent["topic"] == "Does study time affect exam performance?"
+        assert sent["domains"] == ["education"]
+        assert sent["review_mode"] == "copilot"
         assert sent["callback_url"].endswith(f"{INTERNAL}/{run['id']}")
 
         second = await start_run(client, session, project["id"], version["id"])
@@ -193,7 +198,7 @@ async def test_run_goes_from_start_through_review_to_results(harness: Harness) -
 
 
 @pytest.mark.asyncio
-async def test_run_inputs_are_checked_before_popper_is_called(harness: Harness) -> None:
+async def test_topic_run_inputs_are_checked_before_popper_is_called(harness: Harness) -> None:
     async with harness.client() as client:
         session = await login(harness, client, uid="owner", email="owner@example.com")
         project = await create_project(client, session)
@@ -201,31 +206,19 @@ async def test_run_inputs_are_checked_before_popper_is_called(harness: Harness) 
             "latest_version"
         ]
 
-        no_context = await start_run(client, session, project["id"], version["id"])
-        assert no_context.status_code == 422
-        assert no_context.json()["error"]["code"] == "RESEARCH_CONTEXT_REQUIRED"
-
-        await save_context(
-            client,
-            session,
-            project["id"],
-            front_matter={"variables": {"exam_score": {}, "sleep_hours": {}}},
+        short = await client.post(
+            f"{PROJECTS}/{project['id']}/runs",
+            json={"topic": "Short", "domains": ["education"]},
+            headers=mutation_headers(session["csrf_token"]),
         )
-        unknown = await start_run(client, session, project["id"], version["id"])
-        assert unknown.status_code == 422
-        assert unknown.json()["error"]["code"] == "UNKNOWN_COLUMNS"
-        assert "sleep_hours" in unknown.json()["message"]
+        assert short.status_code == 422
+        no_domains = await start_run(client, session, project["id"], version["id"], domains=[])
+        assert no_domains.status_code == 422
+        assert no_domains.json()["error"]["code"] == "VALIDATION_ERROR"
 
-        await save_context(client, session, project["id"])
         over = await start_run(client, session, project["id"], version["id"], budget_usd="20.01")
         assert over.status_code == 422
         assert over.json()["error"]["code"] == "BUDGET_OUT_OF_RANGE"
-        missing = await start_run(client, session, project["id"], str(uuid4()))
-        assert missing.status_code == 404
-
-        other = await create_project(client, session, name="Other")
-        crossed = await start_run(client, session, other["id"], version["id"])
-        assert crossed.status_code == 404
 
         assert harness.popper.started == []
         assert (await client.get(f"{PROJECTS}/{project['id']}/runs")).json()["data"] == []

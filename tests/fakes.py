@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import IO, Any
+from typing import Any
 from urllib.parse import unquote
 from uuid import UUID
 
@@ -351,11 +351,10 @@ class FakePopperClient:
         self,
         *,
         platform_run_id: UUID,
-        research_markdown: str,
-        dataset: IO[bytes],
-        dataset_filename: str,
+        topic: str,
+        domains: list[str],
+        review_mode: str,
         budget_usd: Decimal,
-        auto_review: bool,
         callback_url: str,
     ) -> str:
         if not self.record_before_failing:
@@ -364,11 +363,10 @@ class FakePopperClient:
         self.started.append(
             {
                 "platform_run_id": platform_run_id,
-                "research_markdown": research_markdown,
-                "dataset": dataset.read(),
-                "dataset_filename": dataset_filename,
+                "topic": topic,
+                "domains": domains,
+                "review_mode": review_mode,
                 "budget_usd": budget_usd,
-                "auto_review": auto_review,
                 "callback_url": callback_url,
             }
         )

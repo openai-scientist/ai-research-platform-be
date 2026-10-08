@@ -1,4 +1,3 @@
-import io
 import json
 from decimal import Decimal
 from uuid import uuid4
@@ -29,40 +28,34 @@ def client(handler) -> HttpPopperClient:
 async def start(popper: HttpPopperClient, run_id=None) -> str:
     return await popper.start_run(
         platform_run_id=run_id or uuid4(),
-        research_markdown="---\n{}\n---\nBody",
-        dataset=io.BytesIO(b"a,b\n1,2\n"),
-        dataset_filename="data.csv",
+        topic="Does study time affect exam performance?",
+        domains=["education"],
+        review_mode="copilot",
         budget_usd=Decimal("5.00"),
-        auto_review=False,
         callback_url="http://platform.test/api/v1/internal/popper/runs/x",
     )
 
 
 @pytest.mark.asyncio
-async def test_start_run_sends_the_files_and_the_service_key() -> None:
+async def test_start_run_sends_topic_payload_and_the_service_key() -> None:
     run_id = uuid4()
     seen: dict[str, object] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["url"] = str(request.url)
         seen["key"] = request.headers.get("X-Service-Key")
-        seen["body"] = request.read()
+        seen["body"] = json.loads(request.read())
         return httpx.Response(201, json={"popper_run_id": "p-1", "status": "running"})
 
     assert await start(client(handler), run_id) == "p-1"
     assert seen["url"] == "http://popper.test/runs"
     assert seen["key"] == KEY
-    body = seen["body"]
-    assert isinstance(body, bytes)
-    for part in (b'name="research"; filename="research.md"', b'name="data"; filename="data.csv"'):
-        assert part in body
-    assert b"a,b\n1,2\n" in body
-    after_config = body.split(b'filename="config.json"')[1]
-    config = json.loads(after_config.split(b"\r\n\r\n")[1].split(b"\r\n")[0])
-    assert config == {
+    assert seen["body"] == {
         "platform_run_id": str(run_id),
+        "topic": "Does study time affect exam performance?",
+        "domains": ["education"],
+        "review_mode": "copilot",
         "budget_usd": "5.00",
-        "auto": False,
         "callback_url": "http://platform.test/api/v1/internal/popper/runs/x",
     }
 
