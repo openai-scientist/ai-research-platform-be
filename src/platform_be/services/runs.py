@@ -232,7 +232,7 @@ def gate_answer_summary(
     if dropped:
         parts.append(f"without {len(dropped)} {one if len(dropped) == 1 else many}")
     if kept:
-        parts.append(f"keeping {', '.join(kept)} despite the objection")
+        parts.append(f"keeping {', '.join(kept)}, set aside by the debate")
     return f"Approved the {noun}{' ' + ' and '.join(parts) if parts else ''}."
 
 

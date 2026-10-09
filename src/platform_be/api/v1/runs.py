@@ -653,18 +653,40 @@ async def answer_gate(
         if len(body.dropped) >= len(droppable) and len(droppable) > 0 and not body.kept:
             item = "paper" if gate.kind == "screen" else "hypothesis"
             raise APIError(422, "DROP_ALL_NOT_ALLOWED", f"Keep at least one {item}")
+    if body.option_id == "drop" and not (body.dropped or body.kept):
+        raise APIError(422, "INVALID_DROP", "Choose at least one item to drop or keep")
     if body.kept:
         keepable = set(spec.get("keepable", []))
         if not keepable:
             raise APIError(422, "INVALID_KEEP", "This gate does not hold anything back")
         for k in body.kept:
             if k not in keepable:
-                raise APIError(422, "INVALID_KEEP", f"Item {k} is not held back")
+                raise APIError(422, "INVALID_KEEP", f"Item {k} was not set aside")
         if len(set(body.kept)) != len(body.kept):
             raise APIError(422, "INVALID_KEEP", "Duplicate items in kept list")
 
-    now = datetime.now(UTC)
     clean_note = body.note.strip() if body.note else None
+    # The engine hears the answer first: one it refuses (the gate moved on, an item it does not
+    # know) is not recorded, so the run never waits on an answer the engine never took. When the
+    # engine cannot be reached the answer is still recorded, as before.
+    try:
+        engine_run_id = run.popper_run_id or str(run.id)
+        await popper.answer_gate(
+            engine_run_id,
+            gate_id=gate.gate_key,
+            decision={
+                "option_id": body.option_id,
+                "dropped": body.dropped,
+                "kept": body.kept,
+                "note": clean_note,
+            },
+        )
+    except PopperRejected as exc:
+        raise APIError(422, "GATE_ANSWER_REJECTED", str(exc)) from exc
+    except Exception as exc:
+        logger.warning("Could not immediately notify engine of answered gate: %s", exc)
+
+    now = datetime.now(UTC)
     gate.answer = {
         "option_id": body.option_id,
         "dropped": body.dropped,
@@ -726,21 +748,6 @@ async def answer_gate(
     )
     run_events_changed(db, run.id)
     await db.commit()
-
-    try:
-        engine_run_id = run.popper_run_id or str(run.id)
-        await popper.answer_gate(
-            engine_run_id,
-            gate_id=gate.gate_key,
-            decision={
-                "option_id": body.option_id,
-                "dropped": body.dropped,
-                "kept": body.kept,
-                "note": clean_note,
-            },
-        )
-    except Exception as exc:
-        logger.warning("Could not immediately notify engine of answered gate: %s", exc)
 
     return ok({"gate_id": gate.gate_key, "resolved_seq": resolved_seq}, "Answer recorded")
 

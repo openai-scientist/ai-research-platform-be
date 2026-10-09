@@ -1,6 +1,7 @@
 import pytest
 from httpx import AsyncClient
 
+from platform_be.services.popper_client import PopperRejected, PopperUnavailable
 from tests.conftest import CALLBACK_KEY, Harness, login, mutation_headers
 from tests.test_projects_api import PROJECTS, create_project
 
@@ -172,6 +173,35 @@ async def test_the_hypotheses_gate_drops_and_keeps_and_forwards_both(harness: Ha
         resolved = (await stored(client, runs, run["id"]))[-2]
         assert resolved["type"] == "gate.resolved" and resolved["stage_key"] == "r1-hypothesize"
         assert resolved["payload"]["summary"] == (
-            "Approved the hypotheses without 1 hypothesis and keeping T1 despite the objection."
+            "Approved the hypotheses without 1 hypothesis and keeping T1, set aside by the debate."
         )
         assert resolved["payload"]["answer"]["kept"] == ["T1"]
+
+
+@pytest.mark.asyncio
+async def test_a_gate_answer_the_engine_refuses_is_not_recorded(harness: Harness) -> None:
+    async with harness.client() as client:
+        session = await login(harness, client, uid="owner", email="owner@example.com")
+        runs, run = await topic_run(client, session)
+        await ingest(client, run["id"], (1, "gate.opened", HYPOTHESES_GATE))
+        url = f"{runs}/{run['id']}/gates/gate-s08-a1"
+        headers = mutation_headers(session["csrf_token"])
+
+        nothing = await client.post(url, json={"option_id": "drop"}, headers=headers)
+        assert nothing.status_code == 422 and nothing.json()["error"]["code"] == "INVALID_DROP"
+
+        harness.popper.fail_with = PopperRejected("the gate has moved on")
+        refused = await client.post(url, json={"option_id": "approve"}, headers=headers)
+        assert refused.status_code == 422
+        assert refused.json()["error"]["code"] == "GATE_ANSWER_REJECTED"
+        assert refused.json()["message"] == "the gate has moved on"
+        assert (await stored(client, runs, run["id"]))[-1]["type"] == "gate.opened"
+
+        # The gate is still open: a later answer the engine takes is recorded.
+        harness.popper.fail_with = PopperUnavailable("down")
+        answered = await client.post(url, json={"option_id": "approve"}, headers=headers)
+        assert answered.status_code == 200, answered.text
+        assert [e["type"] for e in (await stored(client, runs, run["id"]))[-2:]] == [
+            "gate.resolved",
+            "run.status",
+        ]
