@@ -75,7 +75,7 @@ class PopperClient(Protocol):
     async def answer_gate(
         self, popper_run_id: str, *, gate_id: str, decision: dict[str, Any]
     ) -> None:
-        """Send a human decision for a screen review gate."""
+        """Send a human decision for a review gate (screen, scope or hypotheses)."""
 
     async def pause(self, popper_run_id: str) -> None:
         """Pause a run at the next safe checkpoint."""

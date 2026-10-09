@@ -74,6 +74,7 @@ async def test_engine_repeats_of_what_the_platform_recorded_are_not_stored(
         assert resolved["payload"]["answer"] == {
             "option_id": "drop",
             "dropped": ["p-2"],
+            "kept": [],
             "note": None,
         }
         before = len(await stored(client, runs, run["id"]))
@@ -126,3 +127,51 @@ async def test_a_gate_answered_at_the_engine_is_stored_and_recorded(harness: Har
         )
         assert conflict.status_code == 409
         assert conflict.json()["error"]["code"] == "GATE_ALREADY_RESOLVED"
+
+
+HYPOTHESES_GATE = {
+    "id": "gate-s08-a1",
+    "gate_id": "gate-s08-a1",
+    "kind": "hypotheses",
+    "stage_key": "r1-hypothesize",
+    "title": "Approve the hypotheses",
+    "options": [{"id": "approve"}, {"id": "drop"}, {"id": "reject"}],
+    "droppable": ["H1", "H2", "H3"],
+    "keepable": ["T1"],
+}
+
+
+@pytest.mark.asyncio
+async def test_the_hypotheses_gate_drops_and_keeps_and_forwards_both(harness: Harness) -> None:
+    async with harness.client() as client:
+        session = await login(harness, client, uid="owner", email="owner@example.com")
+        runs, run = await topic_run(client, session)
+        await ingest(client, run["id"], (1, "gate.opened", HYPOTHESES_GATE))
+        url = f"{runs}/{run['id']}/gates/gate-s08-a1"
+        headers = mutation_headers(session["csrf_token"])
+
+        unknown = await client.post(
+            url, json={"option_id": "drop", "kept": ["M2"]}, headers=headers
+        )
+        assert unknown.status_code == 422 and unknown.json()["error"]["code"] == "INVALID_KEEP"
+        everyone = await client.post(
+            url, json={"option_id": "drop", "dropped": ["H1", "H2", "H3"]}, headers=headers
+        )
+        assert everyone.status_code == 422
+        assert everyone.json()["message"] == "Keep at least one hypothesis"
+
+        answered = await client.post(
+            url,
+            json={"option_id": "drop", "dropped": ["H3"], "kept": ["T1"], "note": "worth it"},
+            headers=headers,
+        )
+        assert answered.status_code == 200, answered.text
+        forwarded = harness.popper.gate_answers[-1]
+        assert forwarded["gate_id"] == "gate-s08-a1"
+        assert (forwarded["dropped"], forwarded["kept"]) == (["H3"], ["T1"])
+        resolved = (await stored(client, runs, run["id"]))[-2]
+        assert resolved["type"] == "gate.resolved" and resolved["stage_key"] == "r1-hypothesize"
+        assert resolved["payload"]["summary"] == (
+            "Approved the hypotheses without 1 hypothesis and keeping T1 despite the objection."
+        )
+        assert resolved["payload"]["answer"]["kept"] == ["T1"]

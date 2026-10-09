@@ -217,15 +217,23 @@ async def ingest_popper_state(
     await db.flush()
 
 
-def gate_answer_summary(kind: str, option_id: str, dropped: list[str]) -> str:
+def gate_answer_summary(
+    kind: str, option_id: str, dropped: list[str], kept: list[str] | None = None
+) -> str:
     """The run studio's one-line record of a gate answer, as the engine words it."""
     if option_id == "reject":
-        return "Asked for a new search." if kind == "screen" else "Asked for new scoping."
-    noun = "shortlist" if kind == "screen" else "scope"
+        return {
+            "screen": "Asked for a new search.",
+            "hypotheses": "Asked for a new set of hypotheses.",
+        }.get(kind, "Asked for new scoping.")
+    noun = {"screen": "shortlist", "hypotheses": "hypotheses"}.get(kind, "scope")
+    one, many = ("paper", "papers") if kind == "screen" else ("hypothesis", "hypotheses")
+    parts = []
     if dropped:
-        papers = "paper" if len(dropped) == 1 else "papers"
-        return f"Approved the {noun} without {len(dropped)} {papers}."
-    return f"Approved the {noun}."
+        parts.append(f"without {len(dropped)} {one if len(dropped) == 1 else many}")
+    if kept:
+        parts.append(f"keeping {', '.join(kept)} despite the objection")
+    return f"Approved the {noun}{' ' + ' and '.join(parts) if parts else ''}."
 
 
 async def engine_event_is_repeat(

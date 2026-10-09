@@ -138,6 +138,8 @@ class RunEventItem(BaseModel):
 class GateAnswer(BaseModel):
     option_id: str = Field(min_length=1, max_length=64)
     dropped: list[str] = Field(default_factory=list)
+    # Held-back hypotheses the reviewer keeps despite their objection (hypotheses gate only).
+    kept: list[str] = Field(default_factory=list)
     note: str | None = Field(default=None, max_length=2000)
 
 
@@ -624,6 +626,7 @@ async def answer_gate(
         if (
             gate.answer.get("option_id") == body.option_id
             and gate.answer.get("dropped") == body.dropped
+            and (gate.answer.get("kept") or []) == body.kept
         ):
             return ok(
                 {"gate_id": gate.gate_key, "resolved_seq": gate.resolved_seq},
@@ -647,14 +650,25 @@ async def answer_gate(
                 raise APIError(422, "INVALID_DROP", f"Item {d} is not in droppable list")
         if len(set(body.dropped)) != len(body.dropped):
             raise APIError(422, "INVALID_DROP", "Duplicate items in dropped list")
-        if len(body.dropped) >= len(droppable) and len(droppable) > 0:
-            raise APIError(422, "DROP_ALL_NOT_ALLOWED", "Keep at least one paper")
+        if len(body.dropped) >= len(droppable) and len(droppable) > 0 and not body.kept:
+            item = "paper" if gate.kind == "screen" else "hypothesis"
+            raise APIError(422, "DROP_ALL_NOT_ALLOWED", f"Keep at least one {item}")
+    if body.kept:
+        keepable = set(spec.get("keepable", []))
+        if not keepable:
+            raise APIError(422, "INVALID_KEEP", "This gate does not hold anything back")
+        for k in body.kept:
+            if k not in keepable:
+                raise APIError(422, "INVALID_KEEP", f"Item {k} is not held back")
+        if len(set(body.kept)) != len(body.kept):
+            raise APIError(422, "INVALID_KEEP", "Duplicate items in kept list")
 
     now = datetime.now(UTC)
     clean_note = body.note.strip() if body.note else None
     gate.answer = {
         "option_id": body.option_id,
         "dropped": body.dropped,
+        "kept": body.kept,
         "note": clean_note,
     }
     gate.answered_by_user_id = principal.user.id
@@ -677,9 +691,10 @@ async def answer_gate(
             "kind": gate.kind,
             "option_id": body.option_id,
             "dropped": body.dropped,
+            "kept": body.kept,
             "note": clean_note,
             "answer": dict(gate.answer),
-            "summary": gate_answer_summary(gate.kind, body.option_id, body.dropped),
+            "summary": gate_answer_summary(gate.kind, body.option_id, body.dropped, body.kept),
         },
         created_at=now,
     )
@@ -720,6 +735,7 @@ async def answer_gate(
             decision={
                 "option_id": body.option_id,
                 "dropped": body.dropped,
+                "kept": body.kept,
                 "note": clean_note,
             },
         )
