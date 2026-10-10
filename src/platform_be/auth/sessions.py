@@ -81,6 +81,20 @@ async def get_principal(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> Principal:
+    return await _get_principal(request, db, touch_session=True)
+
+
+async def get_principal_without_touch(request: Request, db: AsyncSession) -> Principal:
+    """Validate a long-lived stream without renewing the session's idle deadline."""
+    return await _get_principal(request, db, touch_session=False)
+
+
+async def _get_principal(
+    request: Request,
+    db: AsyncSession,
+    *,
+    touch_session: bool,
+) -> Principal:
     settings: Settings = request.app.state.settings
     secret = request.cookies.get(settings.session_cookie_name)
     if not secret:
@@ -110,9 +124,10 @@ async def get_principal(
         raise APIError(
             403, "PASSWORD_CHANGE_REQUIRED", "Change the temporary password before continuing"
         )
-    session.last_seen_at = now
-    idle_expiry = now + timedelta(minutes=settings.session_idle_minutes)
-    session.idle_expires_at = min(idle_expiry, as_utc(session.absolute_expires_at))
+    if touch_session:
+        session.last_seen_at = now
+        idle_expiry = now + timedelta(minutes=settings.session_idle_minutes)
+        session.idle_expires_at = min(idle_expiry, as_utc(session.absolute_expires_at))
     return Principal(user=user, session=session, raw_secret=secret)
 
 

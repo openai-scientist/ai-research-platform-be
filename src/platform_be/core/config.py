@@ -113,6 +113,13 @@ class Settings(BaseSettings):
     # The most one BigQuery query may scan, and so be billed for, in bytes. BigQuery bills at
     # least 10 MiB for each table a query reads, so a lower limit would refuse every query.
     connection_bigquery_max_bytes_billed: int = Field(default=1024**3, ge=10 * 1024**2)
+    # Bounded and redacted technical events use a 14-day proposed retention by default.
+    monitoring_event_retention_days: int = Field(default=14, ge=1, le=365)
+    monitoring_event_max_bytes: int = Field(default=4096, ge=512, le=16_384)
+    monitoring_error_rate_alert_threshold_percent: float | None = Field(default=None, ge=0, le=100)
+    monitoring_error_rate_alert_recovery_percent: float | None = Field(default=None, ge=0, le=100)
+    monitoring_error_rate_alert_min_samples: int | None = Field(default=None, ge=1, le=100_000)
+    monitoring_error_rate_alert_lookback_seconds: int = Field(default=300, ge=60, le=86_400)
 
     @field_validator("cors_allowed_origins")
     @classmethod
@@ -149,6 +156,9 @@ class Settings(BaseSettings):
         "default_admin_email",
         "default_admin_password",
         "connection_secret_key",
+        "monitoring_error_rate_alert_threshold_percent",
+        "monitoring_error_rate_alert_recovery_percent",
+        "monitoring_error_rate_alert_min_samples",
         mode="before",
     )
     @classmethod
@@ -159,6 +169,22 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_deployment_security(self) -> "Settings":
+        alert_settings = (
+            self.monitoring_error_rate_alert_threshold_percent,
+            self.monitoring_error_rate_alert_recovery_percent,
+            self.monitoring_error_rate_alert_min_samples,
+        )
+        if any(value is not None for value in alert_settings) and any(
+            value is None for value in alert_settings
+        ):
+            raise ValueError("Monitoring error-rate alert settings must be configured together")
+        if (
+            self.monitoring_error_rate_alert_threshold_percent is not None
+            and self.monitoring_error_rate_alert_recovery_percent is not None
+            and self.monitoring_error_rate_alert_recovery_percent
+            >= self.monitoring_error_rate_alert_threshold_percent
+        ):
+            raise ValueError("Monitoring error-rate recovery must be below its alert threshold")
         if self.run_default_budget_usd > self.run_max_budget_usd:
             raise ValueError("run_default_budget_usd must not exceed run_max_budget_usd")
         if self.popper_base_url and not (self.popper_service_key and self.popper_callback_key):

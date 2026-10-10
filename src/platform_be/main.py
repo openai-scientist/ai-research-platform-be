@@ -28,6 +28,9 @@ from platform_be.services.file_store import build_file_store
 from platform_be.services.google_drive_oauth import build_google_drive_oauth
 from platform_be.services.google_oauth import build_google_oauth
 from platform_be.services.invite_candidates_stream import InviteCandidatesHub
+from platform_be.services.monitoring_alerts import MonitoringAlertEvaluator
+from platform_be.services.monitoring_events import MonitoringTelemetry
+from platform_be.services.monitoring_stream import MonitoringHub
 from platform_be.services.notification_stream import NotificationHub
 from platform_be.services.popper_client import build_popper_client
 from platform_be.services.run_event_stream import RunEventHub
@@ -55,27 +58,52 @@ def create_app(
     notification_hub = NotificationHub(app_engine)
     invite_candidates_hub = InviteCandidatesHub(app_engine)
     run_event_hub = RunEventHub(app_engine)
+    monitoring_hub = MonitoringHub(app_engine)
+    alert_evaluator = MonitoringAlertEvaluator(
+        app_session_factory,
+        environment=settings.app_env,
+        threshold_percent=settings.monitoring_error_rate_alert_threshold_percent,
+        recovery_percent=settings.monitoring_error_rate_alert_recovery_percent,
+        minimum_samples=settings.monitoring_error_rate_alert_min_samples,
+        lookback_seconds=settings.monitoring_error_rate_alert_lookback_seconds,
+        stream_hub=monitoring_hub,
+    )
+    monitoring_telemetry = MonitoringTelemetry(
+        app_session_factory,
+        environment=settings.app_env,
+        retention_days=settings.monitoring_event_retention_days,
+        max_event_bytes=settings.monitoring_event_max_bytes,
+        alert_evaluator=alert_evaluator.evaluate,
+        stream_hub=monitoring_hub,
+    )
     connector_executor = build_connector_executor(settings)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await ensure_default_admin(app_session_factory, settings)
+        await monitoring_telemetry.start()
         try:
             yield
         finally:
             try:
-                await notification_hub.close()
+                await monitoring_telemetry.close()
             finally:
                 try:
-                    await invite_candidates_hub.close()
+                    await notification_hub.close()
                 finally:
                     try:
-                        await run_event_hub.close()
+                        await invite_candidates_hub.close()
                     finally:
-                        # Not waited for: a thread may be held by a server that never answers.
-                        connector_executor.shutdown(wait=False, cancel_futures=True)
-                        if owned_engine:
-                            await app_engine.dispose()
+                        try:
+                            await run_event_hub.close()
+                        finally:
+                            try:
+                                await monitoring_hub.close()
+                            finally:
+                                # Do not wait on a server that may never answer.
+                                connector_executor.shutdown(wait=False, cancel_futures=True)
+                                if owned_engine:
+                                    await app_engine.dispose()
 
     app = FastAPI(
         title=settings.app_name,
@@ -98,6 +126,8 @@ def create_app(
     app.state.notification_hub = notification_hub
     app.state.invite_candidates_hub = invite_candidates_hub
     app.state.run_event_hub = run_event_hub
+    app.state.monitoring_hub = monitoring_hub
+    app.state.monitoring_telemetry = monitoring_telemetry
     app.state.secret_box = (
         SecretBox(settings.connection_secret_key.get_secret_value())
         if settings.connection_secret_key
@@ -152,6 +182,24 @@ def create_app(
                 "duration_ms": round((time.perf_counter() - started) * 1000, 2),
             },
         )
+        content_type = response.headers.get("content-type", "")
+        is_sse = "text/event-stream" in request.headers.get(
+            "accept", ""
+        ).lower() or content_type.startswith("text/event-stream")
+        monitoring_path = f"{settings.api_prefix}/admin/log-monitoring"
+        is_monitoring_request = request.url.path == monitoring_path or request.url.path.startswith(
+            f"{monitoring_path}/"
+        )
+        if not is_sse and not is_monitoring_request:
+            route = request.scope.get("route")
+            route_template = getattr(route, "path", None)
+            request.app.state.monitoring_telemetry.submit_request(
+                request_id=request_id,
+                method=request.method,
+                route_template=route_template,
+                status_code=response.status_code,
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
         return response
 
     app.add_middleware(
