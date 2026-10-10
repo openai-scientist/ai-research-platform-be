@@ -27,6 +27,7 @@ The research itself is done by **Popper**, a separate service. The Platform send
 - **Research inputs**: versioned CSV datasets (uploaded, or imported through a data connection to PostgreSQL, MySQL, BigQuery, a Google spreadsheet, a Google Drive folder, Prometheus or InfluxDB), project files, a research topic and domains.
 - **Runs**: topic-to-hypothesis runs, one at a time per project, sent to Popper with a spending cap; frame review; result files.
 - **Collaboration**: comments on runs and result files, notifications over SSE, an audit log of every change.
+- **Administration and monitoring**: API-backed admin overview, redacted technical request events, measured request trends, and configurable error-rate alerts. Metrics without a measured source stay unavailable.
 
 ## Tech stack
 
@@ -736,6 +737,11 @@ The `q` parameter matches a substring, case-insensitively, and needs at least 3 
 | `PUT` | `/users/{id}/platform-role` | `{ "role": "platform_admin" }` grants Platform Admin, `{ "role": "user" }` removes it |
 | `GET` | `/audit` | Audit events: global for a Platform Admin, one project (`project_id`) for its Project Manager; filter by `action`, `resource_type`, `actor_user_id`, `from`/`to` |
 | `GET` | `/admin/usage/projects` | Runs and cost per project (Platform Admin; `q`, `from`, `to`) |
+| `GET` | `/admin/overview` | Aggregate data for the Platform Admin Overview tabs (`section`, `from`, `to`, `timezone`) |
+| `GET` | `/admin/log-monitoring/services`, `/events`, `/events/{id}` | Measured services and sanitized technical events (Platform Admin) |
+| `GET` | `/admin/log-monitoring/services/{id}/metrics` | Bounded request-rate, error-rate and p95 latency series; unavailable windows are explicit |
+| `GET` | `/admin/log-monitoring/stream` | Credentialed SSE invalidations and snapshots for Admin monitoring |
+| `POST` | `/admin/log-monitoring/alerts/{id}/acknowledge` | Idempotently acknowledge an active alert (Platform Admin; CSRF required) |
 
 ### Projects and members
 
@@ -859,7 +865,7 @@ Ignore the 15-second keep-alive comment: it rechecks the session but does not ex
 
 ### Handoff documents
 
-Step-by-step integration notes with real responses are kept in `docs/` (local, not tracked in Git): `frontend-api-handoff.md`, `notifications-handoff.md`, `frontend-api-handoff-3-data-connections.md` and `frontend-api-handoff-5-time-series-connections.md`.
+The [`frontend-api-handoff-5-admin-overview-log-monitoring.md`](docs/frontend-api-handoff-5-admin-overview-log-monitoring.md) is the FE contract for Admin Overview and Log Monitoring. Other step-by-step integration notes in `docs/` remain local-only and are not tracked in Git.
 
 ## Configuration
 
@@ -927,6 +933,27 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 ```
 
 A lost or replaced key leaves every saved connection unreadable (409 `CONNECTION_SECRET_UNREADABLE`): each one has to be deleted and created again. Datasets already imported are not affected.
+
+### Admin monitoring
+
+| Variable | Purpose |
+|---|---|
+| `MONITORING_EVENT_RETENTION_DAYS` | How long technical events and matching capture-gap history are retained (default 14 days). |
+| `MONITORING_EVENT_MAX_BYTES` | Maximum serialized event payload size after allowlisting/redaction (default 4096 bytes). |
+| `MONITORING_ERROR_RATE_ALERT_THRESHOLD_PERCENT` | Error-rate percent that opens an API alert. Empty disables alert evaluation. Configure with the recovery threshold and minimum sample count. |
+| `MONITORING_ERROR_RATE_ALERT_RECOVERY_PERCENT` | Error-rate percent at or below which an active alert resolves; must be below the alert threshold. |
+| `MONITORING_ERROR_RATE_ALERT_MIN_SAMPLES` | Minimum captured requests before the evaluator can open or resolve an alert. |
+| `MONITORING_ERROR_RATE_ALERT_LOOKBACK_SECONDS` | Evaluator lookback window (default 300 seconds). |
+
+Technical monitoring events are separate from `/audit`. The initial measured service is `platform-api`; CPU, memory, uptime history, and queue depth remain unavailable until a real source is added. Requests to `/admin/log-monitoring`, including its SSE stream, are excluded from the measured request aggregates.
+
+Apply the monitoring migrations with `task migrate` before exposing the admin routes. For
+the local frontend, use `NEXT_PUBLIC_API_URL=http://localhost:8080` and keep its exact
+origin in `CORS_ALLOWED_ORIGINS` (the example includes both local `localhost` and
+`127.0.0.1` ports). The browser must use one hostname consistently so its session cookie
+is sent to the API. The API client connects to `/api/v1/admin/overview` and
+`/api/v1/admin/log-monitoring`; a Platform Admin session is required. The detailed FE
+contract is in `docs/frontend-api-handoff-5-admin-overview-log-monitoring.md`.
 
 ## Deployment and operations
 

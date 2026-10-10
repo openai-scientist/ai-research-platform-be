@@ -6,7 +6,6 @@ Thumbs.db
 *.log
 /plans/
 /docs/*
-!/docs/time-series-connection-playground/
 .[e]nv
 .[e]nv.*
 !.[e]nv.example
