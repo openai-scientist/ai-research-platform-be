@@ -1,5 +1,7 @@
 from fastapi import APIRouter
 
+from platform_be.api.v1.admin_log_monitoring import router as admin_log_monitoring_router
+from platform_be.api.v1.admin_overview import router as admin_overview_router
 from platform_be.api.v1.admin_usage import router as admin_usage_router
 from platform_be.api.v1.audit import router as audit_router
 from platform_be.api.v1.auth import router as auth_router
@@ -41,4 +43,6 @@ router.include_router(run_artifacts_router)
 router.include_router(comments_router)
 router.include_router(notifications_router)
 router.include_router(admin_usage_router)
+router.include_router(admin_overview_router)
+router.include_router(admin_log_monitoring_router)
 router.include_router(internal_popper_router)
